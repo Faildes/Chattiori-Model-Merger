@@ -356,6 +356,21 @@ def to_half(tensor, enable):
 
     return tensor
 
+def load_weights(path, device):
+  if path.endswith(".safetensors"):
+      weights = safetensors.torch.load_file(path, device)
+  else:
+      weights = torch.load(path, device)
+      weights = weights["state_dict"] if "state_dict" in weights else weights
+  
+  return weights
+
+def save_weights(weights, path):
+  if path.endswith(".safetensors"):
+      safetensors.torch.save_file(weights, path)
+  else:
+      torch.save({"state_dict": weights}, path) 
+        
 def weighted_sum(theta0, theta1, alpha):
     return ((1 - alpha) * theta0) + (alpha * theta1)
 
@@ -437,8 +452,6 @@ if mode == "WS":
           vae = safetensors.torch.load_file(args.vae, device=device)
       else:
           vae = torch.load(args.vae, map_location=device)
-  theta_0 = read_state_dict(model_0_path, map_location=device)
-  theta_1 = read_state_dict(model_1_path, map_location=device)
 elif mode == "AD":
   interp_method = 0
   _, extension_0 = os.path.splitext(model_0_path)
