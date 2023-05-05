@@ -3,6 +3,7 @@ import copy
 import argparse
 import torch
 import re
+import shutil
 import safetensors.torch
 from tqdm import tqdm
 
@@ -377,43 +378,45 @@ checkpoint_dict_replacements = {
 checkpoint_dict_skip_on_merge = ["cond_stage_model.transformer.text_model.embeddings.position_ids"]
 
 def transform_checkpoint_dict_key(k):
-    for text, replacement in checkpoint_dict_replacements.items():
-        if k.startswith(text):
-            k = replacement + k[len(text):]
+  for text, replacement in checkpoint_dict_replacements.items():
+      if k.startswith(text):
+          k = replacement + k[len(text):]
 
-    return k
+  return k
 
 def get_state_dict_from_checkpoint(pl_sd):
-    pl_sd = pl_sd.pop("state_dict", pl_sd)
-    pl_sd.pop("state_dict", None)
+  pl_sd = pl_sd.pop("state_dict", pl_sd)
+  pl_sd.pop("state_dict", None)
 
-    sd = {}
-    for k, v in pl_sd.items():
-        new_key = transform_checkpoint_dict_key(k)
+  sd = {}
+  for k, v in pl_sd.items():
+      new_key = transform_checkpoint_dict_key(k)
 
-        if new_key is not None:
-            sd[new_key] = v
+      if new_key is not None:
+          sd[new_key] = v
 
-    pl_sd.clear()
-    pl_sd.update(sd)
+  pl_sd.clear()
+  pl_sd.update(sd)
 
-    return pl_sd
+  return pl_sd
 
 def read_state_dict(checkpoint_file, print_global_state=False, map_location=None):
-    _, extension = os.path.splitext(checkpoint_file)
-    if extension.lower() == ".safetensors":
-        device = map_location
-        pl_sd = safetensors.torch.load_file(checkpoint_file, device=device)
-    else:
-        pl_sd = torch.load(checkpoint_file, map_location=map_location)
+  _, extension = os.path.splitext(checkpoint_file)
+  if extension.lower() == ".safetensors":
+      device = map_location
+      pl_sd = safetensors.torch.load_file(checkpoint_file, device=device)
+  else:
+      pl_sd = torch.load(checkpoint_file, map_location=map_location)
 
-    if print_global_state and "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
+  if print_global_state and "global_step" in pl_sd:
+      print(f"Global Step: {pl_sd['global_step']}")
 
-    sd = get_state_dict_from_checkpoint(pl_sd)
-    return sd
+  sd = get_state_dict_from_checkpoint(pl_sd)
+  return sd
+
 model_0_path = os.path.join(args.model_path, args.model_0)
 model_1_path = os.path.join(args.model_path, args.model_1)
+
 if args.model_2 is not None:
   model_2_path = os.path.join(args.model_path, args.model_2)
 if mode == "WS":
@@ -512,6 +515,7 @@ theta_funcs = {
     "NoIn": (filename_nothing, None, None),
 }
 filename_generator, theta_func1, theta_func2 = theta_funcs[mode] 
+
 if theta_func2:
   print(f"Loading {model_1_name}...")
   theta_1 = read_state_dict(model_1_path, map_location=device)
@@ -521,7 +525,7 @@ else:
 if theta_func1:
   print(f"Loading {model_2_name}...")
   theta_2 = read_state_dict(model_2_path, map_location=device)
-  for key in tqdm.tqdm(theta_1.keys()):
+  for key in tqdm(theta_1.keys()):
     if key in checkpoint_dict_skip_on_merge:
       continue
     if 'model' in key:
@@ -565,6 +569,24 @@ for key in tqdm(theta_0.keys(), desc="Merging"):
 del theta_1
 
 vae_ignore_keys = {"model_ema.decay", "model_ema.num_updates"}
+
+def load_vae_dict(filename, map_location):
+    vae_ckpt = read_state_dict(filename, map_location=map_location)
+    vae_dict_1 = {k: v for k, v in vae_ckpt.items() if k[0:4] != "loss" and k not in vae_ignore_keys}
+    return vae_dict_1
+
+if args.vae is not None:
+    print(f"Baking in VAE")
+    vae_dict = load_vae_dict(args.vae, map_location=device)
+    for key in vae_dict.keys():
+        theta_0_key = 'first_stage_model.' + key
+        if theta_0_key in theta_0:
+            theta_0[theta_0_key] = to_half(vae_dict[key], args.save_half)
+    del vae_dict
+    
+if args.save_half and mode != "NoIn":
+    for key in theta_0.keys():
+        theta_0[key] = to_half(theta_0[key], args.save_half)   
 
 def get_prefixed_keys(component):
   prefix = COMPONENTS[component]["prefix"]
@@ -614,24 +636,6 @@ def prune_model(model, arch, keep_ema, dont_half):
       if not dont_half and type(model[k]) == torch.Tensor and model[k].dtype == torch.float32:
           model[k] = model[k].half()
 
-def load_vae_dict(filename, map_location):
-    vae_ckpt = read_state_dict(filename, map_location=map_location)
-    vae_dict_1 = {k: v for k, v in vae_ckpt.items() if k[0:4] != "loss" and k not in vae_ignore_keys}
-    return vae_dict_1
-
-if args.vae is not None:
-    print(f"Baking in VAE")
-    vae_dict = load_vae_dict(args.vae, map_location=device)
-    for key in vae_dict.keys():
-        theta_0_key = 'first_stage_model.' + key
-        if theta_0_key in theta_0:
-            theta_0[theta_0_key] = to_half(vae_dict[key], args.save_half)
-    del vae_dict
-    
-if args.save_half and not theta_func2:
-    for key in theta_0.keys():
-        theta_0[key] = to_half(theta_0[key], args.save_half)   
-
 print("Saving...")
 model_path = args.model_path
 output_path = os.path.join(model_path, output_file)
@@ -639,5 +643,5 @@ if args.save_safetensors:
     safetensors.torch.save_file(theta_0, output_path, metadata={"format": "pt"})
 else:
     torch.save(theta_0, output_path)
-
+del theta_0
 print("Done!")
