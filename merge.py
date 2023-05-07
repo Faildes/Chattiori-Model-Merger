@@ -363,6 +363,7 @@ if args.prune:
         safetensors.torch.save_file(nsd, output_path, metadata={"format": "pt"})
   else:
       torch.save({"state_dict": nsd}, output_path)
+  os.remove(output_a)
 else:
   print("Saving...")
   if args.save_safetensors:
