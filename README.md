@@ -1,6 +1,12 @@
 # Merge Models
 
-This script combines two stable-diffusion models at a user-defined ratio.
+This script merges stable-diffusion models with the settings of checkpoint merger at a user-defined ratio.
+
+The mode is:
+
+- "WS" for Weighted Sum
+- "AD" for Add Difference (requires model2)
+- "NoIn" for No Interporation
 
 The ratio works as follows:
 
@@ -11,7 +17,7 @@ The ratio works as follows:
 
 ### Bat file Method for Windows Users
 
-If you are using Windows and [Automatics Webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui), which I highly recommend, the easiest way to use this script is to use the .bat file.
+If you are using Windows, the easiest way to use this script is to use the .bat file.
 
 - Download this repo as a zip file
 - Extract the folder and place it in the main folder of your stable-diffusion install
@@ -23,7 +29,7 @@ If you are using Windows and [Automatics Webui](https://github.com/AUTOMATIC1111
 
 If you aren't using Automatic's web UI or are comfortable with the command line, you can also run `merge.py` directly.
 Just like with the .bat method, I'd recommend creating a folder within your stable-diffusion installation's main folder. This script requires torch to be installed, which you most likely will have installed in a venv inside your stable-diffusion webui install.
-
+- Requires pytorch safetensors
 - Navigate to the merge folder in your terminal
 - Activate the venv
   - For users of Automatic's Webui use
@@ -31,8 +37,14 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
   - For users of [sd-webui](https://github.com/sd-webui/stable-diffusion-webui) (formerly known as HLKY) you should just be able to do
     - `conda activate ldm`
 - run merge.py with arguments
-  - `py merge.py model0 model1 --alpha 0.5 --output merged`
+  - `py merge.py mode model_path model0 model1 --alpha 0.5 --output merged`
+    - Optional: `--model2` sets the tertiory model
     - Optional: `--alpha` controls how much weight is put on the second model. Defaults to 0.5, if omitted
+    - Optional: `--vae` sets the vae file by set the path
+    - Optional: `--save_half` determines whether save the file as fp16 or not Defaults to False
+    - Optional: `--prune` determines whether prune the model or not Defaults to False
+    - Optional: `--keep_ema` determines keep only ema while prune Defaults to False
+    - Optional: `--save_safetensors` determines whether save the file as safetensors Defaults to False
     - Optional: `--output` is the filename of the merged file, without file extension. Defaults to "merged", if omitted
     - Optional: `--device` is the device that's going to be used to merge the models. Unless you have a ton of VRAM, you should probably just ignore this. Defaults to 'cpu', if omitted.
       - Required VRAM seems to be roughly equivalent to the size of `(size of both models) * 1.15`. Merging 2 models at 3.76GB resulted in rougly 8.6GB of VRAM usage on top of everything else going on.
