@@ -37,8 +37,8 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
   - For users of [sd-webui](https://github.com/sd-webui/stable-diffusion-webui) (formerly known as HLKY) you should just be able to do
     - `conda activate ldm`
 - run merge.py with arguments
-  - `py merge.py mode model_path model0 model1 --alpha 0.5 --output merged`
-    - Optional: `--model2` sets the tertiory model
+  - `py merge.py mode model_path model_0 model_1 --alpha 0.5 --output merged`
+    - Optional: `--model_2` sets the tertiory model
     - Optional: `--alpha` controls how much weight is put on the second model. Defaults to 0.5, if omitted
     - Optional: `--vae` sets the vae file by set the path
     - Optional: `--save_half` determines whether save the file as fp16 or not Defaults to False
