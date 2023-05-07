@@ -587,11 +587,6 @@ def load_vae_dict(filename, map_location):
     vae_ckpt = read_state_dict(filename, map_location=map_location)
     vae_dict_1 = {k: v for k, v in vae_ckpt.items() if k[0:4] != "loss" and k not in vae_ignore_keys}
     return vae_dict_1
-
-for key in tqdm(theta_1.keys(), desc="Processing"):
-    if "model" in key and key not in theta_0:
-        theta_0[key] = theta_1[key]
-        theta_0[key] = to_half(theta_0[key], args.save_half)
             
 if args.vae is not None:
     print(f"Baking in VAE")
