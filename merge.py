@@ -438,14 +438,14 @@ if mode == "WS":
   interp_method = 0
   _, extension_0 = os.path.splitext(model_0_path)
   if extension_0.lower() == ".safetensors":
-      model_0 = safetensors.torch.load_file(model_0_path, device=device)
+      model_0 = safetensors.torch.load_file(model_0_path, device=device).half()
   else:
-      model_0 = torch.load(model_0_path, map_location=device)
+      model_0 = torch.load(model_0_path, map_location=device).half()
   _, extension_1 = os.path.splitext(model_1_path)
   if extension_1.lower() == ".safetensors":
-      model_1 = safetensors.torch.load_file(model_1_path, device=device)
+      model_1 = safetensors.torch.load_file(model_1_path, device=device).half()
   else:
-      model_1 = torch.load(model_1_path, map_location=device)
+      model_1 = torch.load(model_1_path, map_location=device).half()
   if args.vae is not None:
       _, extension_vae = os.path.splitext(args.vae)
       if extension_vae.lower() == ".safetensors":
