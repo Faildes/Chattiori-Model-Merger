@@ -346,7 +346,9 @@ parser.add_argument("--model_2", type=str, help="Optional, Name of model 2", def
 parser.add_argument("--vae", type=str, help="Path to vae", default=None, required=False)
 parser.add_argument("--alpha", type=float, help="Alpha value, optional, defaults to 0.5", default=0.5, required=False)
 parser.add_argument("--save_half", type=bool, help="Save as float16", default=False, required=False)
+parser.add_argument("--prune", type=bool, help="Prune Model", default=False, required=False)
 parser.add_argument("--save_safetensors", type=bool, help="Save as .safetensors", default=False, required=False)
+parser.add_argument("--keep_ema", type=bool, help="Keep ema", default=False, required=False)
 parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
 
@@ -438,14 +440,14 @@ if mode == "WS":
   interp_method = 0
   _, extension_0 = os.path.splitext(model_0_path)
   if extension_0.lower() == ".safetensors":
-      model_0 = safetensors.torch.load_file(model_0_path, device=device).half()
+      model_0 = safetensors.torch.load_file(model_0_path, device=device)
   else:
-      model_0 = torch.load(model_0_path, map_location=device).half()
+      model_0 = torch.load(model_0_path, map_location=device)
   _, extension_1 = os.path.splitext(model_1_path)
   if extension_1.lower() == ".safetensors":
-      model_1 = safetensors.torch.load_file(model_1_path, device=device).half()
+      model_1 = safetensors.torch.load_file(model_1_path, device=device)
   else:
-      model_1 = torch.load(model_1_path, map_location=device).half()
+      model_1 = torch.load(model_1_path, map_location=device)
   if args.vae is not None:
       _, extension_vae = os.path.splitext(args.vae)
       if extension_vae.lower() == ".safetensors":
@@ -649,13 +651,56 @@ def prune_model(model, arch, keep_ema, dont_half):
       if not dont_half and type(model[k]) == torch.Tensor and model[k].dtype == torch.float32:
           model[k] = model[k].half()
 
-print("Saving...")
+loaded = None
 model_path = args.model_path
 output_path = os.path.join(model_path, output_file)
-if args.save_safetensors:
+if args.prune:
+  output_a = os.path.join(model_path, "test.ckpt")
+  torch.save({"state_dict": theta_0}, output_a)
+  print("Pruning...\n")
+  sd = torch.load(output_a, map_location=device)
+  nsd = dict()
+  print(sd.keys())
+  for k in sd.keys():
+      if k != "optimizer_states":
+          nsd[k] = sd[k]
+  if "global_step" in sd:
+      print(f"This is global step {sd['global_step']}.")
+  if args.keep_ema:
+      sd = nsd["state_dict"].copy()
+      # infer ema keys
+      ema_keys = {k: "model_ema." + k[6:].replace(".", ".") for k in sd.keys() if k.startswith("model.")}
+      new_sd = dict()
+
+      for k in sd:
+          if k in ema_keys:
+              new_sd[k] = sd[ema_keys[k]].half()
+          elif not k.startswith("model_ema.") or k in ["model_ema.num_updates", "model_ema.decay"]:
+              new_sd[k] = sd[k].half()
+
+      assert len(new_sd) == len(sd) - len(ema_keys)
+      nsd["state_dict"] = new_sd
+  else:
+      sd = nsd['state_dict'].copy()
+      new_sd = dict()
+      for k in sd:
+          new_sd[k] = sd[k].half()
+      nsd['state_dict'] = new_sd
+  nsd = get_state_dict_from_checkpoint(nsd)
+  print("Saving...")
+  if args.save_safetensors:
+    with torch.no_grad():
+        safetensors.torch.save_file(nsd, output_path, metadata={"format": "pt"})
+  else:
+      torch.save({"state_dict": nsd}, output_path)
+else:
+  print("Saving...")
+  if args.save_safetensors:
     with torch.no_grad():
         safetensors.torch.save_file(theta_0, output_path, metadata={"format": "pt"})
-else:
-    torch.save({"state_dict": theta_0}, output_path)
+  else:
+      torch.save({"state_dict": theta_0}, output_path)
+output_path = os.path.join(model_path, output_file)
+
 del theta_0
 print("Done!")
