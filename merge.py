@@ -588,6 +588,11 @@ def load_vae_dict(filename, map_location):
     vae_dict_1 = {k: v for k, v in vae_ckpt.items() if k[0:4] != "loss" and k not in vae_ignore_keys}
     return vae_dict_1
 
+for key in tqdm(theta_1.keys(), desc="Processing"):
+    if "model" in key and key not in theta_0:
+        theta_0[key] = theta_1[key]
+        theta_0[key] = to_half(theta_0[key], args.save_half)
+            
 if args.vae is not None:
     print(f"Baking in VAE")
     vae_dict = load_vae_dict(args.vae, map_location=device)
@@ -653,8 +658,9 @@ print("Saving...")
 model_path = args.model_path
 output_path = os.path.join(model_path, output_file)
 if args.save_safetensors:
-    safetensors.torch.save_file(theta_0, output_path, metadata={"format": "pt"})
+    with torch.no_grad():
+        safetensors.torch.save_file(theta_0, output_path, metadata={"format": "pt"})
 else:
-    torch.save(theta_0, output_path)
+    torch.save({"state_dict": theta_0}, output_path)
 del theta_0
 print("Done!")
