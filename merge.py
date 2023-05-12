@@ -231,8 +231,11 @@ theta_funcs = {
     "WS": (filename_weighted_sum, None, weighted_sum),
     "AD": (filename_add_difference, get_difference, add_difference),
     "NoIn": (filename_nothing, None, None),
+    "SIG": (filename_sigmoid, None, sigmoid),
+    "GEO": (filename_geom, None, geom),
+    "MAX": (filename_max, None, weight_max),
 }
-filename_generator, theta_func1, theta_func2 = theta_funcs[mode] 
+filename_generator, theta_func1, theta_func2, theta_sig, theta_geo, theta_max = theta_funcs[mode] 
 
 if theta_func2:
   print(f"Loading {model_1_name}...")
@@ -274,14 +277,35 @@ for key in tqdm(theta_0.keys(), desc="Merging"):
               raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
 
           if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)#Merge only the vectors the models have in common.  Otherwise we get an error due to dimension mismatch.
+              if mode == "SIG":
+                theta_0[key][:, 0:4, :, :] = theta_sig(a[:, 0:4, :, :], b, alpha) #Merge only the vectors the models have in common.  Otherwise we get an error due to dimension mismatch.
+              elif mode == "GEO":
+                theta_0[key][:, 0:4, :, :] = theta_geo(a[:, 0:4, :, :], b, alpha)
+              elif mode == "MAX":
+                theta_0[key][:, 0:4, :, :] = theta_max(a[:, 0:4, :, :], b)
+              else:
+                theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
               result_is_instruct_pix2pix_model = True
           else:
               assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
+              if mode == "SIG":
+                theta_0[key][:, 0:4, :, :] = theta_sig(a[:, 0:4, :, :], b, alpha) #Merge only the vectors the models have in common.  Otherwise we get an error due to dimension mismatch.
+              elif mode == "GEO":
+                theta_0[key][:, 0:4, :, :] = theta_geo(a[:, 0:4, :, :], b, alpha)
+              elif mode == "MAX":
+                theta_0[key][:, 0:4, :, :] = theta_max(a[:, 0:4, :, :], b)
+              else:
+                theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
               result_is_inpainting_model = True
       else:
-          theta_0[key] = theta_func2(a, b, alpha)
+          if mode == "SIG":
+            theta_0[key] = theta_sig(a, b, alpha)
+          elif mode == "GEO":
+            theta_0[key] = theta_geo(a, b, alpha)
+          elif mode == "MAX":
+            theta_0[key] = theta_max(a, b)
+          else:
+            theta_0[key] = theta_func2(a, b, alpha)
       
       theta_0[key] = to_half(theta_0[key], args.save_half)
 del theta_1
