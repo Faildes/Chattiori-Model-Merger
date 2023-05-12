@@ -42,7 +42,16 @@ def save_weights(weights, path):
       safetensors.torch.save_file(weights, path)
   else:
       torch.save({"state_dict": weights}, path) 
-        
+
+def weight_max(theta0, theta1):
+    return torch.max(theta0, theta1)
+
+def geom(theta0, theta1, alpha):
+    return torch.pow(theta0, 1 - alpha) * torch.pow(theta1, alpha)
+
+def sigmoid(theta0, theta1, alpha):
+    return (1 / (1 + torch.exp(-4 * alpha))) * (theta0 + theta1) - (1 / (1 + torch.exp(-alpha))) * theta0
+
 def weighted_sum(theta0, theta1, alpha):
     return ((1 - alpha) * theta0) + (alpha * theta1)
 
@@ -181,7 +190,31 @@ def filename_weighted_sum():
   Ma = round(1 - alpha, 2)
   Mb = round(alpha, 2)
 
-  return f"{Ma}({a}) + {Mb}({b})"
+  return f"{Ma}({a}) + {Mb}({b}) LIN"
+
+def filename_geom():
+  a = model_0_name
+  b = model_1_name
+  Ma = round(1 - alpha, 2)
+  Mb = round(alpha, 2)
+
+  return f"{Ma}({a}) + {Mb}({b}) GEO"
+
+def filename_max():
+  a = model_0_name
+  b = model_1_name
+  Ma = round(1 - alpha, 2)
+  Mb = round(alpha, 2)
+
+  return f"{a} + {b} MAX"
+
+def filename_sigmoid():
+  a = model_0_name
+  b = model_1_name
+  Ma = round(1 - alpha, 2)
+  Mb = round(alpha, 2)
+
+  return f"{Ma}({a}) + {Mb}({b}) SIG"
 
 def filename_add_difference():
   a = model_0_name
