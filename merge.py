@@ -11,7 +11,7 @@ parser = argparse.ArgumentParser(description="Merge two models")
 parser.add_argument("mode", type=str, help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
 parser.add_argument("model_0", type=str, help="Name of model 0")
-parser.add_argument("model_1", type=str, help="Name of model 1")
+parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None, required=False)
 parser.add_argument("--model_2", type=str, help="Optional, Name of model 2", default=None, required=False)
 parser.add_argument("--vae", type=str, help="Path to vae", default=None, required=False)
 parser.add_argument("--alpha", type=float, help="Alpha value, optional, defaults to 0.5", default=0.5, required=False)
@@ -20,6 +20,7 @@ parser.add_argument("--prune", action="store_true", help="Prune Model", required
 parser.add_argument("--save_safetensors", action="store_true", help="Save as .safetensors", required=False)
 parser.add_argument("--keep_ema", action="store_true", help="Keep ema", required=False)
 parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
+parser.add_argument("--functn", action="store_true", help="Add function name to the file", required=False)
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
 
 def to_half(tensor, enable):
@@ -115,7 +116,7 @@ model_1_path = os.path.join(args.model_path, args.model_1)
 
 if args.model_2 is not None:
   model_2_path = os.path.join(args.model_path, args.model_2)
-if mode == "WS":
+if mode in ["WS", "SIG", "GEO", "MAX"]:
   interp_method = 0
   _, extension_0 = os.path.splitext(model_0_path)
   if extension_0.lower() == ".safetensors":
@@ -159,28 +160,22 @@ elif mode == "AD":
 
 elif mode == "NoIn":
   interp_method = 2
+  _, extension_0 = os.path.splitext(model_0_path)
+  if extension_0.lower() == ".safetensors":
+      model_0 = safetensors.torch.load_file(model_0_path, device=device)
+  else:
+      model_0 = torch.load(model_0_path, map_location=device)
+  if args.vae is not None:
+      _, extension_vae = os.path.splitext(args.vae)
+      if extension_vae.lower() == ".safetensors":
+          vae = safetensors.torch.load_file(args.vae, device=device)
+      else:
+          vae = torch.load(args.vae, map_location=device)
 alpha = args.alpha
 
-if args.save_safetensors:
-    output_file = f'{args.output}.safetensors'
-else:
-    output_file = f'{args.output}.ckpt'
-
-# check if output file already exists, ask to overwrite
-if os.path.isfile(output_file):
-    print("Output file already exists. Overwrite? (y/n)")
-    while True:
-        overwrite = input()
-        if overwrite == "y":
-            break
-        elif overwrite == "n":
-            print("Exiting...")
-            exit()
-        else:
-            print("Please enter y or n")
-
 model_0_name = os.path.splitext(os.path.basename(model_0_path))[0]
-model_1_name = os.path.splitext(os.path.basename(model_1_path))[0]
+if args.model_1 is not None:
+  model_1_name = os.path.splitext(os.path.basename(model_1_path))[0]
 if args.model_2 is not None:
   model_2_name = os.path.splitext(os.path.basename(model_2_path))[0]
 
@@ -377,10 +372,30 @@ def prune_model(model, arch, keep_ema, dont_half):
           continue
       if not dont_half and type(model[k]) == torch.Tensor and model[k].dtype == torch.float32:
           model[k] = model[k].half()
+output_name = args.output
+if args.functn:
+    if args.prune:
+        output_name += "_pruned"
+if args.save_safetensors:
+    output_file = f'{output_name}.safetensors'
+else:
+    output_file = f'{output_name}.ckpt'
 
 loaded = None
 model_path = args.model_path
 output_path = os.path.join(model_path, output_file)
+# check if output file already exists, ask to overwrite
+if os.path.isfile(output_path):
+    print("Output file already exists. Overwrite? (y/n)")
+    while True:
+        overwrite = input()
+        if overwrite == "y":
+            break
+        elif overwrite == "n":
+            print("Exiting...")
+            exit()
+        else:
+            print("Please enter y or n")
 if args.prune:
   output_a = os.path.join(model_path, "test.ckpt")
   torch.save({"state_dict": theta_0}, output_a)
