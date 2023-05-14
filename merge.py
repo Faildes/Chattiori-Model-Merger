@@ -34,7 +34,7 @@ def load_weights(path, device):
       weights = safetensors.torch.load_file(path, device)
   else:
       weights = torch.load(path, device)
-      weights = weights["state_dict"] if "state_dict" in weights else weights
+  weights = weights["state_dict"] if "state_dict" in weights else weights
   
   return weights
 
@@ -376,12 +376,13 @@ if os.path.isfile(output_path):
         else:
             print("Please enter y or n")
 if args.prune:
-  output_a = os.path.join(model_path, "test.ckpt")
-  torch.save({"state_dict": theta_0}, output_a)
+  output_a = os.path.join(model_path, "test.safetensors")
+  safetensors.torch.save_file(theta_0, output_a, metadata={"format": "pt"})
   print("Pruning...\n")
-  sd = torch.load(output_a, map_location=device)
+  sd = safetensors.torch.load_file(output_a, device)
+  sd = sd["state_dict"] if "state_dict" in sd else sd
   nsd = dict()
-  print(sd.keys())
+  #print(sd.keys())
   for k in sd.keys():
       if k != "optimizer_states":
           nsd[k] = sd[k]
