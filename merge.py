@@ -11,7 +11,7 @@ parser = argparse.ArgumentParser(description="Merge two models")
 parser.add_argument("mode", type=str, help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
 parser.add_argument("model_0", type=str, help="Name of model 0")
-parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None, required=False)
+parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None)
 parser.add_argument("--model_2", type=str, help="Optional, Name of model 2", default=None, required=False)
 parser.add_argument("--vae", type=str, help="Path to vae", default=None, required=False)
 parser.add_argument("--alpha", type=float, help="Alpha value, optional, defaults to 0.5", default=0.5, required=False)
@@ -44,7 +44,7 @@ def save_weights(weights, path):
   else:
       torch.save({"state_dict": weights}, path) 
 
-def weight_max(theta0, theta1):
+def weight_max(theta0, theta1, alpha):
     return torch.max(theta0, theta1)
 
 def geom(theta0, theta1, alpha):
@@ -230,7 +230,7 @@ theta_funcs = {
     "GEO": (filename_geom, None, geom),
     "MAX": (filename_max, None, weight_max),
 }
-filename_generator, theta_func1, theta_func2, theta_sig, theta_geo, theta_max = theta_funcs[mode] 
+filename_generator, theta_func1, theta_func2 = theta_funcs[mode] 
 
 if theta_func2:
   print(f"Loading {model_1_name}...")
@@ -272,35 +272,14 @@ for key in tqdm(theta_0.keys(), desc="Merging"):
               raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
 
           if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
-              if mode == "SIG":
-                theta_0[key][:, 0:4, :, :] = theta_sig(a[:, 0:4, :, :], b, alpha) #Merge only the vectors the models have in common.  Otherwise we get an error due to dimension mismatch.
-              elif mode == "GEO":
-                theta_0[key][:, 0:4, :, :] = theta_geo(a[:, 0:4, :, :], b, alpha)
-              elif mode == "MAX":
-                theta_0[key][:, 0:4, :, :] = theta_max(a[:, 0:4, :, :], b)
-              else:
-                theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
+              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
               result_is_instruct_pix2pix_model = True
           else:
               assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
-              if mode == "SIG":
-                theta_0[key][:, 0:4, :, :] = theta_sig(a[:, 0:4, :, :], b, alpha) #Merge only the vectors the models have in common.  Otherwise we get an error due to dimension mismatch.
-              elif mode == "GEO":
-                theta_0[key][:, 0:4, :, :] = theta_geo(a[:, 0:4, :, :], b, alpha)
-              elif mode == "MAX":
-                theta_0[key][:, 0:4, :, :] = theta_max(a[:, 0:4, :, :], b)
-              else:
-                theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
+              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
               result_is_inpainting_model = True
       else:
-          if mode == "SIG":
-            theta_0[key] = theta_sig(a, b, alpha)
-          elif mode == "GEO":
-            theta_0[key] = theta_geo(a, b, alpha)
-          elif mode == "MAX":
-            theta_0[key] = theta_max(a, b)
-          else:
-            theta_0[key] = theta_func2(a, b, alpha)
+          theta_0[key] = theta_func2(a, b, alpha)
       
       theta_0[key] = to_half(theta_0[key], args.save_half)
 del theta_1
