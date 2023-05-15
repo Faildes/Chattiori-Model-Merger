@@ -426,6 +426,9 @@ else:
 output_path = os.path.join(model_path, output_file)
 if args.del_source:
     os.remove(os.path.join(args.model_path, args.model_0))
-    os.remove(os.path.join(args.model_path, args.model_1))
+    if args.model_1 is not None:
+        os.remove(os.path.join(args.model_path, args.model_1))
+    if args.model_2 is not None:
+        os.remove(os.path.join(args.model_path, args.model_2))
 del theta_0
 print("Done!")
