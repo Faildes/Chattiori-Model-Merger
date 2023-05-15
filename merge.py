@@ -1,4 +1,8 @@
+import glob
 import os
+import sys
+import time
+
 import copy
 import argparse
 import torch
@@ -7,580 +11,6 @@ import shutil
 import safetensors.torch
 import safetensors
 from tqdm import tqdm
-EMA_PREFIX = "model_ema."
-
-METADATA = {'epoch': 0, 'global_step': 0, 'pytorch-lightning_version': '1.6.0'}
-
-IDENTIFICATION = {
-    "VAE": {
-        "SD-v1": 0,
-        "SD-v2": 869,
-        "NAI": 2982,
-        "WD-VAE-v1": 155,
-        "WD-VAE-v2": 41
-    },
-    "CLIP-v1": {
-        "SD-v1": 0,
-    },
-    "CLIP-v2": {
-        "SD-v2": 1141,
-        "WD-v1-4": 2543
-    }
-}
-
-COMPONENTS = {
-    "UNET-v1-SD": {
-        "keys": {},
-        "source": "UNET-v1-SD.txt",
-        "prefix": "model.diffusion_model."
-    },
-    "UNET-v1-EMA": {
-        "keys": {},
-        "source": "UNET-v1-EMA.txt",
-        "prefix": "model_ema.diffusion_model"
-    },
-    "UNET-v1-Inpainting": {
-        "keys": {},
-        "source": "UNET-v1-Inpainting.txt",
-        "prefix": "model.diffusion_model."
-    },
-    "UNET-v1-Pix2Pix": {
-        "keys": {},
-        "source": "UNET-v1-Pix2Pix.txt",
-        "prefix": "model.diffusion_model."
-    },
-    "UNET-v1-Pix2Pix-EMA": {
-        "keys": {},
-        "source": "UNET-v1-Pix2Pix-EMA.txt",
-        "prefix": "model_ema.diffusion_model"
-    },
-    "UNET-v2-SD": {
-        "keys": {},
-        "source": "UNET-v2-SD.txt",
-        "prefix": "model.diffusion_model."
-    },
-    "UNET-v2-Inpainting": {
-        "keys": {},
-        "source": "UNET-v2-Inpainting.txt",
-        "prefix": "model.diffusion_model."
-    },
-    "UNET-v2-Depth": {
-        "keys": {},
-        "source": "UNET-v2-Depth.txt",
-        "prefix": "model.diffusion_model."
-    },
-    "VAE-v1-SD": {
-        "keys": {},
-        "source": "VAE-v1-SD.txt",
-        "prefix": "first_stage_model."
-    },
-    "CLIP-v1-SD": {
-        "keys": {},
-        "source": "CLIP-v1-SD.txt",
-        "prefix": "cond_stage_model.transformer.text_model."
-    },
-    "CLIP-v1-NAI": {
-        "keys": {},
-        "source": "CLIP-v1-SD.txt",
-        "prefix": "cond_stage_model.transformer."
-    },
-    "CLIP-v2-SD": {
-        "keys": {},
-        "source": "CLIP-v2-SD.txt",
-        "prefix": "cond_stage_model.model."
-    },
-    "CLIP-v2-WD": {
-        "keys": {},
-        "source": "CLIP-v2-WD.txt",
-        "prefix": "cond_stage_model.model."
-    },
-    "Depth-v2-SD": {
-        "keys": {},
-        "source": "Depth-v2-SD.txt",
-        "prefix": "depth_model.model."
-    },
-    "LoRA-v1-CLIP": {
-        "keys": {},
-        "shapes": {},
-        "source": "LoRA-v1-CLIP.txt",
-        "prefix": ""
-    },
-    "LoRA-v1A-CLIP": {
-        "keys": {},
-        "shapes": {},
-        "source": "LoRA-v1A-CLIP.txt",
-        "prefix": ""
-    },
-    "LoRA-v1-UNET": {
-        "keys": {},
-        "shapes": {},
-        "source": "LoRA-v1-UNET.txt",
-        "prefix": ""
-    },
-    "LoRA-v1A-UNET": {
-        "keys": {},
-        "shapes": {},
-        "source": "LoRA-v1A-UNET.txt",
-        "prefix": ""
-    },
-    "ControlNet-v1-SD": {
-        "keys": {},
-        "shapes": {},
-        "source": "ControlNet-v1-SD.txt",
-        "prefix": "control_model."
-    },
-}
-
-COMPONENT_CLASS = {
-    "UNET-v1-SD": "UNET-v1",
-    "UNET-v1-EMA": "EMA-UNET-v1",
-    "UNET-v1-Inpainting": "UNET-v1",
-    "UNET-v1-Pix2Pix": "UNET-v1-Pix2Pix",
-    "UNET-v1-Pix2Pix-EMA": "EMA-UNET-v1-Pix2Pix",
-    "UNET-v2-SD": "UNET-v2",
-    "UNET-v2-Inpainting": "UNET-v2",
-    "UNET-v2-Depth": "UNET-v2-Depth",
-    "VAE-v1-SD": "VAE-v1",
-    "CLIP-v1-SD": "CLIP-v1",
-    "CLIP-v1-NAI": "CLIP-v1",
-    "CLIP-v2-SD": "CLIP-v2",
-    "CLIP-v2-WD": "CLIP-v2",
-    "Depth-v2-SD": "Depth-v2",
-    "LoRA-v1-UNET": "LoRA-v1-UNET",
-    "LoRA-v1-CLIP": "LoRA-v1-CLIP",
-    "LoRA-v1A-UNET": "LoRA-v1-UNET",
-    "LoRA-v1A-CLIP": "LoRA-v1-CLIP",
-    "ControlNet-v1-SD": "ControlNet-v1",
-}
-
-OPTIONAL = [
-    ("alphas_cumprod", (1000,)),
-    ("alphas_cumprod_prev", (1000,)),
-    ("betas", (1000,)),
-    ("log_one_minus_alphas_cumprod", (1000,)),
-    ("model_ema.decay", ()),
-    ("model_ema.num_updates", ()),
-    ("posterior_log_variance_clipped", (1000,)),
-    ("posterior_mean_coef1", (1000,)),
-    ("posterior_mean_coef2", (1000,)),
-    ("posterior_variance", (1000,)),
-    ("sqrt_alphas_cumprod", (1000,)),
-    ("sqrt_one_minus_alphas_cumprod", (1000,)),
-    ("sqrt_recip_alphas_cumprod", (1000,)),
-    ("sqrt_recipm1_alphas_cumprod", (1000,)),
-    ("logvar", (1000,)),
-]
-
-ARCHITECTURES = {
-    "UNET-v1": {
-        "classes": ["UNET-v1"],
-        "optional": [],
-        "required": [],
-        "prefixed": False
-    },
-    "UNET-v1-Pix2Pix": {
-        "classes": ["UNET-v1-Pix2Pix"],
-        "optional": [],
-        "required": [],
-        "prefixed": False
-    },
-    "UNET-v2": {
-        "classes": ["UNET-v2"],
-        "optional": [],
-        "required": [],
-        "prefixed": False
-    },
-    "UNET-v2-Depth": {
-        "classes": ["UNET-v2-Depth"],
-        "optional": [],
-        "required": [],
-        "prefixed": False
-    },
-    "VAE-v1": {
-        "classes": ["VAE-v1"],
-        "optional": [],
-        "required": [],
-        "prefixed": False
-    },
-    "CLIP-v1": {
-        "classes": ["CLIP-v1"],
-        "optional": [],
-        "required": [],
-        "prefixed": False
-    },
-    "CLIP-v2": {
-        "classes": ["CLIP-v2"],
-        "optional": [],
-        "required": [],
-        "prefixed": False
-    },
-    "Depth-v2": {
-        "classes": ["Depth-v2"],
-        "optional": [],
-        "required": [],
-        "prefixed": False
-    },
-    "ControlNet-v1": {
-        "classes": ["ControlNet-v1"],
-        "optional": [],
-        "required": [],
-        "prefixed": False
-    },
-    "SD-v1": {
-        "classes": ["UNET-v1", "VAE-v1", "CLIP-v1"],
-        "optional": OPTIONAL,
-        "required": [],
-        "prefixed": True
-    },
-    "SD-v1-Pix2Pix": {
-        "classes": ["UNET-v1-Pix2Pix", "VAE-v1", "CLIP-v1"],
-        "optional": OPTIONAL,
-        "required": [],
-        "prefixed": True
-    },
-    "SD-v1-ControlNet": {
-        "classes": ["UNET-v1", "VAE-v1", "CLIP-v1", "ControlNet-v1"],
-        "optional": OPTIONAL,
-        "required": [],
-        "prefixed": True
-    },
-    "SD-v2": {
-        "classes": ["UNET-v2", "VAE-v1", "CLIP-v2"],
-        "optional": OPTIONAL,
-        "required": [],
-        "prefixed": True
-    },
-    "SD-v2-Depth": {
-        "classes": ["UNET-v2-Depth", "VAE-v1", "CLIP-v2", "Depth-v2"],
-        "optional": OPTIONAL,
-        "required": [],
-        "prefixed": True
-    },
-    "EMA-v1": {
-        "classes": ["EMA-UNET-v1"],
-        "optional": OPTIONAL,
-        "required": [],
-        "prefixed": True
-    },
-    "EMA-v1-Pix2Pix": {
-        "classes": ["EMA-UNET-v1-Pix2Pix"],
-        "optional": OPTIONAL,
-        "required": [],
-        "prefixed": True
-    },
-    # standalone component architectures, for detecting broken models
-    "UNET-v1-BROKEN": {
-        "classes": ["UNET-v1"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-    "UNET-v1-Pix2Pix-BROKEN": {
-        "classes": ["UNET-v1-Pix2Pix"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-    "UNET-v2-BROKEN": {
-        "classes": ["UNET-v2"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-    "UNET-v2-Depth-BROKEN": {
-        "classes": ["UNET-v2-Depth"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-    "VAE-v1-BROKEN": {
-        "classes": ["VAE-v1"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-    "CLIP-v1-BROKEN": {
-        "classes": ["CLIP-v1"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-    "CLIP-v2-BROKEN": {
-        "classes": ["CLIP-v2"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-    "Depth-v2-BROKEN": {
-        "classes": ["Depth-v2"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-    "ControlNet-v1-BROKEN": {
-        "classes": ["ControlNet-v1"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-    "LoRA-v1-UNET": {
-        "classes": ["LoRA-v1-UNET"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-    "LoRA-v1-CLIP": {
-        "classes": ["LoRA-v1-CLIP"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-    "LoRA-v1": {
-        "classes": ["LoRA-v1-CLIP", "LoRA-v1-UNET"],
-        "optional": [],
-        "required": [],
-        "prefixed": True
-    },
-}
-
-def resolve_class(components):
-    components = list(components)
-
-    if not components or len(components) == 1:
-        return components
-
-    # prefer SD components vs busted ass components
-    sd_components = [c for c in components if "SD" in c]
-    if len(sd_components) == 1:
-        return [sd_components[0]]
-
-    # otherwise component with the most keys is probably the best
-    components = sorted(components, key=lambda c: len(COMPONENTS[c]["keys"]), reverse=True)
-
-    return [components[0]]
-
-def resolve_arch(arch):
-    arch = copy.deepcopy(arch)
-    # resolve potentially many overlapping arch's to a single one
-
-    if not arch:
-        return {}
-
-    # select arch with most keys
-    arch_sizes = {}
-    for a in arch:
-        arch_sizes[a] = len(ARCHITECTURES[a]["required"])
-        for clss in arch[a]:
-            arch[a][clss] = resolve_class(arch[a][clss])
-            if arch[a][clss]:
-                arch_sizes[a] += len(COMPONENTS[arch[a][clss][0]]["keys"])
-    for normal in ["SD-v1", "SD-v2"]:
-        if normal in arch_sizes:
-            choosen = normal
-            break
-    else:
-        choosen = max(arch_sizes, key=arch_sizes.get)
-    return {choosen: arch[choosen]}
-def fix_model(model, fix_clip=False):
-    # fix NAI nonsense
-    nai_keys = {
-        'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
-        'cond_stage_model.transformer.encoder.': 'cond_stage_model.transformer.text_model.encoder.',
-        'cond_stage_model.transformer.final_layer_norm.': 'cond_stage_model.transformer.text_model.final_layer_norm.'
-    }
-    renamed = []
-    for k in list(model.keys()):
-        for r in nai_keys:
-            if type(k) == str and k.startswith(r):
-                kk = k.replace(r, nai_keys[r])
-                renamed += [(k,kk)]
-                model[kk] = model[k]
-                del model[k]
-                break
-    
-    # fix merging nonsense
-    i = "cond_stage_model.transformer.text_model.embeddings.position_ids"
-    broken = []
-    if i in model:
-        correct = torch.Tensor([list(range(77))]).to(torch.int64)
-        current = model[i].to(torch.int64)
-
-        broken = correct.ne(current)
-        broken = [i for i in range(77) if broken[0][i]]
-
-        if fix_clip:
-            # actually fix the ids
-            model[i] = correct
-        else:
-            # ensure fp16 looks the same as fp32
-            model[i] = current
-
-    return renamed, broken
-
-def fix_ema(model):
-    # turns UNET-v1-EMA into UNET-v1-SD
-    # but only when in component form (unprefixed)
-
-    # example keys
-    # EMA = model_ema.diffusion_modeloutput_blocks91transformer_blocks0norm3weight
-    # SD  = model.diffusion_model.output_blocks9.1.transformer_blocks.0.norm3.weight
-
-    normal = COMPONENTS["UNET-v1-SD"]["keys"]
-    for k, _ in normal:
-        kk = k.replace(".", "")
-        if kk in model:
-            model[k] = model[kk]
-            del model[kk]
-def get_prefixed_keys(component):
-  prefix = COMPONENTS[component]["prefix"]
-  allowed = COMPONENTS[component]["keys"]
-  return set([(prefix + k, z) for k, z in allowed])
-
-def get_allowed_keys(arch, allowed_classes=None):
-  # get all allowed keys
-  allowed = set()
-  for a in arch:
-      if allowed_classes == None:
-          allowed.update(ARCHITECTURES[a]["required"])
-          allowed.update(ARCHITECTURES[a]["optional"])
-      prefixed = ARCHITECTURES[a]["prefixed"]
-      for clss in arch[a]:
-          if allowed_classes == None or clss in allowed_classes:
-              for comp in arch[a][clss]:
-                  comp_keys = COMPONENTS[comp]["keys"]
-                  if prefixed:
-                      comp_keys = get_prefixed_keys(comp)
-                  allowed.update(comp_keys)
-  return allowed
-def load_components(path):
-    for c in COMPONENTS:
-        file = os.path.join(path, COMPONENTS[c]["source"])
-        if not os.path.exists(file):
-            print(f"CANNOT FIND {c} KEYS")
-        with open(file, 'r') as f:
-            COMPONENTS[c]["keys"] = set()
-            for l in f:
-                l = l.rstrip().split(" ")
-                k, z = l[0], l[1]
-                z = z[1:-1].split(",")
-                if not z[0]:
-                    z = tuple()
-                else:
-                    z = tuple(int(i) for i in z)
-                COMPONENTS[c]["keys"].add((k,z))
-                if "shapes" in COMPONENTS[c]:
-                    COMPONENTS[c]["shapes"][k] = z
-def tensor_shape(key, data):
-  if hasattr(data, 'shape'):
-      shape = tuple(data.shape)
-      for c in ["LoRA-v1-UNET", "LoRA-v1-CLIP"]:
-          if key in COMPONENTS[c]['shapes']:
-              lora_shape = COMPONENTS[c]['shapes'][key]
-              if len(shape) == len(lora_shape):
-                  shape = tuple(a if b != -1 else b for a, b in zip(shape, lora_shape))
-      return shape
-  return tuple()
-def inspect_model(model, all=False):
-    # find all arch's and components in the model
-    # also reasons for failing to find them
-
-    keys = set([(k, tensor_shape(k, model[k])) for k in model])
-
-    rejected = {}
-
-    components = [] # comp -> prefixed
-    classes = {} # class -> [comp]
-    for comp in COMPONENTS:
-        required_keys_unprefixed = COMPONENTS[comp]["keys"]
-        required_keys_prefixed = get_prefixed_keys(comp)
-        missing_unprefixed = required_keys_unprefixed.difference(keys)
-        missing_prefixed = required_keys_prefixed.difference(keys)
-
-        if not missing_unprefixed:
-            components += [(comp, False)]
-        if not missing_prefixed:
-            components += [(comp, True)]
-
-        if missing_prefixed and missing_unprefixed:
-            if missing_prefixed != required_keys_prefixed:
-                rejected[comp] = rejected.get(comp, []) + [{"reason": f"Missing required keys ({len(missing_prefixed)} of {len(required_keys_prefixed)})", "data": list(missing_prefixed)}]
-            
-            if missing_unprefixed != required_keys_unprefixed:
-                rejected[comp] = rejected.get(comp, []) + [{"reason": f"Missing required keys ({len(missing_unprefixed)} of {len(required_keys_unprefixed)})", "data": list(missing_unprefixed)}]
-        else:
-            clss = COMPONENT_CLASS[comp]
-            classes[clss] = [comp] + classes.get(clss, [])
-    
-    
-
-    found = {} # arch -> {class -> [comp]}
-    for arch in ARCHITECTURES:
-        needs_prefix = ARCHITECTURES[arch]["prefixed"]
-        required_classes = set(ARCHITECTURES[arch]["classes"])
-        required_keys = set(ARCHITECTURES[arch]["required"])
-
-        if not required_keys.issubset(keys):
-            missing = required_keys.difference(keys)
-            if missing != required_keys:
-                rejected[arch] = rejected.get(arch, []) + [{"reason": f"Missing required keys ({len(missing)} of {len(required_keys)})", "data": list(missing)}]
-            continue
-
-        found_classes = {}
-        for clss in required_classes:
-            if clss in classes:
-                for comp in classes[clss]:
-                    
-                    if (comp, needs_prefix) in components:# or ((comp, not needs_prefix) in components and not needs_prefix):
-                        found_classes[clss] = found_classes.get(clss, [])
-                        found_classes[clss] += [comp]
-                    #else:
-                    #    rejected[arch] = rejected.get(arch, []) + [{"reason": "Class has incorrect prefix", "data": [clss]}]
-
-        found_class_names = set(found_classes.keys())
-        if not required_classes.issubset(found_class_names):
-            if found_class_names:
-                missing = list(required_classes.difference(found_class_names))
-                rejected[arch] = rejected.get(arch, []) + [{"reason": "Missing required classes", "data": missing}]
-            continue
-
-        found[arch] = found_classes
-
-    # if we found a real architecture then dont show the broken ones
-    if any([a.startswith("SD-") for a in found]):
-        for a in list(found.keys()):
-            if a.endswith("-BROKEN"):
-                del found[a]
-    
-    for arch in list(found.keys()):
-        if "LoRA" in arch:
-            for clss in found[arch]:
-                if len(found[arch][clss]) == 2:
-                    found[arch][clss] = [found[arch][clss][0].replace("-v1-", "-v1A-")]
-    
-    if "LoRA-v1" in found:
-        del found["LoRA-v1-UNET"]
-        del found["LoRA-v1-CLIP"]
-
-    if all:
-        return found, rejected
-    else:
-        return resolve_arch(found)
-
-def prune_model(model, keep_ema, dont_half):
-  arch = inspect_model(model)
-  allowed = get_allowed_keys(arch)
-  for k in list(model.keys()):
-      kk = (k, tensor_shape(k, model[k]))
-      keep = False
-      if kk in allowed:
-          keep = True
-      if k.startswith(EMA_PREFIX) and keep_ema:
-          keep = True
-      if not keep:
-          del model[k]
-          continue
-      if not dont_half and type(model[k]) == torch.Tensor and model[k].dtype == torch.float32:
-          model[k] = model[k].half()
             
 parser = argparse.ArgumentParser(description="Merge two models")
 parser.add_argument("mode", type=str, help="Merging mode")
@@ -600,7 +30,7 @@ parser.add_argument("--delete_source", action="store_true", help="Delete the sou
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
 
 def to_half(tensor, enable):
-    if enable and tensor.dtype == torch.float:
+    if enable and tensor.dtype == torch.float32:
         return tensor.half()
 
     return tensor
@@ -642,6 +72,59 @@ args = parser.parse_args()
 device = args.device
 mode = args.mode
 
+def prune_model(model):
+    sd = model
+    if 'state_dict' in sd:
+        sd = sd['state_dict']
+    sd_pruned = dict()
+    for k in sd:
+        cp = k.startswith('model.diffusion_model.')
+        cp = cp or k.startswith('depth_model.')
+        cp = cp or k.startswith('first_stage_model.')
+        cp = cp or k.startswith('cond_stage_model.')
+        if cp:
+            k_in = k
+            if args.keep_ema:
+                k_ema = 'model_ema.' + k[6:].replace('.', '')
+                if k_ema in sd:
+                    k_in = k_ema
+            if type(sd[k]) == torch.Tensor:
+              if not args.save_half and sd[k].dtype in {torch.float16, torch.float64, torch.bfloat16}:
+                  sd_pruned[k] = sd[k_in].to(torch.float32)
+              elif args.save_half and sd[k].dtype in {torch.float32, torch.float64, torch.bfloat16}:
+                  sd_pruned[k] = sd[k_in].to(torch.float16)
+              else:
+                  sd_pruned[k] = sd[k_in]
+            else:
+              sd_pruned[k] = sd[k_in]      
+    return sd_pruned
+
+output_name = args.output
+if args.functn:
+    if args.prune:
+        output_name += "_pruned"
+if args.save_safetensors:
+    output_file = f'{output_name}.safetensors'
+else:
+    output_file = f'{output_name}.ckpt'
+model_path = args.model_path
+output_path = os.path.join(model_path, output_file)
+fan = 0
+while os.path.isfile(output_path):
+    print(f"{output_file} already exists. Overwrite? (y/n)")
+    overwrite = input()
+    if overwrite == "y":
+        os.remove(output_path)
+        break
+    elif overwrite == "n":
+        if args.save_safetensors:
+            output_file = f"{output_name}_{fan}.safetensors"
+        else:
+            output_file = f"{output_name}_{fan}.ckpt"
+        output_path = os.path.join(model_path, output_file)
+        fan += 1
+    else:
+        print("")
 checkpoint_dict_replacements = {
     'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
     'cond_stage_model.transformer.encoder.': 'cond_stage_model.transformer.text_model.encoder.',
@@ -748,6 +231,18 @@ elif mode == "NoIn":
           vae = safetensors.torch.load_file(args.vae, device=device)
       else:
           vae = torch.load(args.vae, map_location=device)
+  if args.prune:
+    print("Pruning...\n")
+    model = prune_model(model_0, args.keep_ema, args.save_half)
+    print("Saving...")
+    if args.save_safetensors:
+      with torch.no_grad():
+          safetensors.torch.save_file(model, output_path, metadata={"format": "pt"})
+    else:
+        torch.save({"state_dict": model}, output_path)
+    del model
+    exit()
+
 
 alpha = args.alpha
 
@@ -756,6 +251,12 @@ if args.model_1 is not None:
   model_1_name = os.path.splitext(os.path.basename(model_1_path))[0]
 if args.model_2 is not None:
   model_2_name = os.path.splitext(os.path.basename(model_2_path))[0]
+if args.prune:
+  model_0 = prune_model(model_0)
+  if args.model_1 is not None:
+    model_1 = prune_model(model_1)
+  if args.model_2 is not None:
+    model_1 = prune_model(model_1)
 
 def filename_weighted_sum():
   a = model_0_name
@@ -881,44 +382,25 @@ if args.vae is not None:
 if args.save_half and not theta_func2:
     for key in theta_0.keys():
         theta_0[key] = to_half(theta_0[key], args.save_half)   
-output_name = args.output
-if args.functn:
-    if args.prune:
-        output_name += "_pruned"
-if args.save_safetensors:
-    output_file = f'{output_name}.safetensors'
-else:
-    output_file = f'{output_name}.ckpt'
 
 loaded = None
-model_path = args.model_path
-output_path = os.path.join(model_path, output_file)
 # check if output file already exists, ask to overwrite
-if os.path.isfile(output_path):
-    print("Output file already exists. Overwrite? (y/n)")
-    while True:
-        overwrite = input()
-        if overwrite == "y":
-            break
-        elif overwrite == "n":
-            print("Exiting...")
-            exit()
-        else:
-            print("Please enter y or n")
 if args.prune:
   print("Pruning...\n")
-  model = copy.deepcopy(theta_0)
-  prune_model(model, opt.keep_ema, not opt.save_half)
-  if model:
-      print("Saving...")
-      if args.save_safetensors:
-        with torch.no_grad():
-            safetensors.torch.save_file(model, output_path, metadata={"format": "pt"})
-      else:
-          out = METADATA
-          out["state_dict"] = model
-          torch.save(out, output_path)
-      del model
+  output_a = os.path.join(model_path, "test.safetensors")
+  if os.path.isfile(output_a):
+    os.remove(output_a)
+  safetensors.torch.save_file(theta_0, output_a,metadata={"format": "pt"})
+  sd = safetensors.torch.load_file(output_a, device=device)
+  model = prune_model(sd)
+  print("Saving...")
+  if args.save_safetensors:
+    with torch.no_grad():
+        safetensors.torch.save_file(model, output_path, metadata={"format": "pt"})
+  else:
+      torch.save({"state_dict": model}, output_path)
+  del model
+  os.remove(output_a)
 else:
   print("Saving...")
   if args.save_safetensors:
