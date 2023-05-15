@@ -300,7 +300,7 @@ if args.vae is not None:
             theta_0[theta_0_key] = to_half(vae_dict[key], args.save_half)
     del vae_dict
     
-if args.save_half and mode != "NoIn":
+if args.save_half and not theta_func2:
     for key in theta_0.keys():
         theta_0[key] = to_half(theta_0[key], args.save_half)   
 
