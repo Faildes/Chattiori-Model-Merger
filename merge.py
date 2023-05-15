@@ -22,6 +22,7 @@ parser.add_argument("--keep_ema", action="store_true", help="Keep ema", required
 parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
 parser.add_argument("--functn", action="store_true", help="Add function name to the file", required=False)
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
+parser.add_argument("--del_source", action="store_true", help="Delete the source checkpoin file", required=False)
 
 def to_half(tensor, enable):
     if enable and tensor.dtype == torch.float:
@@ -376,11 +377,10 @@ if os.path.isfile(output_path):
         else:
             print("Please enter y or n")
 if args.prune:
-  output_a = os.path.join(model_path, "test.safetensors")
-  safetensors.torch.save_file(theta_0, output_a, metadata={"format": "pt"})
+  output_a = os.path.join(model_path, "test.ckpt")
+  torch.save({"state_dict":theta_0}, output_a)
   print("Pruning...\n")
-  sd = safetensors.torch.load_file(output_a, device)
-  sd = sd["state_dict"] if "state_dict" in sd else sd
+  sd = torch.load(output_a, map_location=device)
   nsd = dict()
   #print(sd.keys())
   for k in sd.keys():
@@ -424,6 +424,8 @@ else:
   else:
       torch.save({"state_dict": theta_0}, output_path)
 output_path = os.path.join(model_path, output_file)
-
+if args.del_source:
+    os.remove(os.path.join(args.model_path, args.model_0))
+    os.remove(os.path.join(args.model_path, args.model_1))
 del theta_0
 print("Done!")
