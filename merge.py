@@ -596,6 +596,7 @@ parser.add_argument("--save_safetensors", action="store_true", help="Save as .sa
 parser.add_argument("--keep_ema", action="store_true", help="Keep ema", required=False)
 parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
 parser.add_argument("--functn", action="store_true", help="Add function name to the file", required=False)
+parser.add_argument("--delete_source", action="store_true", help="Delete the source checkpoint file", required=False)
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
 
 def to_half(tensor, enable):
@@ -687,10 +688,11 @@ def read_state_dict(checkpoint_file, print_global_state=False, map_location=None
   return sd
 
 model_0_path = os.path.join(args.model_path, args.model_0)
-model_1_path = os.path.join(args.model_path, args.model_1)
-
+if args.model_1 is not None:
+    model_1_path = os.path.join(args.model_path, args.model_1)
 if args.model_2 is not None:
   model_2_path = os.path.join(args.model_path, args.model_2)
+
 if mode in ["WS", "SIG", "GEO", "MAX"]:
   interp_method = 0
   _, extension_0 = os.path.splitext(model_0_path)
@@ -746,33 +748,6 @@ elif mode == "NoIn":
           vae = safetensors.torch.load_file(args.vae, device=device)
       else:
           vae = torch.load(args.vae, map_location=device)
-  if args.prune:
-    theta_0 = read_state_dict(model_0_path, map_location=device)
-    print("Pruning...\n")
-    model = copy.deepcopy(theta_0)
-    prune_model(model, opt.keep_ema, not opt.save_half)
-    output_name = args.output
-    if args.functn:
-        if args.prune:
-            output_name += "_pruned"
-    if args.save_safetensors:
-        output_file = f'{output_name}.safetensors'
-    else:
-        output_file = f'{output_name}.ckpt'
-    model_path = args.model_path
-    output_path = os.path.join(model_path, output_file)
-    if model:
-          print("Saving...")
-          if args.save_safetensors:
-            with torch.no_grad():
-                safetensors.torch.save_file(model, output_path, metadata={"format": "pt"})
-          else:
-              out = METADATA
-              out["state_dict"] = model
-              torch.save(out, output_path)
-          del model
-    print("Done!")
-    exit()
 
 alpha = args.alpha
 
@@ -951,6 +926,11 @@ else:
         safetensors.torch.save_file(theta_0, output_path, metadata={"format": "pt"})
   else:
       torch.save({"state_dict": theta_0}, output_path)
-
+if args.delete_source:
+    os.remove(model_0_path)
+    if args.model_1 is not None:
+      os.remove(model_1_path)
+    if args.model_2 is not None:
+      os.remove(model_2_path)
 del theta_0
 print("Done!")
