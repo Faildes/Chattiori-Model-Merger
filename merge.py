@@ -241,6 +241,8 @@ elif mode == "NoIn":
     else:
         torch.save({"state_dict": model}, output_path)
     del model
+    if args.delete_source:
+        os.remove(model_0_path)
     exit()
 
 
