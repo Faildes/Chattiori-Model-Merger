@@ -7,6 +7,9 @@ This script isn't need to be loaded on GPU.
 The mode is:
 
 - "WS" for Weighted Sum
+- "SIG" for Sigmoid Merge
+- "GEO" for Geographic Merge
+- "MAX" for Max Merge
 - "AD" for Add Difference (requires model2)
 - "NoIn" for No Interporation
 
@@ -27,15 +30,18 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
   - For users of [sd-webui](https://github.com/sd-webui/stable-diffusion-webui) (formerly known as HLKY) you should just be able to do
     - `conda activate ldm`
 - run merge.py with arguments
-  - `python merge.py mode model_path model_0 model_1 --alpha 0.5 --output merged`
-    - Optional: `--model_2` sets the tertiory model
+  - Form: `python merge.py mode model_path model_0 model_1 --alpha 0.5 --output merged`
+  - Example: `python merge.py "WS" "C:...\Model parent file path" "FILE A.ckpt" "FILE B.safetensors" --alpha 0.45 --vae "C:...\VAE.safetensors" --prune --save_half --output "MERGED"`
+    - Optional: `--model_2` sets the tertiory model, if omitted
     - Optional: `--alpha` controls how much weight is put on the second model. Defaults to 0.5, if omitted
-    - Optional: `--vae` sets the vae file by set the path
-    - Optional: `--save_half` determines whether save the file as fp16 or not
-    - Optional: `--prune` determines whether prune the model or not
-    - Optional: `--keep_ema` determines keep only ema while prune
-    - Optional: `--save_safetensors` determines whether save the file as safetensors
+    - Optional: `--vae` sets the vae file by set the path, if omitted
+    - Optional: `--save_half` determines whether save the file as fp16, if omitted
+    - Optional: `--prune` determines whether prune the model, if omitted
+    - Optional: `--keep_ema` determines keep only ema while prune, if omitted
+    - Optional: `--save_safetensors` determines whether save the file as safetensors, if omitted
     - Optional: `--output` is the filename of the merged file, without file extension. Defaults to "merged", if omitted
+    - Optional: `--functn` determines whether add merge function names, if omitted
+    - Optional: `--delete_source` determines whether to delete the source checkpoint files, if omitted
     - Optional: `--device` is the device that's going to be used to merge the models. Unless you have a ton of VRAM, you should probably just ignore this. Defaults to 'cpu', if omitted.
       - Required VRAM seems to be roughly equivalent to the size of `(size of both models) * 1.15`. Merging 2 models at 3.76GB resulted in rougly 8.6GB of VRAM usage on top of everything else going on.
       - If you have enough VRAM to merge on your GPU you can use `--device "cuda:x"` where x is the card corresponding to the output of `nvidia-smi -L`
