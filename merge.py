@@ -357,21 +357,24 @@ elif mode == "NoIn":
           vae = safetensors.torch.load_file(args.vae, device=device)
       else:
           vae = torch.load(args.vae, map_location=device)
+elif mode == "RM":
+  print(read_metadata_from_safetensors(model_0_path))
+  exit()
 alpha = args.alpha
 
 model_0_name = os.path.splitext(os.path.basename(model_0_path))[0]
 model_0_sha256 = sha256_from_cache(model_0_path, f"checkpoint/{model_0_name}")
-if args.model_1 is not None:
+if mode != "NoIn":
   model_1_name = os.path.splitext(os.path.basename(model_1_path))[0]
   model_1_sha256 = sha256_from_cache(model_1_path, f"checkpoint/{model_1_name}")
-if args.model_2 is not None:
+if mode == "AD":
   model_2_name = os.path.splitext(os.path.basename(model_2_path))[0]
   model_2_sha256 = sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}")
 if args.prune:
   model_0 = prune_model(model_0)
-  if args.model_1 is not None:
+  if mode != "NoIn":
     model_1 = prune_model(model_1)
-  if args.model_2 is not None:
+  if mode == "AD":
     model_2 = prune_model(model_2)
 if args.vae is not None:
   vae_name = os.path.splitext(os.path.basename(args.vae))[0]
@@ -561,9 +564,9 @@ else:
       torch.save({"state_dict": theta_0}, output_path)
 if args.delete_source:
     os.remove(model_0_path)
-    if args.model_1 is not None:
+    if mode != "NoIn":
       os.remove(model_1_path)
-    if args.model_2 is not None:
+    if mode == "AD":
       os.remove(model_2_path)
 del theta_0
 print("Done!")
