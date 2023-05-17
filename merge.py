@@ -289,6 +289,13 @@ def read_state_dict(checkpoint_file, print_global_state=False, map_location=None
   sd = get_state_dict_from_checkpoint(pl_sd)
   return sd
 
+vae_ignore_keys = {"model_ema.decay", "model_ema.num_updates"}
+
+def load_vae_dict(filename, map_location):
+    vae_ckpt = read_state_dict(filename, map_location=map_location)
+    vae_dict_1 = {k: v for k, v in vae_ckpt.items() if k[0:4] != "loss" and k not in vae_ignore_keys}
+    return vae_dict_1
+
 model_0_path = os.path.join(args.model_path, args.model_0)
 if args.model_1 is not None:
     model_1_path = os.path.join(args.model_path, args.model_1)
@@ -350,12 +357,6 @@ elif mode == "NoIn":
           vae = safetensors.torch.load_file(args.vae, device=device)
       else:
           vae = torch.load(args.vae, map_location=device)
-  if args.prune:
-    print("Pruning...\n")
-    model = prune_model(model_0, args.keep_ema, args.save_half)
-    print("Saving...")
-
-
 alpha = args.alpha
 
 model_0_name = os.path.splitext(os.path.basename(model_0_path))[0]
@@ -371,8 +372,9 @@ if args.prune:
   if args.model_1 is not None:
     model_1 = prune_model(model_1)
   if args.model_2 is not None:
-    model_1 = prune_model(model_1)
-
+    model_2 = prune_model(model_2)
+if args.vae is not None:
+  vae_name = os.path.splitext(os.path.basename(args.vae))[0]
 metadata = {"format": "pt", "sd_merge_models": {}, "sd_merge_recipe": None}
 
 merge_recipe = {
@@ -380,11 +382,10 @@ merge_recipe = {
 "primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_name}"),
 "secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_name}") if mode != "NoIn" else None,
 "tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}") if mode == "AD" else None,
-"interp_method": mode,
-"multiplier": alpha,
+"merge_method": mode,
+"alpha": alpha,
 "save_as_half": args.save_half,
-"custom_name": output_name,
-"config_source": 0,
+"output_name": output_name,
 "bake_in_vae": True if args.vae is not None else False,
 "pruned": args.prune
 }
@@ -414,16 +415,6 @@ if mode == "AD":
 
 metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
 
-if mode == "NoIn" and args.prune:
-    if args.save_safetensors:
-      with torch.no_grad():
-          safetensors.torch.save_file(model, output_path, metadata=metadata)
-    else:
-        torch.save({"state_dict": model}, output_path)
-    del model
-    if args.delete_source:
-        os.remove(model_0_path)
-    exit()
 def filename_weighted_sum():
   a = model_0_name
   b = model_1_name
@@ -499,42 +490,35 @@ if theta_func1:
 
 print(f"Loading {model_0_name}...")
 theta_0 = read_state_dict(model_0_path, map_location=device)
+if mode != "NoIn":
+	for key in tqdm(theta_0.keys(), desc="Merging"):
+	    if theta_1 and "model" in key and key in theta_1:
+	      if key in checkpoint_dict_skip_on_merge:
+		continue
+	      a = theta_0[key]
+	      b = theta_1[key]
 
-for key in tqdm(theta_0.keys(), desc="Merging"):
-    if theta_1 and "model" in key and key in theta_1:
-      if key in checkpoint_dict_skip_on_merge:
-        continue
-      a = theta_0[key]
-      b = theta_1[key]
+	      # this enables merging an inpainting model (A) with another one (B);
+	      # where normal model would have 4 channels, for latenst space, inpainting model would
+	      # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
+	      if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
+		  if a.shape[1] == 4 and b.shape[1] == 9:
+		      raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
+		  if a.shape[1] == 4 and b.shape[1] == 8:
+		      raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
 
-      # this enables merging an inpainting model (A) with another one (B);
-      # where normal model would have 4 channels, for latenst space, inpainting model would
-      # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
-      if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
-          if a.shape[1] == 4 and b.shape[1] == 9:
-              raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
-          if a.shape[1] == 4 and b.shape[1] == 8:
-              raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
+		  if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
+		      theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
+		      result_is_instruct_pix2pix_model = True
+		  else:
+		      assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
+		      theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
+		      result_is_inpainting_model = True
+	      else:
+		  theta_0[key] = theta_func2(a, b, alpha)
 
-          if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
-              result_is_instruct_pix2pix_model = True
-          else:
-              assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
-              result_is_inpainting_model = True
-      else:
-          theta_0[key] = theta_func2(a, b, alpha)
-      
-      theta_0[key] = to_half(theta_0[key], args.save_half)
-del theta_1
-
-vae_ignore_keys = {"model_ema.decay", "model_ema.num_updates"}
-
-def load_vae_dict(filename, map_location):
-    vae_ckpt = read_state_dict(filename, map_location=map_location)
-    vae_dict_1 = {k: v for k, v in vae_ckpt.items() if k[0:4] != "loss" and k not in vae_ignore_keys}
-    return vae_dict_1
+	      theta_0[key] = to_half(theta_0[key], args.save_half)
+	del theta_1
             
 if args.vae is not None:
     print(f"Baking in VAE")
