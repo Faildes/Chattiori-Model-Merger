@@ -508,17 +508,17 @@ if mode != "NoIn":
         if a.shape[1] == 4 and b.shape[1] == 8:
           raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
 
-      if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
-        theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
-        result_is_instruct_pix2pix_model = True
+        if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
+          theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
+          result_is_instruct_pix2pix_model = True
+        else:
+          assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
+          theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
+          result_is_inpainting_model = True
       else:
-        assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
-        theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
-        result_is_inpainting_model = True
-    else:
-      theta_0[key] = theta_func2(a, b, alpha)
+        theta_0[key] = theta_func2(a, b, alpha)
 
-    theta_0[key] = to_half(theta_0[key], args.save_half)
+      theta_0[key] = to_half(theta_0[key], args.save_half)
   del theta_1
             
 if args.vae is not None:
