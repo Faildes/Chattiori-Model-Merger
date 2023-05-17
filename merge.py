@@ -491,34 +491,35 @@ if theta_func1:
 print(f"Loading {model_0_name}...")
 theta_0 = read_state_dict(model_0_path, map_location=device)
 if mode != "NoIn":
-	for key in tqdm(theta_0.keys(), desc="Merging"):
-	    if theta_1 and "model" in key and key in theta_1:
-	      if key in checkpoint_dict_skip_on_merge:
-		continue
-	      a = theta_0[key]
-	      b = theta_1[key]
+  for key in tqdm(theta_0.keys(), desc="Merging"):
+    if theta_1 and "model" in key and key in theta_1:
 
-	      # this enables merging an inpainting model (A) with another one (B);
-	      # where normal model would have 4 channels, for latenst space, inpainting model would
-	      # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
-	      if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
-		  if a.shape[1] == 4 and b.shape[1] == 9:
-		      raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
-		  if a.shape[1] == 4 and b.shape[1] == 8:
-		      raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
+      if key in checkpoint_dict_skip_on_merge:
+        continue
+      a = theta_0[key]
+      b = theta_1[key]
 
-		  if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
-		      theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
-		      result_is_instruct_pix2pix_model = True
-		  else:
-		      assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
-		      theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
-		      result_is_inpainting_model = True
-	      else:
-		  theta_0[key] = theta_func2(a, b, alpha)
+      # this enables merging an inpainting model (A) with another one (B);
+      # where normal model would have 4 channels, for latenst space, inpainting model would
+      # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
+      if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
+        if a.shape[1] == 4 and b.shape[1] == 9:
+          raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
+        if a.shape[1] == 4 and b.shape[1] == 8:
+          raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
 
-	      theta_0[key] = to_half(theta_0[key], args.save_half)
-	del theta_1
+      if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
+        theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
+        result_is_instruct_pix2pix_model = True
+      else:
+        assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
+        theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
+        result_is_inpainting_model = True
+    else:
+      theta_0[key] = theta_func2(a, b, alpha)
+
+    theta_0[key] = to_half(theta_0[key], args.save_half)
+  del theta_1
             
 if args.vae is not None:
     print(f"Baking in VAE")
