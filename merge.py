@@ -359,13 +359,13 @@ elif mode == "NoIn":
 alpha = args.alpha
 
 model_0_name = os.path.splitext(os.path.basename(model_0_path))[0]
-model_0_sha256 = sha256_from_cache(model_0_path, f"checkpoint/{name}")
+model_0_sha256 = sha256_from_cache(model_0_path, f"checkpoint/{model_0_name}")
 if args.model_1 is not None:
   model_1_name = os.path.splitext(os.path.basename(model_1_path))[0]
-  model_1_sha256 = sha256_from_cache(model_1_path, f"checkpoint/{name}")
+  model_1_sha256 = sha256_from_cache(model_1_path, f"checkpoint/{model_1_name}")
 if args.model_2 is not None:
   model_2_name = os.path.splitext(os.path.basename(model_2_path))[0]
-  model_2_sha256 = sha256_from_cache(model_2_path, f"checkpoint/{name}")
+  model_2_sha256 = sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}")
 if args.prune:
   model_0 = prune_model(model_0)
   if args.model_1 is not None:
@@ -378,8 +378,8 @@ metadata = {"format": "pt", "sd_merge_models": {}, "sd_merge_recipe": None}
 merge_recipe = {
 "type": "merge-model-chattiori", # indicate this model was merged with chattiori's model mereger
 "primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_name}"),
-"secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_name}") if mode is not "NoIn" else None,
-"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}") if mode is "AD" else None,
+"secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_name}") if mode != "NoIn" else None,
+"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}") if mode == "AD" else None,
 "interp_method": mode,
 "multiplier": alpha,
 "save_as_half": args.save_half,
@@ -407,9 +407,9 @@ def add_model_metadata(filename):
   metadata["sd_merge_models"].update(metadata_t.get("sd_merge_models", {}))
 
 add_model_metadata(model_0_path)
-if secondary_model_info:
+if mode != "NoIn":
   add_model_metadata(model_1_path)
-if tertiary_model_info:
+if mode == "AD":
   add_model_metadata(model_2_path)
 
 metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
