@@ -393,7 +393,11 @@ metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
 def add_model_metadata(filename):
   sha256_t = sha256(filename, f"checkpoint/{os.path.splitext(os.path.basename(filename))[0]}")
   hash_t = model_hash(filename)
-  metadata_t = read_metadata_from_safetensors(filename)
+  _, extension_t = os.path.splitext(filename)
+  if extension_t.lower() == ".safetensors":
+    metadata_t = read_metadata_from_safetensors(filename)
+  else:
+    metadata_t = {}
   metadata["sd_merge_models"][sha256_t] = {
   "name": os.path.splitext(os.path.basename(filename))[0],
   "legacy_hash": hash_t,
