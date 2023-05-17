@@ -2,7 +2,10 @@ import glob
 import os
 import sys
 import time
+import hashlib
+import json
 
+import filelock
 import copy
 import argparse
 import torch
@@ -29,6 +32,13 @@ parser.add_argument("--functn", action="store_true", help="Add function name to 
 parser.add_argument("--delete_source", action="store_true", help="Delete the source checkpoint file", required=False)
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
 
+args = parser.parse_args()
+device = args.device
+mode = args.mode
+
+cache_filename = os.path.join(args.model_path, "cache.json")
+cache_data = None
+
 def to_half(tensor, enable):
     if enable and tensor.dtype == torch.float32:
         return tensor.half()
@@ -50,6 +60,119 @@ def save_weights(weights, path):
   else:
       torch.save({"state_dict": weights}, path) 
 
+def cache(subsection):
+    global cache_data
+
+    if cache_data is None:
+        with filelock.FileLock(f"{cache_filename}.lock"):
+            if not os.path.isfile(cache_filename):
+                cache_data = {}
+            else:
+                with open(cache_filename, "r", encoding="utf8") as file:
+                    cache_data = json.load(file)
+
+    s = cache_data.get(subsection, {})
+    cache_data[subsection] = s
+
+    return s
+
+def dump_cache():
+    with filelock.FileLock(f"{cache_filename}.lock"):
+        with open(cache_filename, "w", encoding="utf8") as file:
+            json.dump(cache_data, file, indent=4)
+	
+def sha256(filename, title):
+    hashes = cache("hashes")
+
+    sha256_value = sha256_from_cache(filename, title)
+    if sha256_value is not None:
+        return sha256_value
+
+    print(f"Calculating sha256 for {filename}: ", end='')
+    sha256_value = calculate_sha256(filename)
+    print(f"{sha256_value}")
+
+    hashes[title] = {
+        "mtime": os.path.getmtime(filename),
+        "sha256": sha256_value,
+    }
+
+    dump_cache()
+
+    return sha256_value
+
+def calculate_shorthash(filename):
+    sha256 = sha256(filename, f"checkpoint/{os.path.splitext(os.path.basename(filename))[0]}")
+    if sha256 is None:
+        return
+
+    shorthash = sha256[0:10]
+
+    return shorthash
+
+def calculate_sha256(filename):
+    hash_sha256 = hashlib.sha256()
+    blksize = 1024 * 1024
+
+    with open(filename, "rb") as f:
+        for chunk in iter(lambda: f.read(blksize), b""):
+            hash_sha256.update(chunk)
+
+    return hash_sha256.hexdigest()
+
+
+def sha256_from_cache(filename, title):
+    hashes = cache("hashes")
+    ondisk_mtime = os.path.getmtime(filename)
+
+    if title not in hashes:
+        return None
+
+    cached_sha256 = hashes[title].get("sha256", None)
+    cached_mtime = hashes[title].get("mtime", 0)
+
+    if ondisk_mtime > cached_mtime or cached_sha256 is None:
+        return None
+
+    return cached_sha256
+
+def model_hash(filename):
+    """old hash that only looks at a small part of the file and is prone to collisions"""
+
+    try:
+        with open(filename, "rb") as file:
+            import hashlib
+            m = hashlib.sha256()
+
+            file.seek(0x100000)
+            m.update(file.read(0x10000))
+            return m.hexdigest()[0:8]
+    except FileNotFoundError:
+        return 'NOFILE'
+
+def read_metadata_from_safetensors(filename):
+    import json
+
+    with open(filename, mode="rb") as file:
+        metadata_len = file.read(8)
+        metadata_len = int.from_bytes(metadata_len, "little")
+        json_start = file.read(2)
+
+        assert metadata_len > 2 and json_start in (b'{"', b"{'"), f"{filename} is not a safetensors file"
+        json_data = json_start + file.read(metadata_len-2)
+        json_obj = json.loads(json_data)
+
+        res = {}
+        for k, v in json_obj.get("__metadata__", {}).items():
+            res[k] = v
+            if isinstance(v, str) and v[0:1] == '{':
+                try:
+                    res[k] = json.loads(v)
+                except Exception as e:
+                    pass
+
+        return res
+
 def weight_max(theta0, theta1, alpha):
     return torch.max(theta0, theta1)
 
@@ -67,10 +190,6 @@ def get_difference(theta1, theta2):
 
 def add_difference(theta0, theta1_2_diff, alpha):
     return theta0 + (alpha * theta1_2_diff)
-
-args = parser.parse_args()
-device = args.device
-mode = args.mode
 
 def prune_model(model):
     sd = model
@@ -235,24 +354,18 @@ elif mode == "NoIn":
     print("Pruning...\n")
     model = prune_model(model_0, args.keep_ema, args.save_half)
     print("Saving...")
-    if args.save_safetensors:
-      with torch.no_grad():
-          safetensors.torch.save_file(model, output_path, metadata={"format": "pt"})
-    else:
-        torch.save({"state_dict": model}, output_path)
-    del model
-    if args.delete_source:
-        os.remove(model_0_path)
-    exit()
 
 
 alpha = args.alpha
 
 model_0_name = os.path.splitext(os.path.basename(model_0_path))[0]
+model_0_sha256 = sha256_from_cache(model_0_path, f"checkpoint/{name}")
 if args.model_1 is not None:
   model_1_name = os.path.splitext(os.path.basename(model_1_path))[0]
+  model_1_sha256 = sha256_from_cache(model_1_path, f"checkpoint/{name}")
 if args.model_2 is not None:
   model_2_name = os.path.splitext(os.path.basename(model_2_path))[0]
+  model_2_sha256 = sha256_from_cache(model_2_path, f"checkpoint/{name}")
 if args.prune:
   model_0 = prune_model(model_0)
   if args.model_1 is not None:
@@ -260,6 +373,53 @@ if args.prune:
   if args.model_2 is not None:
     model_1 = prune_model(model_1)
 
+metadata = {"format": "pt", "sd_merge_models": {}, "sd_merge_recipe": None}
+
+merge_recipe = {
+"type": "merge-model-chattiori", # indicate this model was merged with chattiori's model mereger
+"primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_name}"),
+"secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_name}") if mode is not "NoIn" else None,
+"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}") if mode is "AD" else None,
+"interp_method": mode,
+"multiplier": alpha,
+"save_as_half": args.save_half,
+"custom_name": output_name,
+"config_source": 0,
+"bake_in_vae": True if args.vae is not None else False,
+"pruned": args.prune
+}
+metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
+
+def add_model_metadata(filename):
+  sha256_t = sha256(filename, f"checkpoint/{os.path.splitext(os.path.basename(filename))[0]}")
+  hash_t = model_hash(filename)
+  metadata_t = read_metadata_from_safetensors(filename)
+  metadata["sd_merge_models"][sha256_t] = {
+  "name": os.path.splitext(os.path.basename(filename))[0],
+  "legacy_hash": hash_t,
+  "sd_merge_recipe": metadata_t.get("sd_merge_recipe", None)
+  }
+
+  metadata["sd_merge_models"].update(metadata_t.get("sd_merge_models", {}))
+
+add_model_metadata(model_0_path)
+if secondary_model_info:
+  add_model_metadata(model_1_path)
+if tertiary_model_info:
+  add_model_metadata(model_2_path)
+
+metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
+
+if mode == "NoIn" and args.prune:
+    if args.save_safetensors:
+      with torch.no_grad():
+          safetensors.torch.save_file(model, output_path, metadata=metadata)
+    else:
+        torch.save({"state_dict": model}, output_path)
+    del model
+    if args.delete_source:
+        os.remove(model_0_path)
+    exit()
 def filename_weighted_sum():
   a = model_0_name
   b = model_1_name
@@ -392,13 +552,13 @@ if args.prune:
   output_a = os.path.join(model_path, "test.safetensors")
   if os.path.isfile(output_a):
     os.remove(output_a)
-  safetensors.torch.save_file(theta_0, output_a,metadata={"format": "pt"})
+  safetensors.torch.save_file(theta_0, output_a,metadata=metadata)
   sd = safetensors.torch.load_file(output_a, device=device)
   model = prune_model(sd)
   print("Saving...")
   if args.save_safetensors:
     with torch.no_grad():
-        safetensors.torch.save_file(model, output_path, metadata={"format": "pt"})
+        safetensors.torch.save_file(model, output_path, metadata=metadata)
   else:
       torch.save({"state_dict": model}, output_path)
   del model
@@ -407,7 +567,7 @@ else:
   print("Saving...")
   if args.save_safetensors:
     with torch.no_grad():
-        safetensors.torch.save_file(theta_0, output_path, metadata={"format": "pt"})
+        safetensors.torch.save_file(theta_0, output_path, metadata=metadata)
   else:
       torch.save({"state_dict": theta_0}, output_path)
 if args.delete_source:
