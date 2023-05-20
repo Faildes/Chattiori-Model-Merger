@@ -58,7 +58,7 @@ parser.add_argument("--device", type=str, help="Device to use, defaults to cpu",
 args = parser.parse_args()
 device = args.device
 mode = args.mode
-if (args.cosine0 and args.cosine1) or (mode == "WS" and (args.cosine0 or args.cosine1)):
+if (args.cosine0 and args.cosine1) or mode != "WS":
   cosine0 = False
   cosine1 = False
 else:
