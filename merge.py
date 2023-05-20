@@ -1,20 +1,40 @@
 import glob
 import os
+import numpy as np
 import sys
 import time
 import hashlib
 import json
+import datetime
+import csv
 
 import filelock
 import copy
 import argparse
 import torch
+import torch.nn as nn
+import scipy.ndimage
+from scipy.ndimage.filters import median_filter as filter
 import re
 import shutil
 import safetensors.torch
 import safetensors
 from tqdm import tqdm
-            
+
+NUM_INPUT_BLOCKS = 12
+NUM_MID_BLOCK = 1
+NUM_OUTPUT_BLOCKS = 12
+NUM_TOTAL_BLOCKS = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + NUM_OUTPUT_BLOCKS
+blockid=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
+
+def wgt(string):
+  if type(string) == int or type(string) == float:
+    useblocks = False
+    return float(string)
+  elif type(string) == list:
+    useblocks = True
+    return string
+
 parser = argparse.ArgumentParser(description="Merge two models")
 parser.add_argument("mode", type=str, help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
@@ -22,7 +42,10 @@ parser.add_argument("model_0", type=str, help="Name of model 0")
 parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None)
 parser.add_argument("--model_2", type=str, help="Optional, Name of model 2", default=None, required=False)
 parser.add_argument("--vae", type=str, help="Path to vae", default=None, required=False)
-parser.add_argument("--alpha", type=float, help="Alpha value, optional, defaults to 0.5", default=0.5, required=False)
+parser.add_argument("--alpha", type=wgt, help="Alpha value, optional, defaults to 0", default=0.5, required=False)
+parser.add_argument("--beta", type=wgt, help="Beta value, optional, defaults to 0", default=0.0, required=False)
+parser.add_argument("--cosine0", action="store_true", help="favors model0's structure with details from 1", required=False)
+parser.add_argument("--cosine1", action="store_true", help="favors model1's structure with details from 0", required=False)
 parser.add_argument("--save_half", action="store_true", help="Save as float16", required=False)
 parser.add_argument("--prune", action="store_true", help="Prune Model", required=False)
 parser.add_argument("--save_safetensors", action="store_true", help="Save as .safetensors", required=False)
@@ -35,7 +58,12 @@ parser.add_argument("--device", type=str, help="Device to use, defaults to cpu",
 args = parser.parse_args()
 device = args.device
 mode = args.mode
-
+if (args.cosine0 and args.cosine1) or (mode == "WS" and (args.cosine0 or args.cosine1)):
+  cosine0 = False
+  cosine1 = False
+else:
+  cosine0 = args.cosine0
+  cosine1 = args.cosine1
 cache_filename = os.path.join(args.model_path, "cache.json")
 cache_data = None
 
@@ -183,7 +211,54 @@ def sigmoid(theta0, theta1, alpha):
     return (1 / (1 + torch.exp(-4 * alpha))) * (theta0 + theta1) - (1 / (1 + torch.exp(-alpha))) * theta0
 
 def weighted_sum(theta0, theta1, alpha):
-    return ((1 - alpha) * theta0) + (alpha * theta1)
+    if alpha == 0:
+	return theta0
+    elif alpha == 1:
+	return theta1
+    else:
+    	return ((1 - alpha) * theta0) + (alpha * theta1)
+
+def sum_twice(theta0, theta1, theta2, alpha, beta):
+    if beta == 1:
+	return theta2
+    if alpha == 0:
+	if beta == 0:
+	    return theta0
+	else:
+	    return ((1 - beta) * theta0) + (beta * theta2)
+    elif alpha == 1:
+	if beta == 0:
+	    return theta1
+        else:
+	    return ((1 - beta) * theta1) + (beta * theta2)
+    else:
+	if beta == 0:
+	    return ((1 - alpha) * theta0) + (alpha * theta1)
+	else:
+            return ((1 - alpha) * (1 - beta) * theta0) + (alpha * (1 - beta) * theta1) + (beta * theta2)
+
+def triple_sum(theta0, theta1, theta2, alpha, beta):
+    if alpha == 0:
+	if beta == 0:
+	    return theta0
+	elif beta == 1:
+	    return theta2
+	else:
+	    return ((1 - beta) * theta0) + (beta * theta2)
+    elif alpha == 1:
+	if beta == 0:
+	    return theta1
+	elif beta == 1:
+	    return theta1 + theta2 - theta0
+	else:
+	    return theta1 + (beta * theta2) - (beta * theta0)
+    else:
+	if beta == 0:
+	    return ((1 - alpha) * theta0) + (alpha * theta1)
+	elif beta == 1:
+	    return (alpha * theta1) + theta2 - (alpha * theta0)
+	else:
+    	    return ((1 - alpha - beta) * theta0) + (alpha * theta1) + (beta * theta2)
 
 def get_difference(theta1, theta2):
     return theta1 - theta2
@@ -320,7 +395,7 @@ if mode in ["WS", "SIG", "GEO", "MAX"]:
           vae = safetensors.torch.load_file(args.vae, device=device)
       else:
           vae = torch.load(args.vae, map_location=device)
-elif mode == "AD":
+elif mode in ["sAD", "AD", "TRS", "ST"]:
   interp_method = 0
   _, extension_0 = os.path.splitext(model_0_path)
   if extension_0.lower() == ".safetensors":
@@ -357,24 +432,42 @@ elif mode == "NoIn":
           vae = safetensors.torch.load_file(args.vae, device=device)
       else:
           vae = torch.load(args.vae, map_location=device)
+		
 elif mode == "RM":
   print(read_metadata_from_safetensors(model_0_path))
   exit()
-alpha = args.alpha
-
+usebeta = False	
+if type(args.alpha) == list:
+  weights_a = args.alpha
+  alpha = weights_a[0]
+else:
+  weights_a = None
+  alpha = args.alpha
+if mode in ["TRS","ST"]:
+  usebeta = True
+  if type(args.beta) == list:
+    weights_b = args.beta
+    beta = weights_b[0]
+  else:
+    weights_b = None
+    beta = args.beta
+else:
+  weights_b = None
+  beta = None
+	
 model_0_name = os.path.splitext(os.path.basename(model_0_path))[0]
 model_0_sha256 = sha256_from_cache(model_0_path, f"checkpoint/{model_0_name}")
 if mode != "NoIn":
   model_1_name = os.path.splitext(os.path.basename(model_1_path))[0]
   model_1_sha256 = sha256_from_cache(model_1_path, f"checkpoint/{model_1_name}")
-if mode == "AD":
+if mode in ["sAD", "AD", "TRS", "ST"]:
   model_2_name = os.path.splitext(os.path.basename(model_2_path))[0]
   model_2_sha256 = sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}")
 if args.prune:
   model_0 = prune_model(model_0)
   if mode != "NoIn":
     model_1 = prune_model(model_1)
-  if mode == "AD":
+  if mode in ["sAD", "AD", "TRS", "ST"]:
     model_2 = prune_model(model_2)
 if args.vae is not None:
   vae_name = os.path.splitext(os.path.basename(args.vae))[0]
@@ -384,9 +477,14 @@ merge_recipe = {
 "type": "merge-model-chattiori", # indicate this model was merged with chattiori's model mereger
 "primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_name}"),
 "secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_name}") if mode != "NoIn" else None,
-"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}") if mode == "AD" else None,
+"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}") if mode in ["sAD", "AD", "TRS", "ST"] else None,
 "merge_method": mode,
+"block_weights": bw,
 "alpha": alpha,
+"alphas": weights_a,
+"beta": beta,
+"betas": weights_b,
+"calculation": "cosine_0" if cosine0 "cosine_1" if cosine1 else None,
 "save_as_half": args.save_half,
 "output_name": output_name,
 "bake_in_vae": True if args.vae is not None else False,
@@ -413,7 +511,7 @@ def add_model_metadata(filename):
 add_model_metadata(model_0_path)
 if mode != "NoIn":
   add_model_metadata(model_1_path)
-if mode == "AD":
+if mode in ["sAD", "AD", "TRS", "ST"]:
   add_model_metadata(model_2_path)
 
 metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
@@ -433,6 +531,27 @@ def filename_geom():
   Mb = round(alpha, 2)
 
   return f"{Ma}({a}) + {Mb}({b}) GEO"
+
+def filename_sum_twice():
+  a = model_0_name
+  b = model_1_name
+  c = model_2_name
+  Ma = round(1 - alpha, 2)
+  Mb = round(alpha, 2)
+  Mab = round(1 - beta, 2)
+  Mc = round(beta, 2)
+
+  return f"{Mab}({Ma}({a}) + {Mb}({b})) + {Mc}({c})"
+
+def filename_triple_sum():
+  a = model_0_name
+  b = model_1_name
+  c = model_2_name
+  Ma = round(1 - alpha - beta, 2)
+  Mb = round(alpha, 2)
+  Mc = round(beta, 2)
+
+  return f"{Ma}({a}) + {Mb}({b}) + {Mc}({c})"
 
 def filename_max():
   a = model_0_name
@@ -462,12 +581,15 @@ def filename_nothing():
   return model_0_name
   
 theta_funcs = {
-    "WS": (filename_weighted_sum, None, weighted_sum),
-    "AD": (filename_add_difference, get_difference, add_difference),
+    "WS":   (filename_weighted_sum, None, weighted_sum),
+    "AD":   (filename_add_difference, get_difference, add_difference),
+    "sAD":   (filename_add_difference, get_difference, smooth_add_difference),
+    "TRS":  (filename_triple_sum, None, triple_sum),
+    "ST":   (filename_sum_twice, None, sum_twice),
     "NoIn": (filename_nothing, None, None),
-    "SIG": (filename_sigmoid, None, sigmoid),
-    "GEO": (filename_geom, None, geom),
-    "MAX": (filename_max, None, weight_max),
+    "SIG":  (filename_sigmoid, None, sigmoid),
+    "GEO":  (filename_geom, None, geom),
+    "MAX":  (filename_max, None, weight_max),
 }
 filename_generator, theta_func1, theta_func2 = theta_funcs[mode] 
 
@@ -476,13 +598,13 @@ if theta_func2:
   theta_1 = read_state_dict(model_1_path, map_location=device)
 else:
   theta_1 = None
-        
-if theta_func1:
+
+if mode in ["sAD", "AD", "TRS", "ST"]:
   print(f"Loading {model_2_name}...")
   theta_2 = read_state_dict(model_2_path, map_location=device)
-  for key in tqdm(theta_1.keys()):
-    if key in checkpoint_dict_skip_on_merge:
-      continue
+
+if theta_func1:
+  for key in tqdm(theta_1.keys(), desc="Stage 0/2"):
     if 'model' in key:
       if key in theta_2:
           t2 = theta_2.get(key, torch.zeros_like(theta_1[key]))
@@ -491,37 +613,160 @@ if theta_func1:
           theta_1[key] = torch.zeros_like(theta_1[key])
   del theta_2
 
+re_inp = re.compile(r'\.input_blocks\.(\d+)\.')  # 12
+re_mid = re.compile(r'\.middle_block\.(\d+)\.')  # 1
+re_out = re.compile(r'\.output_blocks\.(\d+)\.') # 12
 print(f"Loading {model_0_name}...")
 theta_0 = read_state_dict(model_0_path, map_location=device)
-if mode != "NoIn":
-  for key in tqdm(theta_0.keys(), desc="Merging"):
-    if theta_1 and "model" in key and key in theta_1:
 
+if cosine0: #favors modelA's structure with details from B
+    sim = torch.nn.CosineSimilarity(dim=0)
+    sims = np.array([], dtype=np.float64)
+    for key in (tqdm(theta_0.keys(), desc="Stage 0/2")):
+        # skip VAE model parameters to get better results
+        if "first_stage_model" in key: continue
+        if "model" in key and key in theta_1:
+            theta_0_norm = nn.functional.normalize(theta_0[key].to(torch.float32), p=2, dim=0)
+            theta_1_norm = nn.functional.normalize(theta_1[key].to(torch.float32), p=2, dim=0)
+            simab = sim(theta_0_norm, theta_1_norm)
+            sims = np.append(sims,simab.numpy())
+    sims = sims[~np.isnan(sims)]
+    sims = np.delete(sims, np.where(sims<np.percentile(sims, 1 ,method = 'midpoint')))
+    sims = np.delete(sims, np.where(sims>np.percentile(sims, 99 ,method = 'midpoint')))
+
+if cosine1: #favors modelB's structure with details from A
+    sim = torch.nn.CosineSimilarity(dim=0)
+    sims = np.array([], dtype=np.float64)
+    for key in (tqdm(theta_0.keys(), desc="Stage 0/2")):
+        # skip VAE model parameters to get better results
+        if "first_stage_model" in key: continue
+        if "model" in key and key in theta_1:
+            simab = sim(theta_0[key].to(torch.float32), theta_1[key].to(torch.float32))
+            dot_product = torch.dot(theta_0[key].view(-1).to(torch.float32), theta_1[key].view(-1).to(torch.float32))
+            magnitude_similarity = dot_product / (torch.norm(theta_0[key].to(torch.float32)) * torch.norm(theta_1[key].to(torch.float32)))
+            combined_similarity = (simab + magnitude_similarity) / 2.0
+            sims = np.append(sims, combined_similarity.numpy())
+    sims = sims[~np.isnan(sims)]
+    sims = np.delete(sims, np.where(sims < np.percentile(sims, 1, method='midpoint')))
+    sims = np.delete(sims, np.where(sims > np.percentile(sims, 99, method='midpoint')))
+
+if mode != "NoIn":
+  for key in tqdm(theta_0.keys(), desc="Stage 1/2"):
+    if theta_1 and "model" in key and key in theta_1:
+      if usebeta and not key in theta_2:
+         continue
+      weight_index = -1
+      current_alpha = alpha
+      current_beta = beta
       if key in checkpoint_dict_skip_on_merge:
         continue
       a = theta_0[key]
       b = theta_1[key]
+      if usebeta:
+	c = theta_2[key]
+      # check weighted and U-Net or not
+      if useblocks and 'model.diffusion_model.' in key:
+	# check block index
+	weight_index = -1
 
+	if 'time_embed' in key:
+	    weight_index = 0                # before input blocks
+	elif '.out.' in key:
+	    weight_index = NUM_TOTAL_BLOCKS - 1     # after output blocks
+	else:
+	    m = re_inp.search(key)
+	    if m:
+		inp_idx = int(m.groups()[0])
+		weight_index = inp_idx
+	    else:
+		m = re_mid.search(key)
+		if m:
+		    weight_index = NUM_INPUT_BLOCKS
+		else:
+		    m = re_out.search(key)
+		    if m:
+			out_idx = int(m.groups()[0])
+			weight_index = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + out_idx
+
+	if weight_index >= NUM_TOTAL_BLOCKS:
+	    print(f"ERROR: illegal block index: {key}")
+
+	if weight_index >= 0 and useblocks:
+	    if weights_a is not None:
+	       current_alpha = weights_a[weight_index]
+	    if usebeta:
+	       if weights_b is not None:
+	           current_beta = weights_b[weight_index]
       # this enables merging an inpainting model (A) with another one (B);
       # where normal model would have 4 channels, for latenst space, inpainting model would
       # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
-      if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
-        if a.shape[1] == 4 and b.shape[1] == 9:
-          raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
-        if a.shape[1] == 4 and b.shape[1] == 8:
-          raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
-
-        if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
-          theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
-          result_is_instruct_pix2pix_model = True
-        else:
-          assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
-          theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, alpha)
-          result_is_inpainting_model = True
+      if cosine0:
+	# skip VAE model parameters to get better results
+	if "first_stage_model" in key: continue
+	if "model" in key and key in theta_0:
+	    # Normalize the vectors before merging
+	    theta_0_norm = nn.functional.normalize(a.to(torch.float32), p=2, dim=0)
+	    theta_1_norm = nn.functional.normalize(b.to(torch.float32), p=2, dim=0)
+	    simab = sim(theta_0_norm, theta_1_norm)
+	    dot_product = torch.dot(theta_0_norm.view(-1), theta_1_norm.view(-1))
+	    magnitude_similarity = dot_product / (torch.norm(theta_0_norm) * torch.norm(theta_1_norm))
+	    combined_similarity = (simab + magnitude_similarity) / 2.0
+	    k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
+	    k = k - current_alpha
+	    k = k.clip(min=.0,max=1.)
+	    theta_0[key] = b * (1 - k) + a * k
+      elif cosine1:
+	# skip VAE model parameters to get better results
+	if "first_stage_model" in key: continue
+	if "model" in key and key in theta_0:
+	    simab = sim(a.to(torch.float32), b.to(torch.float32))
+	    dot_product = torch.dot(a.view(-1).to(torch.float32), b.view(-1).to(torch.float32))
+	    magnitude_similarity = dot_product / (torch.norm(a.to(torch.float32)) * torch.norm(b.to(torch.float32)))
+	    combined_similarity = (simab + magnitude_similarity) / 2.0
+	    k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
+	    k = k - current_alpha
+	    k = k.clip(min=.0,max=1.)
+	    theta_0[key] = b * (1 - k) + a * k
+      elif mode == "sAD":
+	# Apply median filter to the weight differences
+	filtered_diff = scipy.ndimage.median_filter(b.to(torch.float32).cpu().numpy(), size=3)
+	# Apply Gaussian filter to the filtered differences
+	filtered_diff = scipy.ndimage.gaussian_filter(filtered_diff, sigma=1)
+	b = torch.tensor(filtered_diff)
+	# Add the filtered differences to the original weights
+	theta_0[key] = a + current_alpha * b
       else:
-        theta_0[key] = theta_func2(a, b, alpha)
+	      if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
+		if a.shape[1] == 4 and b.shape[1] == 9:
+		  raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
+		if a.shape[1] == 4 and b.shape[1] == 8:
+		  raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
+
+		if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
+		  if usebeta:
+		    theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
+		  else:
+		    theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
+		  result_is_instruct_pix2pix_model = True
+		else:
+		  assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
+		  if usebeta:
+		    theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
+		  else:
+		    theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
+		  result_is_inpainting_model = True
+	      else:
+		if usebeta:
+		  theta_0[key] = theta_func2(a, b, c, current_alpha, current_beta)
+		else:
+		  theta_0[key] = theta_func2(a, b, current_alpha)
 
       theta_0[key] = to_half(theta_0[key], args.save_half)
+  for key in tqdm(theta_1.keys(), desc="Stage 2/2"):
+        if key in checkpoint_dict_skip_on_merge:
+            continue
+        if "model" in key and key not in theta_0:
+            theta_0.update({key:theta_1[key]})
   del theta_1
             
 if args.vae is not None:
