@@ -304,21 +304,23 @@ else:
 model_path = args.model_path
 output_path = os.path.join(model_path, output_file)
 fan = 0
-while os.path.isfile(output_path):
-    print(f"{output_file} already exists. Overwrite? (y/n)")
+if os.path.isfile(output_path):
+    print(f"Output file already exists. Overwrite? (y/n)")
     overwrite = input()
+    while overwrite != "y" and overwrite != "n":
+	print("Please enter y or n")
+	overwrite = input()
     if overwrite == "y":
         os.remove(output_path)
-        break
     elif overwrite == "n":
-        if args.save_safetensors:
-            output_file = f"{output_name}_{fan}.safetensors"
-        else:
-            output_file = f"{output_name}_{fan}.ckpt"
-        output_path = os.path.join(model_path, output_file)
-        fan += 1
-    else:
-        print("")
+	while os.path.isfile(output_path):
+		if args.save_safetensors:
+		    output_file = f"{output_name}_{fan}.safetensors"
+		else:
+		    output_file = f"{output_name}_{fan}.ckpt"
+		output_path = os.path.join(model_path, output_file)
+		fan += 1
+	print(f"Setted the file name to {output_file}\n")
 checkpoint_dict_replacements = {
     'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
     'cond_stage_model.transformer.encoder.': 'cond_stage_model.transformer.text_model.encoder.',
