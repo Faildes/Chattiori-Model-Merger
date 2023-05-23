@@ -26,15 +26,53 @@ NUM_MID_BLOCK = 1
 NUM_OUTPUT_BLOCKS = 12
 NUM_TOTAL_BLOCKS = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + NUM_OUTPUT_BLOCKS
 blockid=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
+deep_a = []
+deep_b = []
+def wgta(string):
+    global deep_a
+    if type(string) == int or type(string) == float:
+        useblocks = False
+        return float(string)
+    elif type(string) == list:
+        useblocks = True
+        string, deep_a = deepblock(string)
+        return string
+    elif type(string) == str:
+        useblocks = True
+        string, deep_a = deepblock([string])
+        return string
+def wgtb(string):
+    global deep_b
+    if type(string) == int or type(string) == float:
+        useblocks = False
+        return float(string)
+    elif type(string) == list:
+        useblocks = True
+        string, deep_b = deepblock(string)
+        return string
+    elif type(string) == str:
+        useblocks = True
+        string, deep_b = deepblock([string])
+        return string
 
-def wgt(string):
-  if type(string) == int or type(string) == float:
-    useblocks = False
-    return float(string)
-  elif type(string) == list:
-    useblocks = True
-    return string
-
+def deepblock(string):
+    res1 = []
+    res2 = []
+    for x in string:
+        try:
+            x = float(x)
+            res1.append(x)
+        except:
+            if type(x) is not str: continue
+            bard = x.replace("\n", ",").split(",")
+            if len(bard) == 0: continue
+            elif len(bard) == 1: res2.append(bard[0])
+            else:
+                cor1, cor2 = deepblock(bard)
+                res1.extend(cor1)
+                res2.extend(cor2)
+    return res1, res2
+	
 parser = argparse.ArgumentParser(description="Merge two models")
 parser.add_argument("mode", type=str, help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
@@ -42,8 +80,8 @@ parser.add_argument("model_0", type=str, help="Name of model 0")
 parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None)
 parser.add_argument("--model_2", type=str, help="Optional, Name of model 2", default=None, required=False)
 parser.add_argument("--vae", type=str, help="Path to vae", default=None, required=False)
-parser.add_argument("--alpha", type=wgt, help="Alpha value, optional, defaults to 0", default=0.5, required=False)
-parser.add_argument("--beta", type=wgt, help="Beta value, optional, defaults to 0", default=0.0, required=False)
+parser.add_argument("--alpha", type=wgta, nargs='*', help="Alpha value, optional, defaults to 0", default=0.5, required=False)
+parser.add_argument("--beta", type=wgtb, nargs='*', help="Beta value, optional, defaults to 0", default=0.0, required=False)
 parser.add_argument("--cosine0", action="store_true", help="favors model0's structure with details from 1", required=False)
 parser.add_argument("--cosine1", action="store_true", help="favors model1's structure with details from 0", required=False)
 parser.add_argument("--save_half", action="store_true", help="Save as float16", required=False)
@@ -699,6 +737,46 @@ if mode != "NoIn":
 	    if usebeta:
 	       if weights_b is not None:
 	           current_beta = weights_b[weight_index]
+	if len(deep_a) > 0:
+		skey = key + blockid[weight_index+1]
+		for d in deep_a:
+		    if d.count(":") != 2 :continue
+		    dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+		    dbs,dws = dbs.split(" "), dws.split(" ")
+		    dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
+		    dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
+		    flag = dbn
+		    for db in dbs:
+			if db in skey:
+			    flag = not dbn
+		    if flag:flag = dwn
+		    else:continue
+		    for dw in dws:
+			if dw in skey:
+			    flag = not dwn
+		    if flag:
+			dr = float(dr)
+			current_alpha = dr
+	if len(deep_b) > 0:
+		skey = key + blockid[weight_index+1]
+		for d in deep_b:
+		    if d.count(":") != 2 :continue
+		    dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+		    dbs,dws = dbs.split(" "), dws.split(" ")
+		    dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
+		    dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
+		    flag = dbn
+		    for db in dbs:
+			if db in skey:
+			    flag = not dbn
+		    if flag:flag = dwn
+		    else:continue
+		    for dw in dws:
+			if dw in skey:
+			    flag = not dwn
+		    if flag:
+			dr = float(dr)
+			current_beta = dr
       # this enables merging an inpainting model (A) with another one (B);
       # where normal model would have 4 channels, for latenst space, inpainting model would
       # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
