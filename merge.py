@@ -98,7 +98,7 @@ def rand_ratio(string):
         seed = random.randint(1, 4294967295)
     np.random.seed(seed)
     ratios = np.random.uniform(rata, ratb, (1, 26))
-    return ratios, seed
+    return ratios[0].tolist(), seed
 parser = argparse.ArgumentParser(description="Merge two models")
 parser.add_argument("mode", type=str, help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
@@ -124,12 +124,6 @@ parser.add_argument("--device", type=str, help="Device to use, defaults to cpu",
 args = parser.parse_args()
 device = args.device
 mode = args.mode
-if args.rand_alpha is not None and args.alpha == 0.0:
-    alphas, alpha_seed = rand_ratio(args.rand_alpha)
-    args.alpha = wgta(alphas)
-if args.rand_beta is not None and args.beta == 0.0:
-    betas, beta_seed = rand_ratio(args.rand_beta)
-    args.beta = wgtb(betas)
 if (args.cosine0 and args.cosine1) or mode != "WS":
   cosine0 = False
   cosine1 = False
@@ -510,9 +504,19 @@ elif mode == "NoIn":
 elif mode == "RM":
   print(read_metadata_from_safetensors(model_0_path))
   exit()
+
+alpha_seed = None
+beta_seed = None
+if args.rand_alpha is not None and args.alpha == 0.0:
+    alphas, alpha_seed = rand_ratio(args.rand_alpha)
+    args.alpha = wgta(alphas)
+if args.rand_beta is not None and args.beta == 0.0:
+    betas, beta_seed = rand_ratio(args.rand_beta)
+    args.beta = wgtb(betas)
 usebeta = False	
 if type(args.alpha) == list:
   weights_a = args.alpha
+  round_a = [round(a, 3) for a in weights_a]
   alpha = weights_a[0]
 else:
   weights_a = None
@@ -521,6 +525,7 @@ if mode in ["TRS","ST"]:
   usebeta = True
   if type(args.beta) == list:
     weights_b = args.beta
+    round_b = [round(b, 3) for b in weights_b]
     beta = weights_b[0]
   else:
     weights_b = None
@@ -554,10 +559,12 @@ merge_recipe = {
 "tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}") if mode in ["sAD", "AD", "TRS", "ST"] else None,
 "merge_method": mode,
 "block_weights": bw,
-"alpha": alpha,
-"alphas": weights_a,
-"beta": beta,
-"betas": weights_b,
+"alpha": round(alpha,3),
+"alpha_seed": alpha_seed,
+"alphas": round_a,
+"beta": round(beta,3),
+"beta_seed": beta_seed,
+"betas": round_b,
 "calculation": "cosine_0" if cosine0 "cosine_1" if cosine1 else None,
 "save_as_half": args.save_half,
 "output_name": output_name,
