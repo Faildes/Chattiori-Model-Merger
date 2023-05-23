@@ -19,6 +19,7 @@ import re
 import shutil
 import safetensors.torch
 import safetensors
+import random
 from tqdm import tqdm
 
 NUM_INPUT_BLOCKS = 12
@@ -72,7 +73,32 @@ def deepblock(string):
                 res1.extend(cor1)
                 res2.extend(cor2)
     return res1, res2
-	
+def rand_ratio(string):
+    if type(string) is not str:
+        print(f"ERROR: illegal rand ratio: {string}") 
+        exit()
+    parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if a != ""]
+    if type(parsed) is list:
+        try:
+            rata = float(parsed[0])
+        except ValueError: rata = 0.0
+        try:
+            try:
+                ratb = float(parsed[1])
+            except ValueError: ratb = 1.0
+        except IndexError: ratb = 1.0
+        try:
+            try:
+                seed = int(parsed[2])
+            except ValueError: seed = random.randint(1, 4294967295)
+        except IndexError: seed = random.randint(1, 4294967295)
+    else:
+        rata = 0.0
+        ratb = 1.0
+        seed = random.randint(1, 4294967295)
+    np.random.seed(seed)
+    ratios = np.random.uniform(rata, ratb, (1, 26))
+    return ratios, seed
 parser = argparse.ArgumentParser(description="Merge two models")
 parser.add_argument("mode", type=str, help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
@@ -80,8 +106,10 @@ parser.add_argument("model_0", type=str, help="Name of model 0")
 parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None)
 parser.add_argument("--model_2", type=str, help="Optional, Name of model 2", default=None, required=False)
 parser.add_argument("--vae", type=str, help="Path to vae", default=None, required=False)
-parser.add_argument("--alpha", type=wgta, nargs='*', help="Alpha value, optional, defaults to 0", default=0.5, required=False)
+parser.add_argument("--alpha", type=wgta, nargs='*', help="Alpha value, optional, defaults to 0", default=0.0, required=False)
+parser.add_argument("--rand_alpha", type=str, help="Random Alpha value, optional", default=None, required=False)
 parser.add_argument("--beta", type=wgtb, nargs='*', help="Beta value, optional, defaults to 0", default=0.0, required=False)
+parser.add_argument("--rand_beta", type=str, help="Random Beta value, optional", default=None, required=False)
 parser.add_argument("--cosine0", action="store_true", help="favors model0's structure with details from 1", required=False)
 parser.add_argument("--cosine1", action="store_true", help="favors model1's structure with details from 0", required=False)
 parser.add_argument("--save_half", action="store_true", help="Save as float16", required=False)
@@ -96,6 +124,12 @@ parser.add_argument("--device", type=str, help="Device to use, defaults to cpu",
 args = parser.parse_args()
 device = args.device
 mode = args.mode
+if args.rand_alpha is not None and args.alpha == 0.0:
+    alphas, alpha_seed = rand_ratio(args.rand_alpha)
+    args.alpha = wgta(alphas)
+if args.rand_beta is not None and args.beta == 0.0:
+    betas, beta_seed = rand_ratio(args.rand_beta)
+    args.beta = wgtb(betas)
 if (args.cosine0 and args.cosine1) or mode != "WS":
   cosine0 = False
   cosine1 = False
