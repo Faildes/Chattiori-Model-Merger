@@ -33,8 +33,17 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
   - Form: `python merge.py mode model_path model_0 model_1 --alpha 0.5 --output merged`
   - Example: `python merge.py "WS" "C:...\Model parent file path" "FILE A.ckpt" "FILE B.safetensors" --alpha 0.45 --vae "C:...\VAE.safetensors" --prune --save_half --output "MERGED"`
     - Optional: `--model_2` sets the tertiory model, if omitted
-    - Optional: `--alpha` controls how much weight is put on the second model. Defaults to 0.5, if omitted
+    - Optional: `--alpha` controls how much weight is put on the second model. Defaults to 0, if omitted  
+    Can be written in float value, [Merge Block Weight type writing](https://github.com/hako-mikan/sd-webui-supermerger/blob/main/README.md) and [Elemental Merge type writing](https://github.com/hako-mikan/sd-webui-supermerger/blob/main/elemental_en.md).
+    - Optional: `--rand_alpha` randomizes weight put on the second model, if omitted  
+    Need to be written in str like `"MIN, MAX, SEED"`.
+    - Optional: `--beta` controls how much weight is put on the third model. Defaults to 0, if omitted  
+    Can be written in float value, Merge Block Weight type writing and Elemental Merge type writing.
+    - Optional: `--rand_beta` randomizes weight put on the third model, if omitted  
+    Need to be written in str like `"MIN, MAX, SEED"`. 
     - Optional: `--vae` sets the vae file by set the path, if omitted
+    - Optional: `--cosine0` determines to favor model0's structure with details from 1, if omitted
+    - Optional: `--cosine1` determines to favor model1's structure with details from 0, if omitted
     - Optional: `--save_half` determines whether save the file as fp16, if omitted
     - Optional: `--prune` determines whether prune the model, if omitted
     - Optional: `--keep_ema` determines keep only ema while prune, if omitted
