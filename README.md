@@ -8,7 +8,7 @@ The mode is:
 
 - "WS" for Weighted Sum
 - "SIG" for Sigmoid Merge
-- "GEO" for Geographic Merge
+- "GEO" for Geometric Merge
 - "MAX" for Max Merge
 - "AD" for Add Difference (requires model2)
 - "sAD" for Smooth Add Difference (requires model2)
