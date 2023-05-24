@@ -1,4 +1,4 @@
-# Merge Models
+# Chattiori's Model Merger
 
 This script merges stable-diffusion models with the settings of checkpoint merger at a user-defined ratio.  
 You can use ckpt and safetensors as checkpoint file.  
@@ -79,7 +79,7 @@ Run merge.py.
 ## Credits
 
 - [AUTOMATIC1111](https://github.com/AUTOMATIC1111/stable-diffusion-webui) for overall designing.
-- [eyriewow](https://github.com/eyriewow/merge-models) for his merge-models.
+- [eyriewow](https://github.com/eyriewow/merge-models) for original merge-models.
 - [lopho](https://github.com/lopho/stable-diffusion-prune) for Pruning system.
 - [idelairre](https://github.com/idelairre/sd-merge-models) for Geometric, Sigmoid and Max Sum.
 - [hako-mikan](https://github.com/hako-mikan/sd-webui-supermerger) for Triple Sum, Sum twice, Smooth Add Difference, Cosine Merging and Elemental Merge.
