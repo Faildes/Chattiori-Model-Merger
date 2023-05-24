@@ -1,4 +1,4 @@
-# Merge Models
+# Chattiori's Model Merger
 
 This script merges stable-diffusion models with the settings of checkpoint merger at a user-defined ratio.  
 You can use ckpt and safetensors as checkpoint file.  
@@ -8,10 +8,14 @@ The mode is:
 
 - "WS" for Weighted Sum
 - "SIG" for Sigmoid Merge
-- "GEO" for Geographic Merge
+- "GEO" for Geometric Merge
 - "MAX" for Max Merge
 - "AD" for Add Difference (requires model2)
+- "sAD" for Smooth Add Difference (requires model2)
+- "TRS" for Triple Sum (requires model2)
+- "ST" for Sum Twice (requires model2)
 - "NoIn" for No Interporation
+- "RM" for Read Metadata
 
 The ratio works as follows:
 
@@ -33,8 +37,17 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
   - Form: `python merge.py mode model_path model_0 model_1 --alpha 0.5 --output merged`
   - Example: `python merge.py "WS" "C:...\Model parent file path" "FILE A.ckpt" "FILE B.safetensors" --alpha 0.45 --vae "C:...\VAE.safetensors" --prune --save_half --output "MERGED"`
     - Optional: `--model_2` sets the tertiory model, if omitted
-    - Optional: `--alpha` controls how much weight is put on the second model. Defaults to 0.5, if omitted
+    - Optional: `--alpha` controls how much weight is put on the second model. Defaults to 0, if omitted  
+    Can be written in float value, [Merge Block Weight type writing](https://github.com/bbc-mc/sdweb-merge-block-weighted-gui/blob/master/README.md) and [Elemental Merge type writing](https://github.com/hako-mikan/sd-webui-supermerger/blob/main/elemental_en.md).
+    - Optional: `--rand_alpha` randomizes weight put on the second model, if omitted  
+    Need to be written in str like `"MIN, MAX, SEED"`.
+    - Optional: `--beta` controls how much weight is put on the third model. Defaults to 0, if omitted  
+    Can be written in float value, Merge Block Weight type writing and Elemental Merge type writing.
+    - Optional: `--rand_beta` randomizes weight put on the third model, if omitted  
+    Need to be written in str like `"MIN, MAX, SEED"`. 
     - Optional: `--vae` sets the vae file by set the path, if omitted
+    - Optional: `--cosine0` determines to favor model0's structure with details from 1, if omitted
+    - Optional: `--cosine1` determines to favor model1's structure with details from 0, if omitted
     - Optional: `--save_half` determines whether save the file as fp16, if omitted
     - Optional: `--prune` determines whether prune the model, if omitted
     - Optional: `--keep_ema` determines keep only ema while prune, if omitted
@@ -65,5 +78,10 @@ Run merge.py.
 
 ## Credits
 
-- Thanks to Automatic and his fantastic Webui, I stole some of the code for the `merge.bat` from him.
-- I got the merging logic in `merge.py` from [this post](https://discord.com/channels/1010980909568245801/1011008178957320282/1018117933894996038) by r_Sh4d0w, who seems to have gotten it from [mlfoundations/wise-ft](https://github.com/mlfoundations/wise-ft)
+- [AUTOMATIC1111](https://github.com/AUTOMATIC1111/stable-diffusion-webui) for overall designing.
+- [eyriewow](https://github.com/eyriewow/merge-models) for original merge-models.
+- [lopho](https://github.com/lopho/stable-diffusion-prune) and [arenasys](https://github.com/arenasys/stable-diffusion-webui-model-toolkit) for Pruning system.
+- [idelairre](https://github.com/idelairre/sd-merge-models) for Geometric, Sigmoid and Max Sum.
+- [hako-mikan](https://github.com/hako-mikan/sd-webui-supermerger) for Triple Sum, Sum twice, Smooth Add Difference, Cosine Merging and Elemental Merge.
+- [bbc-mc](https://github.com/bbc-mc/sdweb-merge-block-weighted-gui) for Block Weighted Merge.
+- Eyriewow got the merging logic in `merge.py` from [this post](https://discord.com/channels/1010980909568245801/1011008178957320282/1018117933894996038) by r_Sh4d0w, who seems to have gotten it from [mlfoundations/wise-ft](https://github.com/mlfoundations/wise-ft)
