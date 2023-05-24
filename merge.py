@@ -527,8 +527,8 @@ if args.rand_beta is not None and args.beta == 0.0:
 usebeta = False	
 if type(args.alpha) == list:
   weights_a = args.alpha
+  alpha = weights_a.pop(0)
   round_a = [round(a, 3) for a in weights_a]
-  alpha = weights_a[0]
 else:
   weights_a = None
   round_a = None
@@ -538,8 +538,8 @@ if mode in ["TRS","ST"]:
   usebeta = True
   if type(args.beta) == list:
     weights_b = args.beta
+    beta = weights_b.pop(0)
     round_b = [round(b, 3) for b in weights_b]
-    beta = weights_b[0]
   else:
     weights_b = None
     round_b = None
