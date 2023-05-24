@@ -80,7 +80,7 @@ Run merge.py.
 
 - [AUTOMATIC1111](https://github.com/AUTOMATIC1111/stable-diffusion-webui) for overall designing.
 - [eyriewow](https://github.com/eyriewow/merge-models) for original merge-models.
-- [lopho](https://github.com/lopho/stable-diffusion-prune) for Pruning system.
+- [lopho](https://github.com/lopho/stable-diffusion-prune) and [arenasys](https://github.com/arenasys/stable-diffusion-webui-model-toolkit) for Pruning system.
 - [idelairre](https://github.com/idelairre/sd-merge-models) for Geometric, Sigmoid and Max Sum.
 - [hako-mikan](https://github.com/hako-mikan/sd-webui-supermerger) for Triple Sum, Sum twice, Smooth Add Difference, Cosine Merging and Elemental Merge.
 - [bbc-mc](https://github.com/bbc-mc/sdweb-merge-block-weighted-gui) for Block Weighted Merge.
