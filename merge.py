@@ -30,10 +30,10 @@ blockid=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","
 
 deep_a = []
 deep_b = []
+useblocks = False
 def wgta(string):
     global deep_a
     if type(string) == int or type(string) == float:
-        useblocks = False
         return float(string)
     elif type(string) == list:
         useblocks = True
@@ -47,7 +47,6 @@ def wgta(string):
 def wgtb(string):
     global deep_b
     if type(string) == int or type(string) == float:
-        useblocks = False
         return float(string)
     elif type(string) == list:
         useblocks = True
@@ -283,54 +282,54 @@ def sigmoid(theta0, theta1, alpha):
     return (1 / (1 + torch.exp(-4 * alpha))) * (theta0 + theta1) - (1 / (1 + torch.exp(-alpha))) * theta0
 
 def weighted_sum(theta0, theta1, alpha):
-    if alpha == 0:
-	return theta0
-    elif alpha == 1:
-	return theta1
-    else:
-    	return ((1 - alpha) * theta0) + (alpha * theta1)
+  if alpha == 0:
+    return theta0
+  elif alpha == 1:
+    return theta1
+  else:
+    return ((1 - alpha) * theta0) + (alpha * theta1)
 
 def sum_twice(theta0, theta1, theta2, alpha, beta):
-    if beta == 1:
-	return theta2
-    if alpha == 0:
-	if beta == 0:
-	    return theta0
-	else:
-	    return ((1 - beta) * theta0) + (beta * theta2)
-    elif alpha == 1:
-	if beta == 0:
-	    return theta1
-        else:
-	    return ((1 - beta) * theta1) + (beta * theta2)
+  if beta == 1:
+    return theta2
+  if alpha == 0:
+    if beta == 0:
+      return theta0
     else:
-	if beta == 0:
-	    return ((1 - alpha) * theta0) + (alpha * theta1)
-	else:
-            return ((1 - alpha) * (1 - beta) * theta0) + (alpha * (1 - beta) * theta1) + (beta * theta2)
+      return ((1 - beta) * theta0) + (beta * theta2)
+  elif alpha == 1:
+    if beta == 0:
+      return theta1
+    else:
+      return ((1 - beta) * theta1) + (beta * theta2)
+  else:
+    if beta == 0:
+      return ((1 - alpha) * theta0) + (alpha * theta1)
+    else:
+      return ((1 - alpha) * (1 - beta) * theta0) + (alpha * (1 - beta) * theta1) + (beta * theta2)
 
 def triple_sum(theta0, theta1, theta2, alpha, beta):
-    if alpha == 0:
-	if beta == 0:
-	    return theta0
-	elif beta == 1:
-	    return theta2
-	else:
-	    return ((1 - beta) * theta0) + (beta * theta2)
-    elif alpha == 1:
-	if beta == 0:
-	    return theta1
-	elif beta == 1:
-	    return theta1 + theta2 - theta0
-	else:
-	    return theta1 + (beta * theta2) - (beta * theta0)
+  if alpha == 0:
+    if beta == 0:
+      return theta0
+    elif beta == 1:
+      return theta2
     else:
-	if beta == 0:
-	    return ((1 - alpha) * theta0) + (alpha * theta1)
-	elif beta == 1:
-	    return (alpha * theta1) + theta2 - (alpha * theta0)
-	else:
-    	    return ((1 - alpha - beta) * theta0) + (alpha * theta1) + (beta * theta2)
+      return ((1 - beta) * theta0) + (beta * theta2)
+  elif alpha == 1:
+    if beta == 0:
+      return theta1
+    elif beta == 1:
+      return theta1 + theta2 - theta0
+    else:
+      return theta1 + (beta * theta2) - (beta * theta0)
+  else:
+    if beta == 0:
+      return ((1 - alpha) * theta0) + (alpha * theta1)
+    elif beta == 1:
+      return (alpha * theta1) + theta2 - (alpha * theta0)
+    else:
+      return ((1 - alpha - beta) * theta0) + (alpha * theta1) + (beta * theta2)
 
 def get_difference(theta1, theta2):
     return theta1 - theta2
@@ -378,22 +377,22 @@ output_path = os.path.join(model_path, output_file)
 
 fan = 0
 if os.path.isfile(output_path):
-    print(f"Output file already exists. Overwrite? (y/n)")
-    overwrite = input()
-    while overwrite != "y" and overwrite != "n":
-	print("Please enter y or n")
-	overwrite = input()
-    if overwrite == "y":
-        os.remove(output_path)
-    elif overwrite == "n":
-	while os.path.isfile(output_path):
-		if args.save_safetensors:
-		    output_file = f"{output_name}_{fan}.safetensors"
-		else:
-		    output_file = f"{output_name}_{fan}.ckpt"
-		output_path = os.path.join(model_path, output_file)
-		fan += 1
-	print(f"Setted the file name to {output_file}\n")
+  print(f"Output file already exists. Overwrite? (y/n)")
+  overwrite = input()
+  while overwrite != "y" and overwrite != "n":
+    print("Please enter y or n")
+  overwrite = input()
+  if overwrite == "y":
+    os.remove(output_path)
+  elif overwrite == "n":
+    while os.path.isfile(output_path):
+      if args.save_safetensors:
+        output_file = f"{output_name}_{fan}.safetensors"
+      else:
+        output_file = f"{output_name}_{fan}.ckpt"
+      output_path = os.path.join(model_path, output_file)
+      fan += 1
+    print(f"Setted the file name to {output_file}\n")
 	
 checkpoint_dict_replacements = {
     'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
@@ -553,20 +552,25 @@ if args.vae is not None:
 
 metadata = {"format": "pt", "sd_merge_models": {}, "sd_merge_recipe": None}
 
+calculate = None
+if cosine0:
+  calculate = "cosine_0"
+if cosine1:
+  calculate = "cosine_1"
 merge_recipe = {
 "type": "merge-model-chattiori", # indicate this model was merged with chattiori's model mereger
 "primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_name}"),
 "secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_name}") if mode != "NoIn" else None,
 "tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}") if mode in ["sAD", "AD", "TRS", "ST"] else None,
 "merge_method": mode,
-"block_weights": bw,
+"block_weights": (weights_a is not None or weights_b is not None),
 "alpha": round(alpha,3),
 "alpha_seed": alpha_seed,
 "alphas": round_a,
 "beta": round(beta,3),
 "beta_seed": beta_seed,
 "betas": round_b,
-"calculation": "cosine_0" if cosine0 "cosine_1" if cosine1 else None,
+"calculation": calculate,
 "save_as_half": args.save_half,
 "output_name": output_name,
 "bake_in_vae": True if args.vae is not None else False,
@@ -665,7 +669,7 @@ def filename_nothing():
 theta_funcs = {
     "WS":   (filename_weighted_sum, None, weighted_sum),
     "AD":   (filename_add_difference, get_difference, add_difference),
-    "sAD":   (filename_add_difference, get_difference, smooth_add_difference),
+    "sAD":   (filename_add_difference, get_difference, add_difference),
     "TRS":  (filename_triple_sum, None, triple_sum),
     "ST":   (filename_sum_twice, None, sum_twice),
     "NoIn": (filename_nothing, None, None),
@@ -746,151 +750,151 @@ if mode != "NoIn":
       a = theta_0[key]
       b = theta_1[key]
       if usebeta:
-	c = theta_2[key]
+        c = theta_2[key]
       # check weighted and U-Net or not
-      if useblocks and 'model.diffusion_model.' in key:
-	# check block index
-	weight_index = -1
+      if (weights_a is not None or weights_b is not None) and 'model.diffusion_model.' in key:
+        # check block index
+        weight_index = -1
 
-	if 'time_embed' in key:
-	    weight_index = 0                # before input blocks
-	elif '.out.' in key:
-	    weight_index = NUM_TOTAL_BLOCKS - 1     # after output blocks
-	else:
-	    m = re_inp.search(key)
-	    if m:
-		inp_idx = int(m.groups()[0])
-		weight_index = inp_idx
-	    else:
-		m = re_mid.search(key)
-		if m:
-		    weight_index = NUM_INPUT_BLOCKS
-		else:
-		    m = re_out.search(key)
-		    if m:
-			out_idx = int(m.groups()[0])
-			weight_index = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + out_idx
+        if 'time_embed' in key:
+            weight_index = 0                # before input blocks
+        elif '.out.' in key:
+            weight_index = NUM_TOTAL_BLOCKS - 1     # after output blocks
+        else:
+          m = re_inp.search(key)
+          if m:
+            inp_idx = int(m.groups()[0])
+            weight_index = inp_idx
+          else:
+            m = re_mid.search(key)
+          if m:
+              weight_index = NUM_INPUT_BLOCKS
+          else:
+              m = re_out.search(key)
+              if m:
+                out_idx = int(m.groups()[0])
+                weight_index = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + out_idx
 
-	if weight_index >= NUM_TOTAL_BLOCKS:
-	    print(f"ERROR: illegal block index: {key}")
+        if weight_index >= NUM_TOTAL_BLOCKS:
+            print(f"ERROR: illegal block index: {key}")
 
-	if weight_index >= 0 and useblocks:
-	    if weights_a is not None:
-	       current_alpha = weights_a[weight_index]
-	    if usebeta:
-	       if weights_b is not None:
-	           current_beta = weights_b[weight_index]
+        if weight_index >= 0 and (weights_a is not None or weights_b is not None) :
+            if weights_a is not None:
+              current_alpha = weights_a[weight_index]
+            if usebeta:
+              if weights_b is not None:
+                  current_beta = weights_b[weight_index]
 			
-	if len(deep_a) > 0:
-		skey = key + blockid[weight_index+1]
-		for d in deep_a:
-		    if d.count(":") != 2 :continue
-		    dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
-		    dbs,dws = dbs.split(" "), dws.split(" ")
-		    dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
-		    dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
-		    flag = dbn
-		    for db in dbs:
-			if db in skey:
-			    flag = not dbn
-		    if flag:flag = dwn
-		    else:continue
-		    for dw in dws:
-			if dw in skey:
-			    flag = not dwn
-		    if flag:
-			dr = float(dr)
-			current_alpha = dr
-			
-	if len(deep_b) > 0:
-		skey = key + blockid[weight_index+1]
-		for d in deep_b:
-		    if d.count(":") != 2 :continue
-		    dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
-		    dbs,dws = dbs.split(" "), dws.split(" ")
-		    dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
-		    dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
-		    flag = dbn
-		    for db in dbs:
-			if db in skey:
-			    flag = not dbn
-		    if flag:flag = dwn
-		    else:continue
-		    for dw in dws:
-			if dw in skey:
-			    flag = not dwn
-		    if flag:
-			dr = float(dr)
-			current_beta = dr
+      if len(deep_a) > 0:
+        skey = key + blockid[weight_index+1]
+        for d in deep_a:
+          if d.count(":") != 2 :continue
+          dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+          dbs,dws = dbs.split(" "), dws.split(" ")
+          dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
+          dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
+          flag = dbn
+          for db in dbs:
+            if db in skey:
+              flag = not dbn
+          if flag:flag = dwn
+          else:continue
+          for dw in dws:
+            if dw in skey:
+              flag = not dwn
+          if flag:
+            dr = float(dr)
+            current_alpha = dr
+
+      if len(deep_b) > 0:
+        skey = key + blockid[weight_index+1]
+        for d in deep_b:
+          if d.count(":") != 2 :continue
+          dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+          dbs,dws = dbs.split(" "), dws.split(" ")
+          dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
+          dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
+          flag = dbn
+          for db in dbs:
+            if db in skey:
+              flag = not dbn
+          if flag:flag = dwn
+          else:continue
+          for dw in dws:
+            if dw in skey:
+              flag = not dwn
+          if flag:
+            dr = float(dr)
+            current_beta = dr
 			
       # this enables merging an inpainting model (A) with another one (B);
       # where normal model would have 4 channels, for latenst space, inpainting model would
       # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
       if cosine0:
-	# skip VAE model parameters to get better results
-	if "first_stage_model" in key: continue
-	if "model" in key and key in theta_0:
-	    # Normalize the vectors before merging
-	    theta_0_norm = nn.functional.normalize(a.to(torch.float32), p=2, dim=0)
-	    theta_1_norm = nn.functional.normalize(b.to(torch.float32), p=2, dim=0)
-	    simab = sim(theta_0_norm, theta_1_norm)
-	    dot_product = torch.dot(theta_0_norm.view(-1), theta_1_norm.view(-1))
-	    magnitude_similarity = dot_product / (torch.norm(theta_0_norm) * torch.norm(theta_1_norm))
-	    combined_similarity = (simab + magnitude_similarity) / 2.0
-	    k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
-	    k = k - current_alpha
-	    k = k.clip(min=.0,max=1.)
-	    theta_0[key] = b * (1 - k) + a * k
+        # skip VAE model parameters to get better results
+        if "first_stage_model" in key: continue
+        if "model" in key and key in theta_0:
+            # Normalize the vectors before merging
+            theta_0_norm = nn.functional.normalize(a.to(torch.float32), p=2, dim=0)
+            theta_1_norm = nn.functional.normalize(b.to(torch.float32), p=2, dim=0)
+            simab = sim(theta_0_norm, theta_1_norm)
+            dot_product = torch.dot(theta_0_norm.view(-1), theta_1_norm.view(-1))
+            magnitude_similarity = dot_product / (torch.norm(theta_0_norm) * torch.norm(theta_1_norm))
+            combined_similarity = (simab + magnitude_similarity) / 2.0
+            k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
+            k = k - current_alpha
+            k = k.clip(min=.0,max=1.)
+            theta_0[key] = b * (1 - k) + a * k
 	
       elif cosine1:
-	# skip VAE model parameters to get better results
-	if "first_stage_model" in key: continue
-	if "model" in key and key in theta_0:
-	    simab = sim(a.to(torch.float32), b.to(torch.float32))
-	    dot_product = torch.dot(a.view(-1).to(torch.float32), b.view(-1).to(torch.float32))
-	    magnitude_similarity = dot_product / (torch.norm(a.to(torch.float32)) * torch.norm(b.to(torch.float32)))
-	    combined_similarity = (simab + magnitude_similarity) / 2.0
-	    k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
-	    k = k - current_alpha
-	    k = k.clip(min=.0,max=1.)
-	    theta_0[key] = b * (1 - k) + a * k
+        # skip VAE model parameters to get better results
+        if "first_stage_model" in key: continue
+        if "model" in key and key in theta_0:
+            simab = sim(a.to(torch.float32), b.to(torch.float32))
+            dot_product = torch.dot(a.view(-1).to(torch.float32), b.view(-1).to(torch.float32))
+            magnitude_similarity = dot_product / (torch.norm(a.to(torch.float32)) * torch.norm(b.to(torch.float32)))
+            combined_similarity = (simab + magnitude_similarity) / 2.0
+            k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
+            k = k - current_alpha
+            k = k.clip(min=.0,max=1.)
+            theta_0[key] = b * (1 - k) + a * k
 		
       elif mode == "sAD":
-	# Apply median filter to the weight differences
-	filtered_diff = scipy.ndimage.median_filter(b.to(torch.float32).cpu().numpy(), size=3)
-	# Apply Gaussian filter to the filtered differences
-	filtered_diff = scipy.ndimage.gaussian_filter(filtered_diff, sigma=1)
-	b = torch.tensor(filtered_diff)
-	# Add the filtered differences to the original weights
-	theta_0[key] = a + current_alpha * b
+        # Apply median filter to the weight differences
+        filtered_diff = scipy.ndimage.median_filter(b.to(torch.float32).cpu().numpy(), size=3)
+        # Apply Gaussian filter to the filtered differences
+        filtered_diff = scipy.ndimage.gaussian_filter(filtered_diff, sigma=1)
+        b = torch.tensor(filtered_diff)
+        # Add the filtered differences to the original weights
+        theta_0[key] = a + current_alpha * b
 	
       else:
-	      if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
-		if a.shape[1] == 4 and b.shape[1] == 9:
-		  raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
-		if a.shape[1] == 4 and b.shape[1] == 8:
-		  raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
+        if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
+          if a.shape[1] == 4 and b.shape[1] == 9:
+            raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
+          if a.shape[1] == 4 and b.shape[1] == 8:
+            raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
 
-		if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
-		  if usebeta:
-		    theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
-		  else:
-		    theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
-		  result_is_instruct_pix2pix_model = True
-		else:
-		  assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
-		  if usebeta:
-		    theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
-		  else:
-		    theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
-		  result_is_inpainting_model = True
-	      else:
-		if usebeta:
-		  theta_0[key] = theta_func2(a, b, c, current_alpha, current_beta)
-		else:
-		  theta_0[key] = theta_func2(a, b, current_alpha)
+          if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
+            if usebeta:
+              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
+            else:
+              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
+            result_is_instruct_pix2pix_model = True
+          else:
+            assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
+            if usebeta:
+              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
+            else:
+              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
+            result_is_inpainting_model = True
+        else:
+          if usebeta:
+            theta_0[key] = theta_func2(a, b, c, current_alpha, current_beta)
+          else:
+            theta_0[key] = theta_func2(a, b, current_alpha)
 
-      theta_0[key] = to_half(theta_0[key], args.save_half)
+        theta_0[key] = to_half(theta_0[key], args.save_half)
   for key in tqdm(theta_1.keys(), desc="Stage 2/2"):
         if key in checkpoint_dict_skip_on_merge:
             continue
