@@ -104,7 +104,7 @@ def rand_ratio(string):
     return ratios[0].tolist(), seed
 
 parser = argparse.ArgumentParser(description="Merge two or three models")
-parser.add_argument("mode", type=str, help="Merging mode")
+parser.add_argument("mode", choices=["WS","AD","NoIn","TRS","ST","sAD","SIG","GEO","MAX","RM"], help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
 parser.add_argument("model_0", type=str, help="Name of model 0")
 parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None)
