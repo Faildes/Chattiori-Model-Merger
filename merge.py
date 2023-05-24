@@ -465,12 +465,6 @@ if mode in ["WS", "SIG", "GEO", "MAX"]:
       model_1 = safetensors.torch.load_file(model_1_path, device=device)
   else:
       model_1 = torch.load(model_1_path, map_location=device)
-  if args.vae is not None:
-      _, extension_vae = os.path.splitext(args.vae)
-      if extension_vae.lower() == ".safetensors":
-          vae = safetensors.torch.load_file(args.vae, device=device)
-      else:
-          vae = torch.load(args.vae, map_location=device)
 		
 elif mode in ["sAD", "AD", "TRS", "ST"]:
   interp_method = 0
@@ -489,12 +483,6 @@ elif mode in ["sAD", "AD", "TRS", "ST"]:
       model_2 = safetensors.torch.load_file(model_2_path, device=device)
   else:
       model_2 = torch.load(model_2_path, map_location=device)
-  if args.vae is not None:
-      _, extension_vae = os.path.splitext(args.vae)
-      if extension_vae.lower() == ".safetensors":
-          vae = safetensors.torch.load_file(args.vae, device=device)
-      else:
-          vae = torch.load(args.vae, map_location=device)
 
 elif mode == "NoIn":
   interp_method = 2
@@ -503,17 +491,18 @@ elif mode == "NoIn":
       model_0 = safetensors.torch.load_file(model_0_path, device=device)
   else:
       model_0 = torch.load(model_0_path, map_location=device)
-  if args.vae is not None:
+		
+elif mode == "RM":
+  print(read_metadata_from_safetensors(model_0_path))
+  exit()
+	
+if args.vae is not None:
       _, extension_vae = os.path.splitext(args.vae)
       if extension_vae.lower() == ".safetensors":
           vae = safetensors.torch.load_file(args.vae, device=device)
       else:
           vae = torch.load(args.vae, map_location=device)
 		
-elif mode == "RM":
-  print(read_metadata_from_safetensors(model_0_path))
-  exit()
-
 alpha_seed = None
 beta_seed = None
 if args.rand_alpha is not None and args.alpha == 0.0:
@@ -522,6 +511,7 @@ if args.rand_alpha is not None and args.alpha == 0.0:
 if args.rand_beta is not None and args.beta == 0.0:
     betas, beta_seed = rand_ratio(args.rand_beta)
     args.beta = wgtb(betas)
+	
 usebeta = False	
 if type(args.alpha) == list:
   weights_a = args.alpha
@@ -530,6 +520,7 @@ if type(args.alpha) == list:
 else:
   weights_a = None
   alpha = args.alpha
+	
 if mode in ["TRS","ST"]:
   usebeta = True
   if type(args.beta) == list:
