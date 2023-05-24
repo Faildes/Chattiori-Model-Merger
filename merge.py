@@ -14,7 +14,7 @@ import argparse
 import torch
 import torch.nn as nn
 import scipy.ndimage
-from scipy.ndimage.filters import median_filter as filter
+from scipy.ndimage import median_filter as filter
 import re
 import shutil
 import safetensors.torch
@@ -38,10 +38,14 @@ def wgta(string):
     elif type(string) == list:
         useblocks = True
         string, deep_a = deepblock(string)
+        while type(string) == list and len(string) == 1:
+          string = string[0]
         return string
     elif type(string) == str:
         useblocks = True
         string, deep_a = deepblock([string])
+        while type(string) == list and len(string) == 1:
+          string = string[0]
         return string
 
 def wgtb(string):
@@ -51,10 +55,14 @@ def wgtb(string):
     elif type(string) == list:
         useblocks = True
         string, deep_b = deepblock(string)
+        while type(string) == list and len(string) == 1:
+          string = string[0]
         return string
     elif type(string) == str:
         useblocks = True
         string, deep_b = deepblock([string])
+        while type(string) == list and len(string) == 1:
+          string = string[0]
         return string
 
 def deepblock(string):
@@ -109,9 +117,9 @@ parser.add_argument("model_0", type=str, help="Name of model 0")
 parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None)
 parser.add_argument("--model_2", type=str, help="Optional, Name of model 2", default=None, required=False)
 parser.add_argument("--vae", type=str, help="Path to vae", default=None, required=False)
-parser.add_argument("--alpha", type=wgta, nargs='*', help="Alpha value, optional, defaults to 0", default=0.0, required=False)
+parser.add_argument("--alpha", type=wgta, help="Alpha value, optional, defaults to 0", default=0.0, required=False)
 parser.add_argument("--rand_alpha", type=str, help="Random Alpha value, optional", default=None, required=False)
-parser.add_argument("--beta", type=wgtb, nargs='*', help="Beta value, optional, defaults to 0", default=0.0, required=False)
+parser.add_argument("--beta", type=wgtb, help="Beta value, optional, defaults to 0", default=0.0, required=False)
 parser.add_argument("--rand_beta", type=str, help="Random Beta value, optional", default=None, required=False)
 parser.add_argument("--cosine0", action="store_true", help="favors model0's structure with details from 1", required=False)
 parser.add_argument("--cosine1", action="store_true", help="favors model1's structure with details from 0", required=False)
@@ -518,6 +526,7 @@ if type(args.alpha) == list:
   alpha = weights_a[0]
 else:
   weights_a = None
+  round_a = None
   alpha = args.alpha
 	
 if mode in ["TRS","ST"]:
@@ -528,9 +537,11 @@ if mode in ["TRS","ST"]:
     beta = weights_b[0]
   else:
     weights_b = None
+    round_b = None
     beta = args.beta
 else:
   weights_b = None
+  round_b = None
   beta = None
 	
 model_0_name = os.path.splitext(os.path.basename(model_0_path))[0]
@@ -567,7 +578,7 @@ merge_recipe = {
 "alpha": round(alpha,3),
 "alpha_seed": alpha_seed,
 "alphas": round_a,
-"beta": round(beta,3),
+"beta": round(beta,3) if beta is not None else None,
 "beta_seed": beta_seed,
 "betas": round_b,
 "calculation": calculate,
