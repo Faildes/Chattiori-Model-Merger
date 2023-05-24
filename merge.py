@@ -42,6 +42,7 @@ def wgta(string):
         useblocks = True
         string, deep_a = deepblock([string])
         return string
+
 def wgtb(string):
     global deep_b
     if type(string) == int or type(string) == float:
@@ -73,6 +74,7 @@ def deepblock(string):
                 res1.extend(cor1)
                 res2.extend(cor2)
     return res1, res2
+
 def rand_ratio(string):
     if type(string) is not str:
         print(f"ERROR: illegal rand ratio: {string}") 
@@ -99,6 +101,7 @@ def rand_ratio(string):
     np.random.seed(seed)
     ratios = np.random.uniform(rata, ratb, (1, 26))
     return ratios[0].tolist(), seed
+
 parser = argparse.ArgumentParser(description="Merge two models")
 parser.add_argument("mode", type=str, help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
@@ -124,12 +127,14 @@ parser.add_argument("--device", type=str, help="Device to use, defaults to cpu",
 args = parser.parse_args()
 device = args.device
 mode = args.mode
+
 if (args.cosine0 and args.cosine1) or mode != "WS":
   cosine0 = False
   cosine1 = False
 else:
   cosine0 = args.cosine0
   cosine1 = args.cosine1
+	
 cache_filename = os.path.join(args.model_path, "cache.json")
 cache_data = None
 
@@ -369,6 +374,7 @@ else:
     output_file = f'{output_name}.ckpt'
 model_path = args.model_path
 output_path = os.path.join(model_path, output_file)
+
 fan = 0
 if os.path.isfile(output_path):
     print(f"Output file already exists. Overwrite? (y/n)")
@@ -387,6 +393,7 @@ if os.path.isfile(output_path):
 		output_path = os.path.join(model_path, output_file)
 		fan += 1
 	print(f"Setted the file name to {output_file}\n")
+	
 checkpoint_dict_replacements = {
     'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
     'cond_stage_model.transformer.encoder.': 'cond_stage_model.transformer.text_model.encoder.',
@@ -463,6 +470,7 @@ if mode in ["WS", "SIG", "GEO", "MAX"]:
           vae = safetensors.torch.load_file(args.vae, device=device)
       else:
           vae = torch.load(args.vae, map_location=device)
+		
 elif mode in ["sAD", "AD", "TRS", "ST"]:
   interp_method = 0
   _, extension_0 = os.path.splitext(model_0_path)
@@ -550,6 +558,7 @@ if args.prune:
     model_2 = prune_model(model_2)
 if args.vae is not None:
   vae_name = os.path.splitext(os.path.basename(args.vae))[0]
+
 metadata = {"format": "pt", "sd_merge_models": {}, "sd_merge_recipe": None}
 
 merge_recipe = {
@@ -697,6 +706,7 @@ if theta_func1:
 re_inp = re.compile(r'\.input_blocks\.(\d+)\.')  # 12
 re_mid = re.compile(r'\.middle_block\.(\d+)\.')  # 1
 re_out = re.compile(r'\.output_blocks\.(\d+)\.') # 12
+
 print(f"Loading {model_0_name}...")
 theta_0 = read_state_dict(model_0_path, map_location=device)
 
@@ -778,6 +788,7 @@ if mode != "NoIn":
 	    if usebeta:
 	       if weights_b is not None:
 	           current_beta = weights_b[weight_index]
+			
 	if len(deep_a) > 0:
 		skey = key + blockid[weight_index+1]
 		for d in deep_a:
@@ -798,6 +809,7 @@ if mode != "NoIn":
 		    if flag:
 			dr = float(dr)
 			current_alpha = dr
+			
 	if len(deep_b) > 0:
 		skey = key + blockid[weight_index+1]
 		for d in deep_b:
@@ -818,6 +830,7 @@ if mode != "NoIn":
 		    if flag:
 			dr = float(dr)
 			current_beta = dr
+			
       # this enables merging an inpainting model (A) with another one (B);
       # where normal model would have 4 channels, for latenst space, inpainting model would
       # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
@@ -836,6 +849,7 @@ if mode != "NoIn":
 	    k = k - current_alpha
 	    k = k.clip(min=.0,max=1.)
 	    theta_0[key] = b * (1 - k) + a * k
+	
       elif cosine1:
 	# skip VAE model parameters to get better results
 	if "first_stage_model" in key: continue
@@ -848,6 +862,7 @@ if mode != "NoIn":
 	    k = k - current_alpha
 	    k = k.clip(min=.0,max=1.)
 	    theta_0[key] = b * (1 - k) + a * k
+		
       elif mode == "sAD":
 	# Apply median filter to the weight differences
 	filtered_diff = scipy.ndimage.median_filter(b.to(torch.float32).cpu().numpy(), size=3)
@@ -856,6 +871,7 @@ if mode != "NoIn":
 	b = torch.tensor(filtered_diff)
 	# Add the filtered differences to the original weights
 	theta_0[key] = a + current_alpha * b
+	
       else:
 	      if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
 		if a.shape[1] == 4 and b.shape[1] == 9:
