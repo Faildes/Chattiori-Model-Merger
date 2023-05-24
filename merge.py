@@ -191,7 +191,7 @@ def dump_cache():
 def sha256(filename, title):
     hashes = cache("hashes")
 
-    sha256_value = sha256_from_cache(filename, title)
+    sha256_value = sha256_from_cache(filename, title, 1)
     if sha256_value is not None:
         return sha256_value
 
@@ -228,11 +228,15 @@ def calculate_sha256(filename):
     return hash_sha256.hexdigest()
 
 
-def sha256_from_cache(filename, title):
+def sha256_from_cache(filename, title, par = 0):
     hashes = cache("hashes")
     ondisk_mtime = os.path.getmtime(filename)
 
     if title not in hashes:
+      if par == 0:
+        print(title)
+        sh = sha256(filename, title)
+      else:
         return None
 
     cached_sha256 = hashes[title].get("sha256", None)
@@ -500,6 +504,7 @@ elif mode == "NoIn":
       model_0 = torch.load(model_0_path, map_location=device)
 		
 elif mode == "RM":
+  print(sha256(model_0_path, f"checkpoint/{os.path.splitext(os.path.basename(model_0_path))[0]}"))
   print(read_metadata_from_safetensors(model_0_path))
   exit()
 	
@@ -789,7 +794,7 @@ if mode != "NoIn":
         if weight_index >= NUM_TOTAL_BLOCKS:
             print(f"ERROR: illegal block index: {key}")
 
-        if weight_index >= 0 and (weights_a is not None or weights_b is not None) :
+        if weight_index >= 0:
             if weights_a is not None:
               current_alpha = weights_a[weight_index]
             if usebeta:
