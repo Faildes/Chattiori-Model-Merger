@@ -103,7 +103,7 @@ def rand_ratio(string):
     ratios = np.random.uniform(rata, ratb, (1, 26))
     return ratios[0].tolist(), seed
 
-parser = argparse.ArgumentParser(description="Merge two models")
+parser = argparse.ArgumentParser(description="Merge two or three models")
 parser.add_argument("mode", type=str, help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
 parser.add_argument("model_0", type=str, help="Name of model 0")
