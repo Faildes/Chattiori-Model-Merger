@@ -234,7 +234,6 @@ def sha256_from_cache(filename, title, par = 0):
 
     if title not in hashes:
       if par == 0:
-        print(title)
         sh = sha256(filename, title)
       else:
         return None
@@ -960,7 +959,7 @@ if args.delete_source:
     os.remove(model_0_path)
     if mode != "NoIn":
       os.remove(model_1_path)
-    if mode == "AD":
+    if mode in ["sAD", "AD", "TRS", "ST"]:
       os.remove(model_2_path)
 del theta_0
 print("Done!")
