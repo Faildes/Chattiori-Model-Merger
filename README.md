@@ -41,12 +41,14 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
     Can be written in float value, [Merge Block Weight type writing](https://github.com/bbc-mc/sdweb-merge-block-weighted-gui/blob/master/README.md) and [Elemental Merge type writing](https://github.com/hako-mikan/sd-webui-supermerger/blob/main/elemental_en.md).
     - Optional: `--rand_alpha` randomizes weight put on the second model, if omitted  
     Need to be written in str like `"MIN, MAX, SEED"`.  
-    Or `"MIN, MAX, SEED, [Elemental merge args(num or num(ratio) to set weight)]"` if you want to specify.
+    Or `"MIN, MAX, SEED, [Elemental merge args]"` if you want to specify.  
+    Check out [elemental_random](https://github.com/Faildes/merge-models/blob/main/elemental_random.md) for Elemental merge args.
     - Optional: `--beta` controls how much weight is put on the third model. Defaults to 0, if omitted  
     Can be written in float value, Merge Block Weight type writing and Elemental Merge type writing.
     - Optional: `--rand_beta` randomizes weight put on the third model, if omitted  
     Need to be written in str like `"MIN, MAX, SEED"`.   
-    Or `"MIN, MAX, SEED, [Elemental merge args(num or num(ratio) to set weight)]"` if you want to specify.
+    Or `"MIN, MAX, SEED, [Elemental merge args]"` if you want to specify.  
+    Check out [elemental_random](https://github.com/Faildes/merge-models/blob/main/elemental_random.md) for Elemental merge args.
     - Optional: `--vae` sets the vae file by set the path, if omitted
     - Optional: `--cosine0` determines to favor model0's structure with details from 1, if omitted
     - Optional: `--cosine1` determines to favor model1's structure with details from 0, if omitted
