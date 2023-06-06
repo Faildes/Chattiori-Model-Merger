@@ -22,9 +22,9 @@ Bloks can be specified in uppercase from BASE,IN00-M00-OUT11. If left blank, all
 Similarly, multiple elements can be specified by separating them with a space.  
 Partial matching is used, so for example, typing "attn" will change both attn1 and attn2, and typing "attn2" will change only attn2. If you want to specify more details, enter "attn2.to_out" and so on.  
 
-OUT03 OUT04 OUT05:attn2 attn1.to_out:0.5  
+OUT03 OUT04 OUT05:attn2 attn1.to_out:0.5(0.3)  
 
-the ratio of elements containing attn2 and attn1.to_out in the OUT03, OUT04 and OUT05 layers will be 0.5.
+the ratio of elements containing attn2 and attn1.to_out in the OUT03, OUT04 and OUT05 layers will be (generated ratio) * (1 - 0.3) + 0.5 * 0.3.
 If the element column is left blank, all elements in the specified Blocks will change, and the effect will be the same as a block-by-block merge.
 If there are duplicate specifications, the one entered later takes precedence. 
 
@@ -47,10 +47,6 @@ OUT05:ALL:0.2
 
 will set all Blocks in the OUT05 layer to 0.2.
 
-OUT03 OUT04 OUT05:attn2 attn1.to_out:0.5(0.3)  
-
-the ratio of elements containing attn2 and attn1.to_out in the OUT03, OUT04 and OUT05 layers will be (generated ratio) * (1 - 0.3) + 0.5 * 0.3.
-
 ## XY plot
 Several XY plots for elemental merge are available. Input examples can be found in sample.txt.  
 #### elemental
@@ -58,10 +54,6 @@ Creates XY plots for multiple elemental merges. Elements should be separated fro
 
 #### pinpoint element
 Creates an XY plot with different values for a specific element. Do the same with elements as with Pinpoint Blocks, but specify alpha for the opposite axis. Separate elements with a new line or comma.  
-
-#### effective elenemtal checker
-Outputs the difference of each element's effective elenemtal checker. The gif.csv file will be created in the output folder under the ModelA and ModelB folders in the diff folder. If there are duplicate file names, rename and save the files, but it is recommended to rename the diff folder to an appropriate name because it is complicated when the number of files increases.  
-Separate the files with a new line or comma. Use alpha for the opposite axis and enter a single value. This is useful to see the effect of an element, but it is also possible to see the effect of a hierarchy by not specifying an element, so you may use it that way more often.  
 
 ### List of elements
 Basically, it seems that attn is responsible for the face and clothing information. The IN07, OUT03, OUT04, and OUT05 layers seem to have a particularly strong influence. It does not seem to make sense to change the same element in multiple Blocks at the same time, since the degree of influence often differs depending on the Blocks.
