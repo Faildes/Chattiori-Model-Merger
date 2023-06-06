@@ -1,5 +1,6 @@
-# Elemental Merge
-- This is a block-by-block merge that goes beyond block-by-block  merge.
+***Original Documented by hako-mikan***
+# Elemental Random Merge
+- This is a block-by-block merge that goes beyond block-by-block merge.
 
 In a block-by-block merge, the merge ratio can be changed for each of the 25 blocks, but a blocks also consists of multiple elements, and in principle it is possible to change the ratio for each element. It is possible, but the number of elements is more than 600, and it was doubtful whether it could be handled by human hands, but we tried to implement it. I do not recommend merging elements by element out of the blue. It is recommended to use it as a final adjustment when a problem that cannot be solved by block-by-block merging.  
 The following images show the result of changing the elements in the OUT05 layer. The leftmost one is without merging, the second one is all the OUT05 layers (i.e., normal block-by-block merging), and the rest are element merging. As shown in the table below, there are several more elements in attn2, etc.
@@ -42,6 +43,14 @@ will set the ratio 1 to the attn of all Blocks except the OUT04 layer.
 OUT05:NOT attn proj:0.2  
 
 will set all Blocks except attn and proj in the OUT05 layer to 0.2.
+
+OUT05:ALL:0.2  
+
+will set all Blocks in the OUT05 layer to 0.2.
+
+OUT03 OUT04 OUT05:attn2 attn1.to_out:0.5(0.3)  
+
+the ratio of elements containing attn2 and attn1.to_out in the OUT03, OUT04 and OUT05 layers will be (generated ratio) * (1 - 0.3) + 0.5 * 0.3.
 
 ## XY plot
 Several XY plots for elemental merge are available. Input examples can be found in sample.txt.  
