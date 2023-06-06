@@ -121,16 +121,27 @@ def rand_ratio(string):
             if d.count(":") != 2 :continue
             dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
             dbs = dbs.split(" ")
-            if "(" in dr:
-                dr0, drat = float(dr.split("(")[0]), dr.split("(")[1].replace(")","")
-                for db in dbs:
-                    dr1 = ratios[blockid.index(db)]
-                    dr = dr1 * (1 - drat) + dr0 * drat
-                    deep_res.append(f"{db}:{dws}:{dr}")
+            if dws == "ALL":
+                if "(" in dr:
+                    dr0, drat = float(dr.split("(")[0]), dr.split("(")[1].replace(")","")
+                    for db in dbs:
+                        dr1 = ratios[blockid.index(db)]
+                        dr = dr1 * (1 - drat) + dr0 * drat
+                        ratios[blockid.index(db)] = dr
+                else:
+                    for db in dbs:
+                        ratios[blockid.index(db)] = float(dr)
             else:
-                dr0 = float(dr)
-                for db in dbs:
-                    deep_res.append(f"{db}:{dws}:{dr0}")
+                if "(" in dr:
+                    dr0, drat = float(dr.split("(")[0]), dr.split("(")[1].replace(")","")
+                    for db in dbs:
+                        dr1 = ratios[blockid.index(db)]
+                        dr = dr1 * (1 - drat) + dr0 * drat
+                        deep_res.append(f"{db}:{dws}:{dr}")
+                else:
+                    dr0 = float(dr)
+                    for db in dbs:
+                        deep_res.append(f"{db}:{dws}:{dr0}")
     return ratios, seed, deep_res
 
 parser = argparse.ArgumentParser(description="Merge two or three models")
