@@ -48,7 +48,7 @@ OUT05:ALL:0.2
 will set all Blocks in the OUT05 layer to 0.2.
 
 ## XY plot
-Several XY plots for elemental merge are available. Input examples can be found in sample.txt.  
+Several XY plots for elemental merge are available.  
 #### elemental
 Creates XY plots for multiple elemental merges. Elements should be separated from each other by blank lines.
 
