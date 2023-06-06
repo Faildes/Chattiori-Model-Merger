@@ -88,9 +88,10 @@ def rand_ratio(string):
         print(f"ERROR: illegal rand ratio: {string}") 
         exit()
     deep_res = []
-    tram = string.split("[")
-    string = tram[0]
-    deep = tram[1].replace("]","")
+    if "[" in string:
+        tram = string.split("[")
+        string = tram[0]
+        deep = tram[1].replace("]","")
     parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if (a != "" or a != " ")]
     if type(parsed) is list:
         try:
