@@ -87,28 +87,50 @@ def rand_ratio(string):
     if type(string) is not str:
         print(f"ERROR: illegal rand ratio: {string}") 
         exit()
-    parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if a != ""]
+    deep_res = []
+    tram = string.split("[")
+    string = tram[0]
+    deep = tram[1].replace("]","")
+    parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if (a != "" or a != " ")]
     if type(parsed) is list:
         try:
-            rata = float(parsed[0])
-        except ValueError: rata = 0.0
+            rmin = float(parsed[0])
+        except ValueError: rmin = 0.0
         try:
             try:
-                ratb = float(parsed[1])
-            except ValueError: ratb = 1.0
-        except IndexError: ratb = 1.0
+                rmax = float(parsed[1])
+            except ValueError: rmax = 1.0
+        except IndexError: rmax = 1.0
         try:
             try:
                 seed = int(parsed[2])
             except ValueError: seed = random.randint(1, 4294967295)
         except IndexError: seed = random.randint(1, 4294967295)
     else:
-        rata = 0.0
-        ratb = 1.0
+        rmin = 0.0
+        rmax = 1.0
         seed = random.randint(1, 4294967295)
     np.random.seed(seed)
-    ratios = np.random.uniform(rata, ratb, (1, 26))
-    return ratios[0].tolist(), seed
+    ratios = np.random.uniform(rmin, rmax, (1, 26))
+    ratios = ratios[0].tolist()
+    if len(deep) > 0:
+        deep = deep.replace("\n",",")
+        deep = deep.split(",")
+        for d in deep:
+            if d.count(":") != 2 :continue
+            dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+            dbs = dbs.split(" ")
+            if "(" in dr:
+                dr0, drat = float(dr.split("(")[0]), dr.split("(")[1].replace(")","")
+                for db in dbs:
+                    dr1 = ratios[blockid.index(db)]
+                    dr = dr1 * (1 - drat) + dr0 * drat
+                    deep_res.append(f"{db}:{dws}:{dr}")
+            else:
+                dr0 = float(dr)
+                for db in dbs:
+                    deep_res.append(f"{db}:{dws}:{dr0}")
+    return ratios, seed, deep_res
 
 parser = argparse.ArgumentParser(description="Merge two or three models")
 parser.add_argument("mode", choices=["WS","AD","NoIn","TRS","ST","sAD","SIG","GEO","MAX","RM"], help="Merging mode")
@@ -513,25 +535,69 @@ if args.vae is not None:
           vae = safetensors.torch.load_file(args.vae, device=device)
       else:
           vae = torch.load(args.vae, map_location=device)
-		
+
+def rinfo(string, seed):
+    tram = string.split("[")
+    string = tram[0]
+    fe = tram[1].replace("]","")
+    parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if (a != "" or a != " ")]
+    if type(parsed) is list:
+        try:
+            rmin = float(parsed[0])
+        except ValueError: rmin = 0.0
+        try:
+            try:
+                rmax = float(parsed[1])
+            except ValueError: rmax = 1.0
+        except IndexError: rmax = 1.0
+        try:
+            try:
+                get = int(parsed[2])
+            except ValueError: get = seed
+        except IndexError: get = seed
+    else:
+        rmin = 0.0
+        rmax = 1.0
+        get = seed
+    return f"({rmin},{rmax},{get},[{fe}])"
+
+def roundeep(term):
+    deep = term
+    if len(deep) > 0:
+        for d in deep:
+            dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+            dr = round(float(dr),3)
+            d = f"{dbs}:{dws}:{dr}"
+    else:
+        return None
+    return deep
+            
 alpha_seed = None
 beta_seed = None
-if args.rand_alpha is not None and args.alpha == 0.0:
-    alphas, alpha_seed = rand_ratio(args.rand_alpha)
+if args.rand_alpha is not None:
+    alphas, alpha_seed, deep_a = rand_ratio(args.rand_alpha)
+    alpha_info = rinfo(args.rand_alpha, alpha_seed)
     args.alpha = wgta(alphas)
-if args.rand_beta is not None and args.beta == 0.0:
-    betas, beta_seed = rand_ratio(args.rand_beta)
+if args.rand_beta is not None:
+    betas, beta_seed, deep_b = rand_ratio(args.rand_beta)
+    beta_rand_info = rinfo(args.rand_beta, beta_seed)
     args.beta = wgtb(betas)
 	
 usebeta = False	
 if type(args.alpha) == list:
-  weights_a = args.alpha
-  alpha = weights_a.pop(0)
-  round_a = [round(a, 3) for a in weights_a]
+    weights_a = args.alpha
+    alpha = weights_a.pop(0)
+    round_a = [round(a, 3) for a in weights_a]
+    round_deep_a = roundeep(deep_a)
+    if args.rand_alpha is not None:
+        alpha_info = f"preset:[{alpha_info}],{round(alpha, 3)},[{round_a},[{round_deep_a}]]"
+    else:
+        alpha_info = f"{round(alpha,3)},[{round_a},[{round_deep_a}]]"
 else:
   weights_a = None
   round_a = None
   alpha = args.alpha
+  alpha_info = f"{round(args.alpha,3)}"
 	
 if mode in ["TRS","ST"]:
   usebeta = True
@@ -539,14 +605,21 @@ if mode in ["TRS","ST"]:
     weights_b = args.beta
     beta = weights_b.pop(0)
     round_b = [round(b, 3) for b in weights_b]
+    round_deep_b = roundeep(deep_b)
+    if args.rand_beta is not None:
+        beta_info = f"preset:[{beta_info}],{round(beta,3)},[{round_b},[{round_deep_b}]]"
+    else:
+        beta_info = f"{round(beta,3)},[{round_b},[{round_deep_b}]]"
   else:
     weights_b = None
     round_b = None
     beta = args.beta
+    beta_info = f"{round(args.beta,3)}"
 else:
   weights_b = None
   round_b = None
   beta = None
+  beta_info = None
 	
 model_0_name = os.path.splitext(os.path.basename(model_0_path))[0]
 model_0_sha256 = sha256_from_cache(model_0_path, f"checkpoint/{model_0_name}")
@@ -579,12 +652,8 @@ merge_recipe = {
 "tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}") if mode in ["sAD", "AD", "TRS", "ST"] else None,
 "merge_method": mode,
 "block_weights": (weights_a is not None or weights_b is not None),
-"alpha": round(alpha,3),
-"alpha_seed": alpha_seed,
-"alphas": round_a,
-"beta": round(beta,3) if beta is not None else None,
-"beta_seed": beta_seed,
-"betas": round_b,
+"alpha_info": alpha_info,
+"beta_info": beta_info,
 "calculation": calculate,
 "save_as_half": args.save_half,
 "output_name": output_name,
