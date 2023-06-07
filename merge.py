@@ -538,7 +538,7 @@ elif mode == "NoIn":
 		
 elif mode == "RM":
   print(sha256(model_0_path, f"checkpoint/{os.path.splitext(os.path.basename(model_0_path))[0]}"))
-  print(read_metadata_from_safetensors(model_0_path))
+  print(json.dumps(read_metadata_from_safetensors(model_0_path), indent=2))
   exit()
 	
 if args.vae is not None:
