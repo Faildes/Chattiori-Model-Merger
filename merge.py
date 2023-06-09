@@ -156,6 +156,19 @@ def rand_ratio(string):
         deep = deep.replace("\n",",")
         deep = deep.split(",")
         for d in deep:
+            if "PRESET" in d:
+                res1 = []
+                preset_pack = d.split(":")[1]
+                preset_name, drat = float(preset_pack.split("(")[0]), preset_pack.split("(")[1].replace(")","")
+                try:
+                    get = weights_presets_list[x].replace("\n", ",").split(",")
+                    for a in get:
+                        res1.append(float(a))
+                    dr1 = ratios
+                    for d in range(0, 25):
+                        ratios[d] = dr1[d] * (1 - drat) + res1[d] * drat
+                    continue
+                except KeyError: continue
             if d.count(":") != 2 :continue
             dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
             dbs = dbs.split(" ")
