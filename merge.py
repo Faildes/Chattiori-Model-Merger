@@ -28,6 +28,39 @@ NUM_OUTPUT_BLOCKS = 12
 NUM_TOTAL_BLOCKS = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + NUM_OUTPUT_BLOCKS
 blockid=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
 
+def tagdict(presets):
+    presets=presets.splitlines()
+    wdict={}
+    for l in presets:
+        w=[]
+        if ":" in l :
+            key = l.split(":",1)[0]
+            w = l.split(":",1)[1]
+        if "\t" in l:
+            key = l.split("\t",1)[0]
+            w = l.split("\t",1)[1]
+        if len([w for w in w.split(",")]) == 26:
+            wdict[key.strip()]=w
+    return wdict
+path_root = os.getcwd()
+userfilepath = os.path.join(path_root, "mbwpresets.txt")
+if os.path.isfile(userfilepath):
+    try:
+        with open(userfilepath) as f:
+            weights_presets = f.read()
+            filepath = userfilepath
+    except OSError as e:
+            pass
+else:
+    filepath = os.path.join(path_root, "mbwpresets_master.txt")
+    try:
+        with open(filepath) as f:
+            weights_presets = f.read()
+            shutil.copyfile(filepath, userfilepath)
+    except OSError as e:
+            pass
+weights_presets_list = tagdict(weights_presets)
+
 deep_a = []
 deep_b = []
 useblocks = False
@@ -70,17 +103,22 @@ def deepblock(string):
     res2 = []
     for x in string:
         try:
-            x = float(x)
-            res1.append(x)
-        except:
-            if type(x) is not str: continue
-            bard = x.replace("\n", ",").split(",")
-            if len(bard) == 0: continue
-            elif len(bard) == 1: res2.append(bard[0])
-            else:
-                cor1, cor2 = deepblock(bard)
-                res1.extend(cor1)
-                res2.extend(cor2)
+            get = weights_presets_list[x].replace("\n", ",").split(",")
+            for a in get:
+                res1.append(float(a))
+        except KeyError:
+            try:
+                x = float(x)
+                res1.append(x)
+            except:
+                if type(x) is not str: continue
+                bard = x.replace("\n", ",").split(",")
+                if len(bard) == 0: continue
+                elif len(bard) == 1: res2.append(bard[0])
+                else:
+                    cor1, cor2 = deepblock(bard)
+                    res1.extend(cor1)
+                    res2.extend(cor2)
     return res1, res2
 
 def rand_ratio(string):
