@@ -201,6 +201,9 @@ parser.add_argument("model_path", type=str, help="Path to models")
 parser.add_argument("model_0", type=str, help="Name of model 0")
 parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None)
 parser.add_argument("--model_2", type=str, help="Optional, Name of model 2", default=None, required=False)
+parser.add_argument("--m0_name", type=str, help="Custom name of model 0", default=None, required=False)
+parser.add_argument("--m1_name", type=str, help="Custom name of model 1", default=None, required=False)
+parser.add_argument("--m2_name", type=str, help="Custom name of model 2", default=None, required=False)
 parser.add_argument("--vae", type=str, help="Path to vae", default=None, required=False)
 parser.add_argument("--alpha", type=wgta, help="Alpha value, optional, defaults to 0", default=0.0, required=False)
 parser.add_argument("--rand_alpha", type=str, help="Random Alpha value, optional", default=None, required=False)
@@ -687,14 +690,17 @@ else:
   beta = None
   beta_info = None
 	
-model_0_name = os.path.splitext(os.path.basename(model_0_path))[0]
-model_0_sha256 = sha256_from_cache(model_0_path, f"checkpoint/{model_0_name}")
+model_0_name = args.m0_name if args.m0_name is not None else os.path.splitext(os.path.basename(model_0_path))[0]
+model_0_bname = os.path.splitext(os.path.basename(model_0_path))[0]
+model_0_sha256 = sha256_from_cache(model_0_path, f"checkpoint/{model_0_bname}")
 if mode != "NoIn":
-  model_1_name = os.path.splitext(os.path.basename(model_1_path))[0]
-  model_1_sha256 = sha256_from_cache(model_1_path, f"checkpoint/{model_1_name}")
+  model_1_name = args.m1_name if args.m1_name is not None else os.path.splitext(os.path.basename(model_1_path))[0]
+  model_1_bname = os.path.splitext(os.path.basename(model_1_path))[0]
+  model_1_sha256 = sha256_from_cache(model_1_path, f"checkpoint/{model_1_bname}")
 if mode in ["sAD", "AD", "TRS", "ST"]:
-  model_2_name = os.path.splitext(os.path.basename(model_2_path))[0]
-  model_2_sha256 = sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}")
+  model_2_name = args.m2_name if args.m2_name is not None else os.path.splitext(os.path.basename(model_2_path))[0]
+  model_2_bname = os.path.splitext(os.path.basename(model_2_path))[0]
+  model_2_sha256 = sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}")
 if args.prune:
   model_0 = prune_model(model_0)
   if mode != "NoIn":
@@ -713,9 +719,9 @@ if cosine1:
   calculate = "cosine_1"
 merge_recipe = {
 "type": "merge-model-chattiori", # indicate this model was merged with chattiori's model mereger
-"primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_name}"),
-"secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_name}") if mode != "NoIn" else None,
-"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_name}") if mode in ["sAD", "AD", "TRS", "ST"] else None,
+"primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_bname}"),
+"secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_bname}") if mode != "NoIn" else None,
+"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}") if mode in ["sAD", "AD", "TRS", "ST"] else None,
 "merge_method": mode,
 "block_weights": (weights_a is not None or weights_b is not None),
 "alpha_info": alpha_info,
@@ -728,7 +734,7 @@ merge_recipe = {
 }
 metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
 
-def add_model_metadata(filename):
+def add_model_metadata(filename, model_name):
   sha256_t = sha256(filename, f"checkpoint/{os.path.splitext(os.path.basename(filename))[0]}")
   hash_t = model_hash(filename)
   _, extension_t = os.path.splitext(filename)
@@ -737,18 +743,18 @@ def add_model_metadata(filename):
   else:
     metadata_t = {}
   metadata["sd_merge_models"][sha256_t] = {
-  "name": os.path.splitext(os.path.basename(filename))[0],
+  "name": model_name,
   "legacy_hash": hash_t,
   "sd_merge_recipe": metadata_t.get("sd_merge_recipe", None)
   }
 
   metadata["sd_merge_models"].update(metadata_t.get("sd_merge_models", {}))
 
-add_model_metadata(model_0_path)
+add_model_metadata(model_0_path, model_0_name)
 if mode != "NoIn":
-  add_model_metadata(model_1_path)
+  add_model_metadata(model_1_path, model_1_name)
 if mode in ["sAD", "AD", "TRS", "ST"]:
-  add_model_metadata(model_2_path)
+  add_model_metadata(model_2_path, model_2_name)
 
 metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
 
