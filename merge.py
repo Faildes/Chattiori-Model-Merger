@@ -220,6 +220,16 @@ parser.add_argument("--functn", action="store_true", help="Add function name to 
 parser.add_argument("--delete_source", action="store_true", help="Delete the source checkpoint file", required=False)
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
 
+real_mode = {"WS": "Weighted Sum",
+	     "AD": "Add Difference",
+	     "NoIn": "No Interpolation",
+	     "TRS": "Triple Sum",
+	     "ST": "Sum Twice",
+	     "sAD": "smooth Add Difference",
+	     "SIG": "Sigmoid Merge",
+	     "GEO": "Geometric Sum",
+	     "MAX": "Max Merge",
+	     "RM": "Read Metadata"}
 args = parser.parse_args()
 device = args.device
 mode = args.mode
@@ -718,11 +728,11 @@ if cosine0:
 if cosine1:
   calculate = "cosine_1"
 merge_recipe = {
-"type": "merge-model-chattiori", # indicate this model was merged with chattiori's model mereger
+"type": "merge-models-chattiori", # indicate this model was merged with chattiori's model mereger
 "primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_bname}"),
 "secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_bname}") if mode != "NoIn" else None,
 "tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}") if mode in ["sAD", "AD", "TRS", "ST"] else None,
-"merge_method": mode,
+"merge_method": real_mode[mode],
 "block_weights": (weights_a is not None or weights_b is not None),
 "alpha_info": alpha_info,
 "beta_info": beta_info,
