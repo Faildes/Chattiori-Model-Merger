@@ -589,7 +589,10 @@ elif mode == "NoIn":
 		
 elif mode == "RM":
   print(sha256(model_0_path, f"checkpoint/{os.path.splitext(os.path.basename(model_0_path))[0]}"))
-  print(json.dumps(read_metadata_from_safetensors(model_0_path), indent=2))
+  meta = read_metadata_from_safetensors(model_0_path)
+  print(json.dumps(meta, indent=2))
+  with open("./" + output_name + ".json", mode="a+") as dmp:
+    json.dump(meta, dmp, indent=4)
   exit()
 	
 if args.vae is not None:
