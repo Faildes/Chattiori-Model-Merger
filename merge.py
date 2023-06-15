@@ -609,11 +609,12 @@ elif mode == "RM":
   exit()
 	
 if args.vae is not None:
-      _, extension_vae = os.path.splitext(args.vae)
-      if extension_vae.lower() == ".safetensors":
-          vae = safetensors.torch.load_file(args.vae, device=device)
-      else:
-          vae = torch.load(args.vae, map_location=device)
+    _, extension_vae = os.path.splitext(args.vae)
+    vae_name = os.path.splitext(os.path.basename(args.vae))[0]
+    if extension_vae.lower() == ".safetensors":
+      vae = safetensors.torch.load_file(args.vae, device=device)
+    else:
+      vae = torch.load(args.vae, map_location=device)
 
 def rinfo(string, seed):
     tram = string.split("[")
@@ -739,7 +740,7 @@ merge_recipe = {
 "calculation": calculate,
 "save_as_half": args.save_half,
 "output_name": output_name,
-"bake_in_vae": True if args.vae is not None else False,
+"bake_in_vae": vae_name if args.vae is not None else False,
 "pruned": args.prune
 }
 metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
