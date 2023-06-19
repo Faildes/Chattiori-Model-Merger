@@ -52,10 +52,16 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
     Or `"MIN, MAX, SEED, [Elemental merge args]"` if you want to specify.  
     Check out [Elemental Random](https://github.com/Faildes/merge-models/blob/main/elemental_random.md) for Elemental merge args.
     - Optional: `--vae` sets the vae file by set the path, if omitted
+    - Optional: `--m0_name` determines the name that to write in the data for the model0, if omitted
+    - Optional: `--m1_name` determines the name that to write in the data for the model1, if omitted
+    - Optional: `--m2_name` determines the name that to write in the data for the model2, if omitted
     - Optional: `--cosine0` determines to favor model0's structure with details from 1, if omitted  
     Check out [Calcmode](https://github.com/hako-mikan/sd-webui-supermerger/blob/main/calcmode_en.md) by hako-mikan for the information.
     - Optional: `--cosine1` determines to favor model1's structure with details from 0, if omitted  
     Check out [Calcmode](https://github.com/hako-mikan/sd-webui-supermerger/blob/main/calcmode_en.md) by hako-mikan for the information.
+    - Optional: `--use_dif_10` determines to use the difference between model0 and model1 as model1, if omitted
+    - Optional: `--use_dif_20` determines to use the difference between model0 and model2 as model2, if omitted
+    - Optional: `--use_dif_21` determines to use the difference between model2 and model1 as model2, if omitted
     - Optional: `--save_half` determines whether save the file as fp16, if omitted
     - Optional: `--prune` determines whether prune the model, if omitted
     - Optional: `--keep_ema` determines keep only ema while prune, if omitted
@@ -70,8 +76,9 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
 
 ### For Colab users
 
-- Install torch safetensors.  
-`!pip install torch safetensors`
+- Install required scripts.  
+`!pip install torch safetensors` *for safetensors*  
+`!pip install pytorch_lighting` *for ckpt*  
 
 - Clone this repo.  
 `!cd /content/`  
@@ -82,7 +89,7 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
 `!mkdir vae`
 
 - After installing models and vaes to the right directory,  
-Run merge.py.   
+Run `merge.py`.   
 `!cd /content/merge-models/`  
 `!python merge.py...`
 
