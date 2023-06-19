@@ -205,6 +205,9 @@ parser.add_argument("--m0_name", type=str, help="Custom name of model 0", defaul
 parser.add_argument("--m1_name", type=str, help="Custom name of model 1", default=None, required=False)
 parser.add_argument("--m2_name", type=str, help="Custom name of model 2", default=None, required=False)
 parser.add_argument("--vae", type=str, help="Path to vae", default=None, required=False)
+parser.add_argument("--use_dif_10", action="store_true", help="Use the difference of model 1 and model 0 as model 1", required=False)
+parser.add_argument("--use_dif_20", action="store_true", help="Use the difference of model 2 and model 0 as model 2", required=False)
+parser.add_argument("--use_dif_21", action="store_true", help="Use the difference of model 2 and model 1 as model 2", required=False)
 parser.add_argument("--alpha", type=wgta, help="Alpha value, optional, defaults to 0", default=0.0, required=False)
 parser.add_argument("--rand_alpha", type=str, help="Random Alpha value, optional", default=None, required=False)
 parser.add_argument("--beta", type=wgtb, help="Beta value, optional, defaults to 0", default=0.0, required=False)
@@ -723,11 +726,18 @@ if args.vae is not None:
 
 metadata = {"format": "pt", "sd_merge_models": {}, "sd_merge_recipe": None}
 
-calculate = None
+calculate = []
 if cosine0:
-  calculate = "cosine_0"
+  calculate.append("cosine_0")
 if cosine1:
-  calculate = "cosine_1"
+  calculate.append("cosine_1")
+if args.use_dif_10:
+    calculate.append("use_dif_10")
+if args.use_dif_20:
+    calculate.append("use_dif_20")
+if args.use_dif_21:
+    calculate.append("use_dif_21")
+calcl = ",".join(calculate) if calculate != [] else None
 merge_recipe = {
 "type": "merge-models-chattiori", # indicate this model was merged with chattiori's model mereger
 "primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_bname}"),
@@ -737,7 +747,7 @@ merge_recipe = {
 "block_weights": (weights_a is not None or weights_b is not None),
 "alpha_info": alpha_info,
 "beta_info": beta_info,
-"calculation": calculate,
+"calculation": calcl,
 "save_as_half": args.save_half,
 "output_name": output_name,
 "bake_in_vae": vae_name if args.vae is not None else False,
@@ -865,6 +875,39 @@ if theta_func1:
       else:
           theta_1[key] = torch.zeros_like(theta_1[key])
   del theta_2
+
+if args.use_dif_21:
+    theta_3 = copy.deepcopy(theta_1)
+    for key in tqdm(theta_2.keys(), desc="Stage 0/2"):
+        if 'model' in key:
+          if key in theta_3:
+              t2 = theta_3.get(key, torch.zeros_like(theta_2[key]))
+              theta_2[key] = theta_func1(theta_2[key], t2)
+          else:
+              theta_2[key] = torch.zeros_like(theta_2[key])
+    del theta_3
+
+if args.use_dif_10:
+    theta_3 = copy.deepcopy(theta_0)
+    for key in tqdm(theta_1.keys(), desc="Stage 0/2"):
+        if 'model' in key:
+          if key in theta_3:
+              t2 = theta_3.get(key, torch.zeros_like(theta_1[key]))
+              theta_1[key] = theta_func1(theta_1[key], t2)
+          else:
+              theta_1[key] = torch.zeros_like(theta_1[key])
+    del theta_3
+
+if args.use_dif_20:
+    theta_3 = copy.deepcopy(theta_0)
+    for key in tqdm(theta_2.keys(), desc="Stage 0/2"):
+        if 'model' in key:
+          if key in theta_3:
+              t2 = theta_3.get(key, torch.zeros_like(theta_2[key]))
+              theta_2[key] = theta_func1(theta_2[key], t2)
+          else:
+              theta_2[key] = torch.zeros_like(theta_2[key])
+    del theta_3
 
 re_inp = re.compile(r'\.input_blocks\.(\d+)\.')  # 12
 re_mid = re.compile(r'\.middle_block\.(\d+)\.')  # 1
