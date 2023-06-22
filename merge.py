@@ -130,6 +130,8 @@ def rand_ratio(string):
         tram = string.split("[")
         string = tram[0]
         deep = tram[1].replace("]","")
+    else:
+      deep = []
     parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if (a != "" or a != " ")]
     if type(parsed) is list:
         try:
@@ -161,7 +163,7 @@ def rand_ratio(string):
                 preset_pack = d.split(":")[1]
                 preset_name, drat = float(preset_pack.split("(")[0]), preset_pack.split("(")[1].replace(")","")
                 try:
-                    get = weights_presets_list[x].replace("\n", ",").split(",")
+                    get = weights_presets_list[preset_name].replace("\n", ",").split(",")
                     for a in get:
                         res1.append(float(a))
                     dr1 = ratios
@@ -622,7 +624,10 @@ if args.vae is not None:
 def rinfo(string, seed):
     tram = string.split("[")
     string = tram[0]
-    fe = tram[1].replace("]","")
+    try:
+      fe = tram[1].replace("]","")
+    except:
+      fe = None
     parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if (a != "" or a != " ")]
     if type(parsed) is list:
         try:
@@ -663,7 +668,7 @@ if args.rand_alpha is not None:
     args.alpha = wgta(alphas)
 if args.rand_beta is not None:
     betas, beta_seed, deep_b = rand_ratio(args.rand_beta)
-    beta_rand_info = rinfo(args.rand_beta, beta_seed)
+    beta_info = rinfo(args.rand_beta, beta_seed)
     args.beta = wgtb(betas)
 	
 usebeta = False	
@@ -876,6 +881,9 @@ if theta_func1:
           theta_1[key] = torch.zeros_like(theta_1[key])
   del theta_2
 
+print(f"Loading {model_0_name}...")
+theta_0 = read_state_dict(model_0_path, map_location=device)
+
 if args.use_dif_21:
     theta_3 = copy.deepcopy(theta_1)
     for key in tqdm(theta_2.keys(), desc="Stage 0/2"):
@@ -886,6 +894,10 @@ if args.use_dif_21:
           else:
               theta_2[key] = torch.zeros_like(theta_2[key])
     del theta_3
+
+re_inp = re.compile(r'\.input_blocks\.(\d+)\.')  # 12
+re_mid = re.compile(r'\.middle_block\.(\d+)\.')  # 1
+re_out = re.compile(r'\.output_blocks\.(\d+)\.') # 12
 
 if args.use_dif_10:
     theta_3 = copy.deepcopy(theta_0)
@@ -908,13 +920,6 @@ if args.use_dif_20:
           else:
               theta_2[key] = torch.zeros_like(theta_2[key])
     del theta_3
-
-re_inp = re.compile(r'\.input_blocks\.(\d+)\.')  # 12
-re_mid = re.compile(r'\.middle_block\.(\d+)\.')  # 1
-re_out = re.compile(r'\.output_blocks\.(\d+)\.') # 12
-
-print(f"Loading {model_0_name}...")
-theta_0 = read_state_dict(model_0_path, map_location=device)
 
 if cosine0: #favors modelA's structure with details from B
     sim = torch.nn.CosineSimilarity(dim=0)
