@@ -132,7 +132,7 @@ def rand_ratio(string):
         deep = tram[1].replace("]","")
     else:
       deep = []
-    parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if (a != "" or a != " ")]
+    parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if (a != "" and a != " ")]
     if type(parsed) is list:
         try:
             rmin = float(parsed[0])
