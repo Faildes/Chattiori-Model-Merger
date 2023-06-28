@@ -198,7 +198,7 @@ def rand_ratio(string):
     return ratios, seed, deep_res
 
 parser = argparse.ArgumentParser(description="Merge two or three models")
-parser.add_argument("mode", choices=["WS","AD","NoIn","TRS","ST","sAD","SIG","GEO","MAX","RM"], help="Merging mode")
+parser.add_argument("mode", choices=["WS","AD","NoIn","TRS","ST","sAD","TD","TS","SIG","GEO","MAX","RM"], help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
 parser.add_argument("model_0", type=str, help="Name of model 0")
 parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None)
@@ -231,6 +231,8 @@ real_mode = {"WS": "Weighted Sum",
 	     "TRS": "Triple Sum",
 	     "ST": "Sum Twice",
 	     "sAD": "smooth Add Difference",
+             "TS": "Tensor Sum",
+             "TD": "Train Difference",
 	     "SIG": "Sigmoid Merge",
 	     "GEO": "Geometric Sum",
 	     "MAX": "Max Merge",
@@ -566,7 +568,7 @@ if args.model_1 is not None:
 if args.model_2 is not None:
   model_2_path = os.path.join(args.model_path, args.model_2)
 
-if mode in ["WS", "SIG", "GEO", "MAX"]:
+if mode in ["WS", "SIG", "GEO", "MAX","TS"]:
   interp_method = 0
   _, extension_0 = os.path.splitext(model_0_path)
   if extension_0.lower() == ".safetensors":
@@ -579,7 +581,7 @@ if mode in ["WS", "SIG", "GEO", "MAX"]:
   else:
       model_1 = torch.load(model_1_path, map_location=device)
 		
-elif mode in ["sAD", "AD", "TRS", "ST"]:
+elif mode in ["sAD", "AD", "TRS", "ST", "TD"]:
   interp_method = 0
   _, extension_0 = os.path.splitext(model_0_path)
   if extension_0.lower() == ".safetensors":
@@ -687,7 +689,7 @@ else:
   alpha = args.alpha
   alpha_info = f"{round(args.alpha,3)}"
 	
-if mode in ["TRS","ST"]:
+if mode in ["TRS","ST","TS"]:
   usebeta = True
   if type(args.beta) == list:
     weights_b = args.beta
@@ -716,7 +718,7 @@ if mode != "NoIn":
   model_1_name = args.m1_name if args.m1_name is not None else os.path.splitext(os.path.basename(model_1_path))[0]
   model_1_bname = os.path.splitext(os.path.basename(model_1_path))[0]
   model_1_sha256 = sha256_from_cache(model_1_path, f"checkpoint/{model_1_bname}")
-if mode in ["sAD", "AD", "TRS", "ST"]:
+if mode in ["sAD", "AD", "TRS", "ST", "TD"]:
   model_2_name = args.m2_name if args.m2_name is not None else os.path.splitext(os.path.basename(model_2_path))[0]
   model_2_bname = os.path.splitext(os.path.basename(model_2_path))[0]
   model_2_sha256 = sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}")
@@ -743,11 +745,12 @@ if args.use_dif_20:
 if args.use_dif_21:
     calculate.append("use_dif_21")
 calcl = ",".join(calculate) if calculate != [] else None
+
 merge_recipe = {
 "type": "merge-models-chattiori", # indicate this model was merged with chattiori's model mereger
 "primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_bname}"),
 "secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_bname}") if mode != "NoIn" else None,
-"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}") if mode in ["sAD", "AD", "TRS", "ST"] else None,
+"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}") if mode in ["sAD", "AD", "TRS", "ST","TD"] else None,
 "merge_method": real_mode[mode],
 "block_weights": (weights_a is not None or weights_b is not None),
 "alpha_info": alpha_info,
@@ -779,7 +782,7 @@ def add_model_metadata(filename, model_name):
 add_model_metadata(model_0_path, model_0_name)
 if mode != "NoIn":
   add_model_metadata(model_1_path, model_1_name)
-if mode in ["sAD", "AD", "TRS", "ST"]:
+if mode in ["sAD", "AD", "TRS", "ST","TD"]:
   add_model_metadata(model_2_path, model_2_name)
 
 metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
@@ -847,11 +850,32 @@ def filename_add_difference():
 
 def filename_nothing():
   return model_0_name
-  
+
+def blocker_S(blocks):
+    blocks = blocks.split(" ")
+    output = ""
+    for w in blocks:
+        flagger=[False]*26
+        changer = True
+        if "-" in w:
+            wt = [wt.strip() for wt in w.split('-')]
+            if  blockid.index(wt[1]) > blockid.index(wt[0]):
+                flagger[blockid.index(wt[0]):blockid.index(wt[1])+1] = [changer]*(blockid.index(wt[1])-blockid.index(wt[0])+1)
+            else:
+                flagger[blockid.index(wt[1]):blockid.index(wt[0])+1] = [changer]*(blockid.index(wt[0])-blockid.index(wt[1])+1)
+        else:
+            output = output + " " + w if output != "" else w
+            return output
+        for i in range(26):
+            if flagger[i]: output = output + " " + blockid[i] if output !="" else blockid[i]
+        return output
+    
 theta_funcs = {
     "WS":   (filename_weighted_sum, None, weighted_sum),
     "AD":   (filename_add_difference, get_difference, add_difference),
     "sAD":   (filename_add_difference, get_difference, add_difference),
+    "TD":   (filename_add_difference, None, add_difference),
+    "TS":   (filename_weighted_sum, None, weighted_sum),
     "TRS":  (filename_triple_sum, None, triple_sum),
     "ST":   (filename_sum_twice, None, sum_twice),
     "NoIn": (filename_nothing, None, None),
@@ -867,7 +891,7 @@ if theta_func2:
 else:
   theta_1 = None
 
-if mode in ["sAD", "AD", "TRS", "ST"]:
+if mode in ["sAD", "AD", "TRS", "ST", "TD"]:
   print(f"Loading {model_2_name}...")
   theta_2 = read_state_dict(model_2_path, map_location=device)
 
@@ -882,7 +906,14 @@ if theta_func1:
   del theta_2
 
 print(f"Loading {model_0_name}...")
-theta_0 = read_state_dict(model_0_path, map_location=device)
+if mode == "TS":
+    theta_t = read_state_dict(model_0_path, map_location=device)
+    theta_0 ={}
+    for key in theta_t:
+        theta_0[key] = theta_t[key].clone()
+    del theta_t
+else:
+    theta_0 = read_state_dict(model_0_path, map_location=device)
 
 if args.use_dif_21:
     theta_3 = copy.deepcopy(theta_1)
@@ -921,6 +952,7 @@ if args.use_dif_20:
               theta_2[key] = torch.zeros_like(theta_2[key])
     del theta_3
 
+    
 if cosine0: #favors modelA's structure with details from B
     sim = torch.nn.CosineSimilarity(dim=0)
     sims = np.array([], dtype=np.float64)
@@ -954,8 +986,8 @@ if cosine1: #favors modelB's structure with details from A
 
 if mode != "NoIn":
   for key in tqdm(theta_0.keys(), desc="Stage 1/2"):
-    if theta_1 and "model" in key and key in theta_1:
-      if usebeta and not key in theta_2:
+    if theta_1 and "model" in key and key in theta_1:    
+      if (usebeta or mode == "TD") and not key in theta_2:
          continue
       weight_index = -1
       current_alpha = alpha
@@ -1005,6 +1037,7 @@ if mode != "NoIn":
         for d in deep_a:
           if d.count(":") != 2 :continue
           dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+          dbs = blocker_S(dbs)
           dbs,dws = dbs.split(" "), dws.split(" ")
           dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
           dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
@@ -1027,6 +1060,7 @@ if mode != "NoIn":
           if d.count(":") != 2 :continue
           dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
           dbs,dws = dbs.split(" "), dws.split(" ")
+          dbs = blocker_S(dbs)
           dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
           dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
           flag = dbn
@@ -1057,8 +1091,8 @@ if mode != "NoIn":
             magnitude_similarity = dot_product / (torch.norm(theta_0_norm) * torch.norm(theta_1_norm))
             combined_similarity = (simab + magnitude_similarity) / 2.0
             k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
-            k = k - current_alpha
-            k = k.clip(min=.0,max=1.)
+            k = k - abs(current_alpha)
+            k = k.clip(min=0,max=1.0)
             theta_0[key] = b * (1 - k) + a * k
 	
       elif cosine1:
@@ -1071,7 +1105,7 @@ if mode != "NoIn":
             combined_similarity = (simab + magnitude_similarity) / 2.0
             k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
             k = k - current_alpha
-            k = k.clip(min=.0,max=1.)
+            k = k.clip(min=0,max=1.0)
             theta_0[key] = b * (1 - k) + a * k
 		
       elif mode == "sAD":
@@ -1082,7 +1116,60 @@ if mode != "NoIn":
         b = torch.tensor(filtered_diff)
         # Add the filtered differences to the original weights
         theta_0[key] = a + current_alpha * b
-	
+        
+      elif mode == "TD":
+        # Check if theta_1[key] is equal to theta_2[key]
+        if torch.allclose(theta_1[key].float(), theta_2[key].float(), rtol=0, atol=0):
+            theta_2[key] = theta_0[key]
+            continue
+
+        diff_AB = theta_1[key].float() - theta_2[key].float()
+
+        distance_A0 = torch.abs(theta_1[key].float() - theta_2[key].float())
+        distance_A1 = torch.abs(theta_1[key].float() - theta_0[key].float())
+
+        sum_distances = distance_A0 + distance_A1
+
+        scale = torch.where(sum_distances != 0, distance_A1 / sum_distances, torch.tensor(0.).float())
+        sign_scale = torch.sign(theta_1[key].float() - theta_2[key].float())
+        scale = sign_scale * torch.abs(scale)
+
+        new_diff = scale * torch.abs(diff_AB)
+        theta_0[key] = theta_0[key] + (new_diff * (current_alpha*1.8))
+      elif mode == "TS":
+            dim = theta_0[key].dim()
+            if dim == 0 : continue
+            if current_alpha+current_beta <= 1 :
+                talphas = int(theta_0[key].shape[0]*(current_beta))
+                talphae = int(theta_0[key].shape[0]*(current_alpha+current_beta))
+                if dim == 1:
+                    theta_0[key][talphas:talphae] = theta_1[key][talphas:talphae].clone()
+
+                elif dim == 2:
+                    theta_0[key][talphas:talphae,:] = theta_1[key][talphas:talphae,:].clone()
+
+                elif dim == 3:
+                    theta_0[key][talphas:talphae,:,:] = theta_1[key][talphas:talphae,:,:].clone()
+
+                elif dim == 4:
+                    theta_0[key][talphas:talphae,:,:,:] = theta_1[key][talphas:talphae,:,:,:].clone()
+
+            else:
+                talphas = int(theta_0[key].shape[0]*(current_alpha+current_beta-1))
+                talphae = int(theta_0[key].shape[0]*(current_beta))
+                theta_t = theta_1[key].clone()
+                if dim == 1:
+                    theta_t[talphas:talphae] = theta_0[key][talphas:talphae].clone()
+
+                elif dim == 2:
+                    theta_t[talphas:talphae,:] = theta_0[key][talphas:talphae,:].clone()
+
+                elif dim == 3:
+                    theta_t[talphas:talphae,:,:] = theta_0[key][talphas:talphae,:,:].clone()
+
+                elif dim == 4:
+                    theta_t[talphas:talphae,:,:,:] = theta_0[key][talphas:talphae,:,:,:].clone()
+                theta_0[key] = theta_t
       else:
         if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
           if a.shape[1] == 4 and b.shape[1] == 9:
@@ -1116,6 +1203,8 @@ if mode != "NoIn":
         if "model" in key and key not in theta_0:
             theta_0.update({key:theta_1[key]})
   del theta_1
+  if theta_2:
+      del theta_2
             
 if args.vae is not None:
     print(f"Baking in VAE")
