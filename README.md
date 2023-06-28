@@ -12,8 +12,10 @@ The mode is:
 - "MAX" for Max Merge
 - "AD" for Add Difference (requires model2)
 - "sAD" for Smooth Add Difference (requires model2)
-- "TRS" for Triple Sum (requires model2)
-- "ST" for Sum Twice (requires model2)
+- "TD" for Train Difference (requires model2)
+- "TRS" for Triple Sum (requires model2 and beta)
+- "TS" for Tensor Sum (requires beta)
+- "ST" for Sum Twice (requires model2 and beta)
 - "NoIn" for No Interporation
 - "RM" for Read Metadata
 
