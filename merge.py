@@ -630,7 +630,7 @@ def rinfo(string, seed):
       fe = tram[1].replace("]","")
     except:
       fe = None
-    parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if (a != "" or a != " ")]
+    parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if (a != "" and a != " ")]
     if type(parsed) is list:
         try:
             rmin = float(parsed[0])
