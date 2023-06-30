@@ -1203,8 +1203,11 @@ if mode != "NoIn":
         if "model" in key and key not in theta_0:
             theta_0.update({key:theta_1[key]})
   del theta_1
-  if theta_2:
-      del theta_2
+  try:
+    if theta_2:
+        del theta_2
+  except NameError:
+    pass
             
 if args.vae is not None:
     print(f"Baking in VAE")
