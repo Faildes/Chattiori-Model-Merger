@@ -1254,4 +1254,5 @@ if args.delete_source:
     if mode in ["sAD", "AD", "TRS", "ST"]:
       os.remove(model_2_path)
 del theta_0
-print("Done!")
+file_size = round(os.path.getsize(output_path) / 1073741824,2)
+print(f"Done! Saved as {output_file}({file_size}G)!")
