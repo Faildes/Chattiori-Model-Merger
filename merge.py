@@ -22,6 +22,7 @@ import safetensors
 import random
 from tqdm import tqdm
 
+FINETUNEX = ["IN","OUT","OUT2","CONT","COL1","COL2","COL3"]
 NUM_INPUT_BLOCKS = 12
 NUM_MID_BLOCK = 1
 NUM_OUTPUT_BLOCKS = 12
@@ -197,6 +198,26 @@ def rand_ratio(string):
                         deep_res.append(f"{db}:{dws}:{dr0}")
     return ratios, seed, deep_res
 
+def fineman(fine):
+    fine = [
+        1 - fine[0] * 0.01,
+        1+ fine[0] * 0.02,
+        1 - fine[1] * 0.01,
+        1+ fine[1] * 0.02,
+        1 - fine[2] * 0.01,
+        [x*0.02 for x in fine[3:]]
+                ]
+    return fine
+
+FINETUNES = [
+"model.diffusion_model.input_blocks.0.0.weight",
+"model.diffusion_model.input_blocks.0.0.bias",
+"model.diffusion_model.out.0.weight",
+"model.diffusion_model.out.0.bias",
+"model.diffusion_model.out.2.weight",
+"model.diffusion_model.out.2.bias",
+]
+
 parser = argparse.ArgumentParser(description="Merge two or three models")
 parser.add_argument("mode", choices=["WS","AD","NoIn","TRS","ST","sAD","TD","TS","SIG","GEO","MAX","RM"], help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
@@ -214,8 +235,9 @@ parser.add_argument("--alpha", type=wgta, help="Alpha value, optional, defaults 
 parser.add_argument("--rand_alpha", type=str, help="Random Alpha value, optional", default=None, required=False)
 parser.add_argument("--beta", type=wgtb, help="Beta value, optional, defaults to 0", default=0.0, required=False)
 parser.add_argument("--rand_beta", type=str, help="Random Beta value, optional", default=None, required=False)
-parser.add_argument("--cosine0", action="store_true", help="favors model0's structure with details from 1", required=False)
-parser.add_argument("--cosine1", action="store_true", help="favors model1's structure with details from 0", required=False)
+parser.add_argument("--cosine0", action="store_true", help="Favors model 0's structure with details from 1", required=False)
+parser.add_argument("--cosine1", action="store_true", help="Favors model 1's structure with details from 0", required=False)
+parser.add-argument("--fine", type=str, help="Finetune the given keys on model 0", default=None, required=False)
 parser.add_argument("--save_half", action="store_true", help="Save as float16", required=False)
 parser.add_argument("--prune", action="store_true", help="Prune Model", required=False)
 parser.add_argument("--save_safetensors", action="store_true", help="Save as .safetensors", required=False)
@@ -241,6 +263,11 @@ args = parser.parse_args()
 device = args.device
 mode = args.mode
 
+if args.fine is not None:
+    fine = [float(t) for t in args.fine.split(",")]
+    fine = fineman(fine)
+else:
+    fine = []
 if (args.cosine0 and args.cosine1) or mode != "WS":
   cosine0 = False
   cosine1 = False
@@ -744,6 +771,8 @@ if args.use_dif_20:
     calculate.append("use_dif_20")
 if args.use_dif_21:
     calculate.append("use_dif_21")
+if args.fine is not None:
+    calculate.append(f"fine[{fine}]")
 calcl = ",".join(calculate) if calculate != [] else None
 
 merge_recipe = {
@@ -1196,7 +1225,14 @@ if mode != "NoIn":
           else:
             theta_0[key] = theta_func2(a, b, current_alpha)
 
-        theta_0[key] = to_half(theta_0[key], args.save_half)
+      if any(item in key for item in FINETUNES) and fine:
+        index = FINETUNES.index(key)
+        print(key,fine[index])
+        if 5 > index : 
+            theta_0[key] =theta_0[key]* fine[index] 
+        else :theta_0[key] =theta_0[key] + torch.tensor(fine[5])
+        
+      theta_0[key] = to_half(theta_0[key], args.save_half)
   for key in tqdm(theta_1.keys(), desc="Remerging..."):
         if key in checkpoint_dict_skip_on_merge:
             continue
