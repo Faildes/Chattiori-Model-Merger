@@ -885,18 +885,18 @@ theta_funcs = {
 }
 filename_generator, theta_func1, theta_func2 = theta_funcs[mode] 
 
+if mode in ["sAD", "AD", "TRS", "ST", "TD"]:
+  print(f"Loading {model_2_name}...")
+  theta_2 = read_state_dict(model_2_path, map_location=device)
+
 if theta_func2:
   print(f"Loading {model_1_name}...")
   theta_1 = read_state_dict(model_1_path, map_location=device)
 else:
   theta_1 = None
 
-if mode in ["sAD", "AD", "TRS", "ST", "TD"]:
-  print(f"Loading {model_2_name}...")
-  theta_2 = read_state_dict(model_2_path, map_location=device)
-
 if theta_func1:
-  for key in tqdm(theta_1.keys(), desc="Stage 0/2"):
+  for key in tqdm(theta_1.keys(), desc="Getting Difference of Model 1 and 2"):
     if 'model' in key:
       if key in theta_2:
           t2 = theta_2.get(key, torch.zeros_like(theta_1[key]))
@@ -917,7 +917,7 @@ else:
 
 if args.use_dif_21:
     theta_3 = copy.deepcopy(theta_1)
-    for key in tqdm(theta_2.keys(), desc="Stage 0/2"):
+    for key in tqdm(theta_2.keys(), desc="Getting Difference of Model 1 and 2"):
         if 'model' in key:
           if key in theta_3:
               t2 = theta_3.get(key, torch.zeros_like(theta_2[key]))
@@ -932,7 +932,7 @@ re_out = re.compile(r'\.output_blocks\.(\d+)\.') # 12
 
 if args.use_dif_10:
     theta_3 = copy.deepcopy(theta_0)
-    for key in tqdm(theta_1.keys(), desc="Stage 0/2"):
+    for key in tqdm(theta_1.keys(), desc="Getting Difference of Model 0 and 1"):
         if 'model' in key:
           if key in theta_3:
               t2 = theta_3.get(key, torch.zeros_like(theta_1[key]))
@@ -943,7 +943,7 @@ if args.use_dif_10:
 
 if args.use_dif_20:
     theta_3 = copy.deepcopy(theta_0)
-    for key in tqdm(theta_2.keys(), desc="Stage 0/2"):
+    for key in tqdm(theta_2.keys(), desc="Getting Difference of Model 0 and 2"):
         if 'model' in key:
           if key in theta_3:
               t2 = theta_3.get(key, torch.zeros_like(theta_2[key]))
@@ -956,7 +956,7 @@ if args.use_dif_20:
 if cosine0: #favors modelA's structure with details from B
     sim = torch.nn.CosineSimilarity(dim=0)
     sims = np.array([], dtype=np.float64)
-    for key in (tqdm(theta_0.keys(), desc="Stage 0/2")):
+    for key in (tqdm(theta_0.keys(), desc="Caluculating Cosine 0")):
         # skip VAE model parameters to get better results
         if "first_stage_model" in key: continue
         if "model" in key and key in theta_1:
@@ -971,7 +971,7 @@ if cosine0: #favors modelA's structure with details from B
 if cosine1: #favors modelB's structure with details from A
     sim = torch.nn.CosineSimilarity(dim=0)
     sims = np.array([], dtype=np.float64)
-    for key in (tqdm(theta_0.keys(), desc="Stage 0/2")):
+    for key in (tqdm(theta_0.keys(), desc="Caluculating Cosine 1")):
         # skip VAE model parameters to get better results
         if "first_stage_model" in key: continue
         if "model" in key and key in theta_1:
@@ -985,7 +985,7 @@ if cosine1: #favors modelB's structure with details from A
     sims = np.delete(sims, np.where(sims > np.percentile(sims, 99, method='midpoint')))
 
 if mode != "NoIn":
-  for key in tqdm(theta_0.keys(), desc="Stage 1/2"):
+  for key in tqdm(theta_0.keys(), desc="Merging..."):
     if theta_1 and "model" in key and key in theta_1:    
       if (usebeta or mode == "TD") and not key in theta_2:
          continue
@@ -1197,7 +1197,7 @@ if mode != "NoIn":
             theta_0[key] = theta_func2(a, b, current_alpha)
 
         theta_0[key] = to_half(theta_0[key], args.save_half)
-  for key in tqdm(theta_1.keys(), desc="Stage 2/2"):
+  for key in tqdm(theta_1.keys(), desc="Remerging..."):
         if key in checkpoint_dict_skip_on_merge:
             continue
         if "model" in key and key not in theta_0:
@@ -1225,14 +1225,15 @@ if args.save_half and not theta_func2:
 loaded = None
 # check if output file already exists, ask to overwrite
 if args.prune:
-  print("Pruning...\n")
+  print("Making Full-sized File...\n")
   output_a = os.path.join(model_path, "test.safetensors")
   if os.path.isfile(output_a):
     os.remove(output_a)
   safetensors.torch.save_file(theta_0, output_a,metadata=metadata)
   sd = safetensors.torch.load_file(output_a, device=device)
   model = prune_model(sd)
-  print("Saving...")
+  file_size_temp = round(os.path.getsize(output_a) / 1073741824,2)
+  print(f"Pruning {output_file}({file_size_temp}G)...")
   if args.save_safetensors:
     with torch.no_grad():
         safetensors.torch.save_file(model, output_path, metadata=metadata)
@@ -1241,7 +1242,7 @@ if args.prune:
   del model
   os.remove(output_a)
 else:
-  print("Saving...")
+  print(f"Saving as {output_file}...")
   if args.save_safetensors:
     with torch.no_grad():
         safetensors.torch.save_file(theta_0, output_path, metadata=metadata)
@@ -1255,4 +1256,4 @@ if args.delete_source:
       os.remove(model_2_path)
 del theta_0
 file_size = round(os.path.getsize(output_path) / 1073741824,2)
-print(f"Done! Saved as {output_file}({file_size}G)!")
+print(f"Done! ({file_size}G)")
