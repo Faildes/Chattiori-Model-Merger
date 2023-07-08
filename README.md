@@ -64,6 +64,8 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
     - Optional: `--use_dif_10` determines to use the difference between model0 and model1 as model1, if omitted
     - Optional: `--use_dif_20` determines to use the difference between model0 and model2 as model2, if omitted
     - Optional: `--use_dif_21` determines to use the difference between model2 and model1 as model2, if omitted
+    - Optional: `--fine` determines adjustment of details, if omitted  
+    Check out [Elemental EN](https://github.com/hako-mikan/sd-webui-supermerger/blob/main/elemental_en.md#adjust) by hako-mikan for the information.
     - Optional: `--save_half` determines whether save the file as fp16, if omitted
     - Optional: `--prune` determines whether prune the model, if omitted
     - Optional: `--keep_ema` determines keep only ema while prune, if omitted
