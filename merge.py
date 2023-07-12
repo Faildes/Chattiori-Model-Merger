@@ -245,6 +245,7 @@ parser.add_argument("--keep_ema", action="store_true", help="Keep ema", required
 parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
 parser.add_argument("--functn", action="store_true", help="Add function name to the file", required=False)
 parser.add_argument("--delete_source", action="store_true", help="Delete the source checkpoint file", required=False)
+parser.add_argument("--discard_vae", action="store_true", help="Discard the weights of pre baked vae", required=False)
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
 
 real_mode = {"WS": "Weighted Sum",
@@ -804,7 +805,7 @@ merge_recipe = {
 "calculation": calcl,
 "save_as_half": args.save_half,
 "output_name": output_name,
-"bake_in_vae": vae_name if args.vae is not None else False,
+"bake_in_vae": vae_name if args.vae is not None and not args.discard_vae else False,
 "pruned": args.prune
 }
 metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
@@ -1264,7 +1265,15 @@ if mode != "NoIn":
         del theta_2
   except NameError:
     pass
-            
+
+if args.discard_vae:
+  theta_X ={}
+  for key in theta_0.keys():
+    if "first_stage_model" in key: continue
+    theta_X[key] = theta_0
+  theta_0 = copy.deepcopy(theta_X)
+  del theta_X
+
 if args.vae is not None:
     print(f"Baking in VAE")
     vae_dict = load_vae_dict(args.vae, map_location=device)
