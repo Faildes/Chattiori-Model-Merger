@@ -12,6 +12,8 @@ The mode is:
 - "MAX" for Max Merge
 - "AD" for Add Difference (requires model2)
 - "sAD" for Smooth Add Difference (requires model2)
+- "MD" for Multiply Difference (requires model2 and beta)
+- "SIM" for Similarity Add Difference (requires model2 and beta)
 - "TD" for Train Difference (requires model2)
 - "TRS" for Triple Sum (requires model2 and beta)
 - "TS" for Tensor Sum (requires beta)
@@ -107,6 +109,7 @@ Run `merge.py`.
 - [eyriewow](https://github.com/eyriewow/merge-models) for original merge-models.
 - [lopho](https://github.com/lopho/stable-diffusion-prune) and [arenasys](https://github.com/arenasys/stable-diffusion-webui-model-toolkit) for Pruning system.
 - [idelairre](https://github.com/idelairre/sd-merge-models) for Geometric, Sigmoid and Max Sum.
-- [hako-mikan](https://github.com/hako-mikan/sd-webui-supermerger) for Triple Sum, Sum twice, Smooth Add Difference, Cosine Merging and Elemental Merge.
+- [s1dlx](https://github.com/s1dlx/meh) for Multiply Difference and Similarity Add Difference.
+- [hako-mikan](https://github.com/hako-mikan/sd-webui-supermerger) for Tensor Sum, Train Difference, Triple Sum, Sum twice, Smooth Add Difference, Finetuning, Cosine Merging and Elemental Merge.
 - [bbc-mc](https://github.com/bbc-mc/sdweb-merge-block-weighted-gui) for Block Weighted Merge.
 - Eyriewow got the merging logic in `merge.py` from [this post](https://discord.com/channels/1010980909568245801/1011008178957320282/1018117933894996038) by r_Sh4d0w, who seems to have gotten it from [mlfoundations/wise-ft](https://github.com/mlfoundations/wise-ft)
