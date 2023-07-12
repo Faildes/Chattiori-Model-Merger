@@ -237,7 +237,7 @@ parser.add_argument("--beta", type=wgtb, help="Beta value, optional, defaults to
 parser.add_argument("--rand_beta", type=str, help="Random Beta value, optional", default=None, required=False)
 parser.add_argument("--cosine0", action="store_true", help="Favors model 0's structure with details from 1", required=False)
 parser.add_argument("--cosine1", action="store_true", help="Favors model 1's structure with details from 0", required=False)
-parser.add-argument("--fine", type=str, help="Finetune the given keys on model 0", default=None, required=False)
+parser.add_argument("--fine", type=str, help="Finetune the given keys on model 0", default=None, required=False)
 parser.add_argument("--save_half", action="store_true", help="Save as float16", required=False)
 parser.add_argument("--prune", action="store_true", help="Prune Model", required=False)
 parser.add_argument("--save_safetensors", action="store_true", help="Save as .safetensors", required=False)
