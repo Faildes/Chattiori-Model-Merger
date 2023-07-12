@@ -219,7 +219,7 @@ FINETUNES = [
 ]
 
 parser = argparse.ArgumentParser(description="Merge two or three models")
-parser.add_argument("mode", choices=["WS","AD","NoIn","TRS","ST","sAD","TD","TS","SIG","GEO","MAX","RM"], help="Merging mode")
+parser.add_argument("mode", choices=["WS","AD","NoIn","MD","SIM","TRS","ST","sAD","TD","TS","SIG","GEO","MAX","RM"], help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
 parser.add_argument("model_0", type=str, help="Name of model 0")
 parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None)
@@ -250,6 +250,8 @@ parser.add_argument("--device", type=str, help="Device to use, defaults to cpu",
 real_mode = {"WS": "Weighted Sum",
 	     "AD": "Add Difference",
 	     "NoIn": "No Interpolation",
+             "MD": "Multiply Difference",
+             "SIM": "Similarity Add Difference",
 	     "TRS": "Triple Sum",
 	     "ST": "Sum Twice",
 	     "sAD": "smooth Add Difference",
@@ -480,6 +482,21 @@ def get_difference(theta1, theta2):
 def add_difference(theta0, theta1_2_diff, alpha):
     return theta0 + (alpha * theta1_2_diff)
 
+def multiply_difference(theta0, theta1, theta2, alpha, beta):
+    diff_a = torch.pow(torch.abs(theta0.float() - theta2), (1 - alpha))
+    diff_b = torch.pow(torch.abs(theta1.float() - theta2), alpha)
+    difference = torch.copysign(diff_a * diff_b, weighted_sum(theta0, theta1, beta) - theta2)
+    return theta2 + difference.to(theta2.dtype)
+
+def similarity_add_difference(a, b, c, alpha, beta):
+    threshold = torch.maximum(torch.abs(a), torch.abs(b))
+    similarity = ((a * b / threshold**2) + 1) / 2
+    similarity = torch.nan_to_num(similarity * beta, nan=beta)
+
+    ab_diff = a + alpha * (b - c)
+    ab_sum = (1 - alpha / 2) * a + (alpha / 2) * b
+    return (1 - similarity) * ab_diff + similarity * ab_sum
+
 def prune_model(model):
     sd = model
     if 'state_dict' in sd:
@@ -608,7 +625,7 @@ if mode in ["WS", "SIG", "GEO", "MAX","TS"]:
   else:
       model_1 = torch.load(model_1_path, map_location=device)
 		
-elif mode in ["sAD", "AD", "TRS", "ST", "TD"]:
+elif mode in ["sAD", "AD", "TRS", "ST", "TD","SIM","MD"]:
   interp_method = 0
   _, extension_0 = os.path.splitext(model_0_path)
   if extension_0.lower() == ".safetensors":
@@ -716,7 +733,7 @@ else:
   alpha = args.alpha
   alpha_info = f"{round(args.alpha,3)}"
 	
-if mode in ["TRS","ST","TS"]:
+if mode in ["TRS","ST","TS","SIM","MD"]:
   usebeta = True
   if type(args.beta) == list:
     weights_b = args.beta
@@ -745,7 +762,7 @@ if mode != "NoIn":
   model_1_name = args.m1_name if args.m1_name is not None else os.path.splitext(os.path.basename(model_1_path))[0]
   model_1_bname = os.path.splitext(os.path.basename(model_1_path))[0]
   model_1_sha256 = sha256_from_cache(model_1_path, f"checkpoint/{model_1_bname}")
-if mode in ["sAD", "AD", "TRS", "ST", "TD"]:
+if mode in ["sAD", "AD", "TRS", "ST", "TD","SIM","MD"]:
   model_2_name = args.m2_name if args.m2_name is not None else os.path.splitext(os.path.basename(model_2_path))[0]
   model_2_bname = os.path.splitext(os.path.basename(model_2_path))[0]
   model_2_sha256 = sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}")
@@ -753,7 +770,7 @@ if args.prune:
   model_0 = prune_model(model_0)
   if mode != "NoIn":
     model_1 = prune_model(model_1)
-  if mode in ["sAD", "AD", "TRS", "ST"]:
+  if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"]:
     model_2 = prune_model(model_2)
 if args.vae is not None:
   vae_name = os.path.splitext(os.path.basename(args.vae))[0]
@@ -779,7 +796,7 @@ merge_recipe = {
 "type": "merge-models-chattiori", # indicate this model was merged with chattiori's model mereger
 "primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_bname}"),
 "secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_bname}") if mode != "NoIn" else None,
-"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}") if mode in ["sAD", "AD", "TRS", "ST","TD"] else None,
+"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}") if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"] else None,
 "merge_method": real_mode[mode],
 "block_weights": (weights_a is not None or weights_b is not None),
 "alpha_info": alpha_info,
@@ -811,7 +828,7 @@ def add_model_metadata(filename, model_name):
 add_model_metadata(model_0_path, model_0_name)
 if mode != "NoIn":
   add_model_metadata(model_1_path, model_1_name)
-if mode in ["sAD", "AD", "TRS", "ST","TD"]:
+if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"]:
   add_model_metadata(model_2_path, model_2_name)
 
 metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
@@ -903,6 +920,8 @@ theta_funcs = {
     "WS":   (filename_weighted_sum, None, weighted_sum),
     "AD":   (filename_add_difference, get_difference, add_difference),
     "sAD":   (filename_add_difference, get_difference, add_difference),
+    "MD":   (filename_add_difference, None, multiply_difference),
+    "SIM":  (filename_add_difference, None, similarity_add_difference),
     "TD":   (filename_add_difference, None, add_difference),
     "TS":   (filename_weighted_sum, None, weighted_sum),
     "TRS":  (filename_triple_sum, None, triple_sum),
@@ -914,7 +933,7 @@ theta_funcs = {
 }
 filename_generator, theta_func1, theta_func2 = theta_funcs[mode] 
 
-if mode in ["sAD", "AD", "TRS", "ST", "TD"]:
+if mode in ["sAD", "AD", "TRS", "ST", "TD","SIM","MD"]:
   print(f"Loading {model_2_name}...")
   theta_2 = read_state_dict(model_2_path, map_location=device)
 
@@ -1288,7 +1307,7 @@ if args.delete_source:
     os.remove(model_0_path)
     if mode != "NoIn":
       os.remove(model_1_path)
-    if mode in ["sAD", "AD", "TRS", "ST"]:
+    if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"]:
       os.remove(model_2_path)
 del theta_0
 file_size = round(os.path.getsize(output_path) / 1073741824,2)
