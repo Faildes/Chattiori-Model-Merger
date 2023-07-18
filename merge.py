@@ -262,6 +262,7 @@ real_mode = {"WS": "Weighted Sum",
 	     "GEO": "Geometric Sum",
 	     "MAX": "Max Merge",
 	     "RM": "Read Metadata"}
+
 args = parser.parse_args()
 device = args.device
 mode = args.mode
@@ -523,6 +524,30 @@ def prune_model(model):
                   sd_pruned[k] = sd[k_in]
             else:
               sd_pruned[k] = sd[k_in]      
+    return sd_pruned
+
+def prune_model_after(theta):
+    sd_pruned = dict()
+    for key in tqdm(theta.keys(), desc="Pruning..."):
+        cp = "model.diffusion_model" in key
+        cp = cp or "depth_model" in key
+        cp = cp or "first_stage_model" in key
+        cp = cp or "cond_stage_model" in key
+        if cp:
+            k_in = key
+            if args.keep_ema:
+                k_ema = 'model_ema.' + key[6:].replace('.', '')
+                if k_ema in theta:
+                    k_in = k_ema
+            if type(theta[key]) == torch.Tensor:
+              if not args.save_half and theta[key].dtype in {torch.float16, torch.float64, torch.bfloat16}:
+                  sd_pruned[key] = theta[k_in].to(torch.float32)
+              elif args.save_half and theta[key].dtype in {torch.float32, torch.float64, torch.bfloat16}:
+                  sd_pruned[key] = theta[k_in].to(torch.float16)
+              else:
+                  sd_pruned[key] = theta[k_in]
+            else:
+              sd_pruned[key] = theta[k_in]      
     return sd_pruned
 
 output_name = args.output
@@ -1290,29 +1315,13 @@ if args.save_half and not theta_func2:
 loaded = None
 # check if output file already exists, ask to overwrite
 if args.prune:
-  print("Making Full-sized File...\n")
-  output_a = os.path.join(model_path, "test.safetensors")
-  if os.path.isfile(output_a):
-    os.remove(output_a)
-  safetensors.torch.save_file(theta_0, output_a,metadata=metadata)
-  sd = safetensors.torch.load_file(output_a, device=device)
-  model = prune_model(sd)
-  file_size_temp = round(os.path.getsize(output_a) / 1073741824,2)
-  print(f"Pruning {output_file}({file_size_temp}G)...")
-  if args.save_safetensors:
-    with torch.no_grad():
-        safetensors.torch.save_file(model, output_path, metadata=metadata)
-  else:
-      torch.save({"state_dict": model}, output_path)
-  del model
-  os.remove(output_a)
+  theta_0 = prune_model_after(theta_0)
+print(f"Saving as {output_file}...")
+if args.save_safetensors:
+  with torch.no_grad():
+      safetensors.torch.save_file(theta_0, output_path, metadata=metadata)
 else:
-  print(f"Saving as {output_file}...")
-  if args.save_safetensors:
-    with torch.no_grad():
-        safetensors.torch.save_file(theta_0, output_path, metadata=metadata)
-  else:
-      torch.save({"state_dict": theta_0}, output_path)
+    torch.save({"state_dict": theta_0}, output_path)
 if args.delete_source:
     os.remove(model_0_path)
     if mode != "NoIn":
