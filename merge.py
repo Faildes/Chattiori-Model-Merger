@@ -504,7 +504,7 @@ def prune_model(model, name):
     if 'state_dict' in sd:
         sd = sd['state_dict']
     sd_pruned = dict()
-    for key in tqdm(sd, desc=f"Pruning {name}..."):
+    for k in tqdm(sd, desc=f"Pruning {name}..."):
         cp = k.startswith('model.diffusion_model.') or k.startswith('depth_model.') or k.startswith('first_stage_model.') or k.startswith('cond_stage_model.')
         if cp:
             k_in = k
