@@ -499,16 +499,13 @@ def similarity_add_difference(a, b, c, alpha, beta):
     ab_sum = (1 - alpha / 2) * a + (alpha / 2) * b
     return (1 - similarity) * ab_diff + similarity * ab_sum
 
-def prune_model(model):
+def prune_model(model, name):
     sd = model
     if 'state_dict' in sd:
         sd = sd['state_dict']
     sd_pruned = dict()
-    for k in sd:
-        cp = k.startswith('model.diffusion_model.')
-        cp = cp or k.startswith('depth_model.')
-        cp = cp or k.startswith('first_stage_model.')
-        cp = cp or k.startswith('cond_stage_model.')
+    for key in tqdm(sd, desc=f"Pruning {name}..."):
+        cp = k.startswith('model.diffusion_model.') or k.startswith('depth_model.') or k.startswith('first_stage_model.') or k.startswith('cond_stage_model.')
         if cp:
             k_in = k
             if args.keep_ema:
@@ -529,10 +526,7 @@ def prune_model(model):
 def prune_model_after(theta):
     sd_pruned = dict()
     for key in tqdm(theta.keys(), desc="Pruning..."):
-        cp = "model.diffusion_model" in key
-        cp = cp or "depth_model" in key
-        cp = cp or "first_stage_model" in key
-        cp = cp or "cond_stage_model" in key
+        cp = key.startswith('model.diffusion_model.') or key.startswith('depth_model.') or key.startswith('first_stage_model.') or key.startswith('cond_stage_model.')
         if cp:
             k_in = key
             if args.keep_ema:
@@ -793,11 +787,11 @@ if mode in ["sAD", "AD", "TRS", "ST", "TD","SIM","MD"]:
   model_2_bname = os.path.splitext(os.path.basename(model_2_path))[0]
   model_2_sha256 = sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}")
 if args.prune:
-  model_0 = prune_model(model_0)
+  model_0 = prune_model(model_0, "model_0")
   if mode != "NoIn":
-    model_1 = prune_model(model_1)
+    model_1 = prune_model(model_1, "model_1")
   if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"]:
-    model_2 = prune_model(model_2)
+    model_2 = prune_model(model_2, "model_2")
 if args.vae is not None:
   vae_name = os.path.splitext(os.path.basename(args.vae))[0]
 
