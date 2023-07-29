@@ -21,6 +21,10 @@ import safetensors.torch
 import safetensors
 import random
 from tqdm import tqdm
+from math import ceil
+from multiprocessing import cpu_count
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 FINETUNEX = ["IN","OUT","OUT2","CONT","COL1","COL2","COL3"]
 NUM_INPUT_BLOCKS = 12
@@ -1052,238 +1056,301 @@ if cosine1: #favors modelB's structure with details from A
     sims = np.delete(sims, np.where(sims < np.percentile(sims, 1, method='midpoint')))
     sims = np.delete(sims, np.where(sims > np.percentile(sims, 99, method='midpoint')))
 
+def merge_0(mode, key_and_alpha_beta, theta_0, theta_1, theta_2, theta_func2, threads, tasks_per_thread, cosine0, cosine1, usebeta):  
+    lock_theta_0 = Lock()
+    lock_theta_1 = Lock()
+    lock_theta_2 = Lock()
+    lock_progress = Lock()
+
+    def thread_callback(keys):
+        nonlocal theta_0, theta_1, theta_2, mode, theta_func2, cosine0, cosine1, usebeta
+        
+        for key in keys:
+            a = theta_0[key]
+            b = theta_1[key]
+            if usebeta:
+                c = theta_2[key]
+            current_alpha = key_and_alpha_beta[key][0]
+            current_beta = key_and_alpha_beta[key][1]
+            # where normal model would have 4 channels, for latenst space, inpainting model would
+            # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
+            if cosine0:
+                # skip VAE model parameters to get better results
+                if "first_stage_model" in key: continue
+                if "model" in key and key in theta_0:
+                    # Normalize the vectors before merging
+                    theta_0_norm = nn.functional.normalize(a.to(torch.float32), p=2, dim=0)
+                    theta_1_norm = nn.functional.normalize(b.to(torch.float32), p=2, dim=0)
+                    simab = sim(theta_0_norm, theta_1_norm)
+                    dot_product = torch.dot(theta_0_norm.view(-1), theta_1_norm.view(-1))
+                    magnitude_similarity = dot_product / (torch.norm(theta_0_norm) * torch.norm(theta_1_norm))
+                    combined_similarity = (simab + magnitude_similarity) / 2.0
+                    k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
+                    k = k - abs(current_alpha)
+                    k = k.clip(min=0,max=1.0)
+                    with lock_theta_0:
+                        theta_0[key] = b * (1 - k) + a * k
+
+            elif cosine1:
+                # skip VAE model parameters to get better results
+                if "first_stage_model" in key: continue
+                if "model" in key and key in theta_0:
+                    simab = sim(a.to(torch.float32), b.to(torch.float32))
+                    dot_product = torch.dot(a.view(-1).to(torch.float32), b.view(-1).to(torch.float32))
+                    magnitude_similarity = dot_product / (torch.norm(a.to(torch.float32)) * torch.norm(b.to(torch.float32)))
+                    combined_similarity = (simab + magnitude_similarity) / 2.0
+                    k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
+                    k = k - current_alpha
+                    k = k.clip(min=0,max=1.0)
+                    with lock_theta_0:
+                        theta_0[key] = b * (1 - k) + a * k
+
+            elif mode == "sAD":
+                # Apply median filter to the weight differences
+                filtered_diff = scipy.ndimage.median_filter(b.to(torch.float32).cpu().numpy(), size=3)
+                # Apply Gaussian filter to the filtered differences
+                filtered_diff = scipy.ndimage.gaussian_filter(filtered_diff, sigma=1)
+                with lock_theta_1:
+                    theta_1[key] = torch.tensor(filtered_diff)
+                # Add the filtered differences to the original weights
+                with lock_theta_0:
+                    theta_0[key] = a + current_alpha * b
+
+            elif mode == "TD":
+                # Check if theta_1[key] is equal to theta_2[key]
+                if torch.allclose(theta_1[key].float(), theta_2[key].float(), rtol=0, atol=0):
+                    with lock_theta_2:
+                        theta_2[key] = theta_0[key]
+                        continue
+
+                diff_AB = theta_1[key].float() - theta_2[key].float()
+
+                distance_A0 = torch.abs(theta_1[key].float() - theta_2[key].float())
+                distance_A1 = torch.abs(theta_1[key].float() - theta_0[key].float())
+
+                sum_distances = distance_A0 + distance_A1
+
+                scale = torch.where(sum_distances != 0, distance_A1 / sum_distances, torch.tensor(0.).float())
+                sign_scale = torch.sign(theta_1[key].float() - theta_2[key].float())
+                scale = sign_scale * torch.abs(scale)
+
+                new_diff = scale * torch.abs(diff_AB)
+                with lock_theta_0:
+                    theta_0[key] = theta_0[key] + (new_diff * (current_alpha*1.8))
+            elif mode == "TS":
+                dim = theta_0[key].dim()
+                if dim == 0 : continue
+                if current_alpha+current_beta <= 1 :
+                    talphas = int(theta_0[key].shape[0]*(current_beta))
+                    talphae = int(theta_0[key].shape[0]*(current_alpha+current_beta))
+                    with lock_theta_0:
+                        if dim == 1:
+                            theta_0[key][talphas:talphae] = theta_1[key][talphas:talphae].clone()
+
+                        elif dim == 2:
+                            theta_0[key][talphas:talphae,:] = theta_1[key][talphas:talphae,:].clone()
+
+                        elif dim == 3:
+                            theta_0[key][talphas:talphae,:,:] = theta_1[key][talphas:talphae,:,:].clone()
+
+                        elif dim == 4:
+                            theta_0[key][talphas:talphae,:,:,:] = theta_1[key][talphas:talphae,:,:,:].clone()
+
+                else:
+                    talphas = int(theta_0[key].shape[0]*(current_alpha+current_beta-1))
+                    talphae = int(theta_0[key].shape[0]*(current_beta))
+                    theta_t = theta_1[key].clone()
+                    if dim == 1:
+                        theta_t[talphas:talphae] = theta_0[key][talphas:talphae].clone()
+
+                    elif dim == 2:
+                        theta_t[talphas:talphae,:] = theta_0[key][talphas:talphae,:].clone()
+
+                    elif dim == 3:
+                        theta_t[talphas:talphae,:,:] = theta_0[key][talphas:talphae,:,:].clone()
+
+                    elif dim == 4:
+                        theta_t[talphas:talphae,:,:,:] = theta_0[key][talphas:talphae,:,:,:].clone()
+                    with lock_theta_0:
+                        theta_0[key] = theta_t
+            else:
+                with lock_theta_0:
+                    if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
+                        if a.shape[1] == 4 and b.shape[1] == 9:
+                            raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
+                        if a.shape[1] == 4 and b.shape[1] == 8:
+                            raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
+
+                        if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
+                            if usebeta:
+                                theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
+                            else:
+                                theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
+                            result_is_instruct_pix2pix_model = True
+                        else:
+                            assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
+                            if usebeta:
+                                theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
+                            else:
+                                theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
+                            result_is_inpainting_model = True
+                    else:
+                        if usebeta:
+                            theta_0[key] = theta_func2(a, b, c, current_alpha, current_beta)
+                        else:
+                            theta_0[key] = theta_func2(a, b, current_alpha)
+
+            if any(item in key for item in FINETUNES) and fine:
+                index = FINETUNES.index(key)
+                print(key,fine[index])
+                if 5 > index :
+                    with lock_theta_0:
+                        theta_0[key] =theta_0[key]* fine[index] 
+                else :
+                    with lock_theta_0:
+                        theta_0[key] =theta_0[key] + torch.tensor(fine[5])
+            with lock_theta_0:
+                theta_0[key] = to_half(theta_0[key], args.save_half)
+                
+        with lock_progress:
+            progress.update(len(keys))
+
+        return True
+    
+    def extract_and_remove(input_list, count):
+        extracted = input_list[:count]
+        del input_list[:count]
+
+        return extracted
+
+    keys = list(key_and_alpha_beta.keys())
+
+    total_threads = ceil(len(keys) / int(tasks_per_thread))
+    print(f"max threads = {threads}, total threads = {total_threads}, tasks per thread = {tasks_per_thread}")
+
+    progress = tqdm(key_and_alpha_beta.keys(), desc="Merging...")
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = [executor.submit(thread_callback, extract_and_remove(keys, int(tasks_per_thread))) for i in range(total_threads)]
+
+        for future in as_completed(futures):
+            if not future.result():
+                executor.shutdown()
+                return theta_0, theta_1, True
+
+        del progress
+
+    return theta_0, theta_1, False
+
+key_and_alpha_beta = {}
 if mode != "NoIn":
-  for key in tqdm(theta_0.keys(), desc="Merging..."):
-    if args.vae is None and "first_stage_model" in key: continue
-    if theta_1 and "model" in key and key in theta_1:    
-      if (usebeta or mode == "TD") and not key in theta_2:
-         continue
-      weight_index = -1
-      current_alpha = alpha
-      current_beta = beta
-      if key in checkpoint_dict_skip_on_merge:
-        continue
-      a = theta_0[key]
-      b = theta_1[key]
-      if usebeta:
-        c = theta_2[key]
-      # check weighted and U-Net or not
-      if (weights_a is not None or weights_b is not None) and 'model.diffusion_model.' in key:
-        # check block index
-        weight_index = -1
-
-        if 'time_embed' in key:
-            weight_index = 0                # before input blocks
-        elif '.out.' in key:
-            weight_index = NUM_TOTAL_BLOCKS - 1     # after output blocks
-        else:
-          m = re_inp.search(key)
-          if m:
-            inp_idx = int(m.groups()[0])
-            weight_index = inp_idx
-          else:
-            m = re_mid.search(key)
-          if m:
-              weight_index = NUM_INPUT_BLOCKS
-          else:
-              m = re_out.search(key)
-              if m:
-                out_idx = int(m.groups()[0])
-                weight_index = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + out_idx
-
-        if weight_index >= NUM_TOTAL_BLOCKS:
-            print(f"ERROR: illegal block index: {key}")
-
-        if weight_index >= 0:
-            if weights_a is not None:
-              current_alpha = weights_a[weight_index]
+    for key in theta_0.keys():
+        if args.vae is None and "first_stage_model" in key: continue
+        if theta_1 and "model" in key and key in theta_1:    
+            if (usebeta or mode == "TD") and not key in theta_2:
+                continue
+            weight_index = -1
+            current_alpha = alpha
+            current_beta = beta
+            if key in checkpoint_dict_skip_on_merge:
+                continue
+            a = theta_0[key]
+            b = theta_1[key]
             if usebeta:
-              if weights_b is not None:
-                  current_beta = weights_b[weight_index]
-			
-      if len(deep_a) > 0:
-        skey = key + blockid[weight_index+1]
-        for d in deep_a:
-          if d.count(":") != 2 :continue
-          dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
-          dbs = blocker_S(dbs)
-          dbs,dws = dbs.split(" "), dws.split(" ")
-          dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
-          dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
-          flag = dbn
-          for db in dbs:
-            if db in skey:
-              flag = not dbn
-          if flag:flag = dwn
-          else:continue
-          for dw in dws:
-            if dw in skey:
-              flag = not dwn
-          if flag:
-            dr = float(dr)
-            current_alpha = dr
+                c = theta_2[key]
+            # check weighted and U-Net or not
+            if (weights_a is not None or weights_b is not None) and 'model.diffusion_model.' in key:
+                # check block index
+                weight_index = -1
 
-      if len(deep_b) > 0:
-        skey = key + blockid[weight_index+1]
-        for d in deep_b:
-          if d.count(":") != 2 :continue
-          dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
-          dbs,dws = dbs.split(" "), dws.split(" ")
-          dbs = blocker_S(dbs)
-          dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
-          dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
-          flag = dbn
-          for db in dbs:
-            if db in skey:
-              flag = not dbn
-          if flag:flag = dwn
-          else:continue
-          for dw in dws:
-            if dw in skey:
-              flag = not dwn
-          if flag:
-            dr = float(dr)
-            current_beta = dr
-			
-      # this enables merging an inpainting model (A) with another one (B);
-      # where normal model would have 4 channels, for latenst space, inpainting model would
-      # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
-      if cosine0:
-        # skip VAE model parameters to get better results
-        if "first_stage_model" in key: continue
-        if "model" in key and key in theta_0:
-            # Normalize the vectors before merging
-            theta_0_norm = nn.functional.normalize(a.to(torch.float32), p=2, dim=0)
-            theta_1_norm = nn.functional.normalize(b.to(torch.float32), p=2, dim=0)
-            simab = sim(theta_0_norm, theta_1_norm)
-            dot_product = torch.dot(theta_0_norm.view(-1), theta_1_norm.view(-1))
-            magnitude_similarity = dot_product / (torch.norm(theta_0_norm) * torch.norm(theta_1_norm))
-            combined_similarity = (simab + magnitude_similarity) / 2.0
-            k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
-            k = k - abs(current_alpha)
-            k = k.clip(min=0,max=1.0)
-            theta_0[key] = b * (1 - k) + a * k
-	
-      elif cosine1:
-        # skip VAE model parameters to get better results
-        if "first_stage_model" in key: continue
-        if "model" in key and key in theta_0:
-            simab = sim(a.to(torch.float32), b.to(torch.float32))
-            dot_product = torch.dot(a.view(-1).to(torch.float32), b.view(-1).to(torch.float32))
-            magnitude_similarity = dot_product / (torch.norm(a.to(torch.float32)) * torch.norm(b.to(torch.float32)))
-            combined_similarity = (simab + magnitude_similarity) / 2.0
-            k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
-            k = k - current_alpha
-            k = k.clip(min=0,max=1.0)
-            theta_0[key] = b * (1 - k) + a * k
-		
-      elif mode == "sAD":
-        # Apply median filter to the weight differences
-        filtered_diff = scipy.ndimage.median_filter(b.to(torch.float32).cpu().numpy(), size=3)
-        # Apply Gaussian filter to the filtered differences
-        filtered_diff = scipy.ndimage.gaussian_filter(filtered_diff, sigma=1)
-        b = torch.tensor(filtered_diff)
-        # Add the filtered differences to the original weights
-        theta_0[key] = a + current_alpha * b
-        
-      elif mode == "TD":
-        # Check if theta_1[key] is equal to theta_2[key]
-        if torch.allclose(theta_1[key].float(), theta_2[key].float(), rtol=0, atol=0):
-            theta_2[key] = theta_0[key]
-            continue
+                if 'time_embed' in key:
+                    weight_index = 0                # before input blocks
+                elif '.out.' in key:
+                    weight_index = NUM_TOTAL_BLOCKS - 1     # after output blocks
+                else:
+                    m = re_inp.search(key)
+                    if m:
+                        inp_idx = int(m.groups()[0])
+                        weight_index = inp_idx
+                    else:
+                        m = re_mid.search(key)
+                    if m:
+                        weight_index = NUM_INPUT_BLOCKS
+                    else:
+                        m = re_out.search(key)
+                        if m:
+                            out_idx = int(m.groups()[0])
+                            weight_index = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + out_idx
 
-        diff_AB = theta_1[key].float() - theta_2[key].float()
+                if weight_index >= NUM_TOTAL_BLOCKS:
+                    print(f"ERROR: illegal block index: {key}")
 
-        distance_A0 = torch.abs(theta_1[key].float() - theta_2[key].float())
-        distance_A1 = torch.abs(theta_1[key].float() - theta_0[key].float())
+                if weight_index >= 0:
+                    if weights_a is not None:
+                        current_alpha = weights_a[weight_index]
+                    if usebeta:
+                        if weights_b is not None:
+                            current_beta = weights_b[weight_index]
 
-        sum_distances = distance_A0 + distance_A1
+            if len(deep_a) > 0:
+                skey = key + blockid[weight_index+1]
+                for d in deep_a:
+                    if d.count(":") != 2 :continue
+                    dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+                    dbs = blocker_S(dbs)
+                    dbs,dws = dbs.split(" "), dws.split(" ")
+                    dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
+                    dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
+                    flag = dbn
+                    for db in dbs:
+                        if db in skey:
+                            flag = not dbn
+                    if flag:flag = dwn
+                    else:continue
+                    for dw in dws:
+                        if dw in skey:
+                            flag = not dwn
+                    if flag:
+                        dr = float(dr)
+                        current_alpha = dr
 
-        scale = torch.where(sum_distances != 0, distance_A1 / sum_distances, torch.tensor(0.).float())
-        sign_scale = torch.sign(theta_1[key].float() - theta_2[key].float())
-        scale = sign_scale * torch.abs(scale)
-
-        new_diff = scale * torch.abs(diff_AB)
-        theta_0[key] = theta_0[key] + (new_diff * (current_alpha*1.8))
-      elif mode == "TS":
-            dim = theta_0[key].dim()
-            if dim == 0 : continue
-            if current_alpha+current_beta <= 1 :
-                talphas = int(theta_0[key].shape[0]*(current_beta))
-                talphae = int(theta_0[key].shape[0]*(current_alpha+current_beta))
-                if dim == 1:
-                    theta_0[key][talphas:talphae] = theta_1[key][talphas:talphae].clone()
-
-                elif dim == 2:
-                    theta_0[key][talphas:talphae,:] = theta_1[key][talphas:talphae,:].clone()
-
-                elif dim == 3:
-                    theta_0[key][talphas:talphae,:,:] = theta_1[key][talphas:talphae,:,:].clone()
-
-                elif dim == 4:
-                    theta_0[key][talphas:talphae,:,:,:] = theta_1[key][talphas:talphae,:,:,:].clone()
-
-            else:
-                talphas = int(theta_0[key].shape[0]*(current_alpha+current_beta-1))
-                talphae = int(theta_0[key].shape[0]*(current_beta))
-                theta_t = theta_1[key].clone()
-                if dim == 1:
-                    theta_t[talphas:talphae] = theta_0[key][talphas:talphae].clone()
-
-                elif dim == 2:
-                    theta_t[talphas:talphae,:] = theta_0[key][talphas:talphae,:].clone()
-
-                elif dim == 3:
-                    theta_t[talphas:talphae,:,:] = theta_0[key][talphas:talphae,:,:].clone()
-
-                elif dim == 4:
-                    theta_t[talphas:talphae,:,:,:] = theta_0[key][talphas:talphae,:,:,:].clone()
-                theta_0[key] = theta_t
-      else:
-        if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
-          if a.shape[1] == 4 and b.shape[1] == 9:
-            raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
-          if a.shape[1] == 4 and b.shape[1] == 8:
-            raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
-
-          if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
-            if usebeta:
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
-            else:
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
-            result_is_instruct_pix2pix_model = True
-          else:
-            assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
-            if usebeta:
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
-            else:
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
-            result_is_inpainting_model = True
-        else:
-          if usebeta:
-            theta_0[key] = theta_func2(a, b, c, current_alpha, current_beta)
-          else:
-            theta_0[key] = theta_func2(a, b, current_alpha)
-
-      if any(item in key for item in FINETUNES) and fine:
-        index = FINETUNES.index(key)
-        print(key,fine[index])
-        if 5 > index : 
-            theta_0[key] =theta_0[key]* fine[index] 
-        else :theta_0[key] =theta_0[key] + torch.tensor(fine[5])
-        
-      theta_0[key] = to_half(theta_0[key], args.save_half)
-  for key in tqdm(theta_1.keys(), desc="Remerging..."):
+            if len(deep_b) > 0:
+                skey = key + blockid[weight_index+1]
+                for d in deep_b:
+                    if d.count(":") != 2 :continue
+                    dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+                    dbs,dws = dbs.split(" "), dws.split(" ")
+                    dbs = blocker_S(dbs)
+                    dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
+                    dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
+                    flag = dbn
+                    for db in dbs:
+                        if db in skey:
+                            flag = not dbn
+                    if flag:flag = dwn
+                    else:continue
+                    for dw in dws:
+                        if dw in skey:
+                            flag = not dwn
+                    if flag:
+                        dr = float(dr)
+                        current_beta = dr
+            key_and_alpha_beta[key] = [current_alpha, current_beta]
+    threads = cpu_count()
+    tasks_per_thread = 8
+    theta_0, theta_1, stopped = merge_0(mode, key_and_alpha_beta, theta_0, theta_1, theta_2, theta_func2, threads, tasks_per_thread, cosine0, cosine1, usebeta)
+    for key in tqdm(theta_1.keys(), desc="Remerging..."):
         if key in checkpoint_dict_skip_on_merge:
             continue
         if "model" in key and key not in theta_0:
             theta_0.update({key:theta_1[key]})
-  del theta_1
-  try:
-    if theta_2:
-        del theta_2
-  except NameError:
-    pass
+    del theta_1
+    try:
+        if theta_2:
+            del theta_2
+    except NameError:
+        pass
 
 if args.discard_vae:
   theta_X ={}
