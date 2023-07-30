@@ -985,11 +985,12 @@ else:
 
 if args.use_dif_21:
     theta_3 = copy.deepcopy(theta_1)
+    func1 = get_difference
     for key in tqdm(theta_2.keys(), desc="Getting Difference of Model 1 and 2"):
         if 'model' in key:
           if key in theta_3:
               t2 = theta_3.get(key, torch.zeros_like(theta_2[key]))
-              theta_2[key] = theta_func1(theta_2[key], t2)
+              theta_2[key] = func1(theta_2[key], t2)
           else:
               theta_2[key] = torch.zeros_like(theta_2[key])
     del theta_3
@@ -1000,22 +1001,24 @@ re_out = re.compile(r'\.output_blocks\.(\d+)\.') # 12
 
 if args.use_dif_10:
     theta_3 = copy.deepcopy(theta_0)
+    func1 = get_difference
     for key in tqdm(theta_1.keys(), desc="Getting Difference of Model 0 and 1"):
         if 'model' in key:
           if key in theta_3:
               t2 = theta_3.get(key, torch.zeros_like(theta_1[key]))
-              theta_1[key] = theta_func1(theta_1[key], t2)
+              theta_1[key] = func1(theta_1[key], t2)
           else:
               theta_1[key] = torch.zeros_like(theta_1[key])
     del theta_3
 
 if args.use_dif_20:
     theta_3 = copy.deepcopy(theta_0)
+    func1 = get_difference
     for key in tqdm(theta_2.keys(), desc="Getting Difference of Model 0 and 2"):
         if 'model' in key:
           if key in theta_3:
               t2 = theta_3.get(key, torch.zeros_like(theta_2[key]))
-              theta_2[key] = theta_func1(theta_2[key], t2)
+              theta_2[key] = func1(theta_2[key], t2)
           else:
               theta_2[key] = torch.zeros_like(theta_2[key])
     del theta_3
