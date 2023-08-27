@@ -1059,7 +1059,7 @@ if mode != "NoIn":
   for key in tqdm(theta_0.keys(), desc="Merging..."):
     if args.vae is None and "first_stage_model" in key: continue
     if theta_1 and "model" in key and key in theta_1:    
-      if (usebeta or mode == "TD") and not key in theta_2:
+      if usebeta or mode == "TD":
          continue
       weight_index = -1
       current_alpha = alpha
@@ -1280,10 +1280,76 @@ if mode != "NoIn":
         if key in checkpoint_dict_skip_on_merge:
             continue
         if "model" in key and key not in theta_0:
-            theta_0.update({key:theta_1[key]})
+            try:
+                if mode in ["TRS","ST"] and theta_2:
+                    b = theta_1[key]
+                    c = theta_2[key]
+                    if key in theta_2:
+                        current_beta = beta
+                        if (weights_a is not None or weights_b is not None) and 'model.diffusion_model.' in key:
+                            # check block index
+                            weight_index = -1
+
+                            if 'time_embed' in key:
+                                weight_index = 0                # before input blocks
+                            elif '.out.' in key:
+                                weight_index = NUM_TOTAL_BLOCKS - 1     # after output blocks
+                            else:
+                              m = re_inp.search(key)
+                              if m:
+                                inp_idx = int(m.groups()[0])
+                                weight_index = inp_idx
+                              else:
+                                m = re_mid.search(key)
+                              if m:
+                                  weight_index = NUM_INPUT_BLOCKS
+                              else:
+                                  m = re_out.search(key)
+                                  if m:
+                                    out_idx = int(m.groups()[0])
+                                    weight_index = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + out_idx
+
+                            if weight_index >= NUM_TOTAL_BLOCKS:
+                                print(f"ERROR: illegal block index: {key}")
+
+                            if weight_index >= 0:
+                              if weights_b is not None:
+                                  current_beta = weights_b[weight_index]
+
+                          if len(deep_b) > 0:
+                            skey = key + blockid[weight_index+1]
+                            for d in deep_b:
+                              if d.count(":") != 2 :continue
+                              dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+                              dbs,dws = dbs.split(" "), dws.split(" ")
+                              dbs = blocker_S(dbs)
+                              dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
+                              dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
+                              flag = dbn
+                              for db in dbs:
+                                if db in skey:
+                                  flag = not dbn
+                              if flag:flag = dwn
+                              else:continue
+                              for dw in dws:
+                                if dw in skey:
+                                  flag = not dwn
+                              if flag:
+                                dr = float(dr)
+                                current_beta = dr
+                        theta_0[key] = weighted_sum(b, c, current_beta)
+                else:
+                    theta_0.update({key:theta_1[key]})
+            except NameError:
+                theta_0.update({key:theta_1[key]})
   del theta_1
   try:
     if theta_2:
+        for key in tqdm(theta_2.keys(), desc="Remerging..."):
+            if key in checkpoint_dict_skip_on_merge:
+                continue
+            if "model" in key and key not in theta_0:
+                theta_0.update({key:theta_2[key]})
         del theta_2
   except NameError:
     pass
