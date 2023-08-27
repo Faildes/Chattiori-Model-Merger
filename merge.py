@@ -1059,7 +1059,7 @@ if mode != "NoIn":
   for key in tqdm(theta_0.keys(), desc="Merging..."):
     if args.vae is None and "first_stage_model" in key: continue
     if theta_1 and "model" in key and key in theta_1:    
-      if usebeta or mode == "TD":
+      if (usebeta or mode == "TD") and not key in theta_2:
          continue
       weight_index = -1
       current_alpha = alpha
@@ -1316,30 +1316,30 @@ if mode != "NoIn":
                               if weights_b is not None:
                                   current_beta = weights_b[weight_index]
 
-                          if len(deep_b) > 0:
-                            skey = key + blockid[weight_index+1]
-                            for d in deep_b:
-                              if d.count(":") != 2 :continue
-                              dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
-                              dbs,dws = dbs.split(" "), dws.split(" ")
-                              dbs = blocker_S(dbs)
-                              dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
-                              dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
-                              flag = dbn
-                              for db in dbs:
-                                if db in skey:
-                                  flag = not dbn
-                              if flag:flag = dwn
-                              else:continue
-                              for dw in dws:
-                                if dw in skey:
-                                  flag = not dwn
-                              if flag:
-                                dr = float(dr)
-                                current_beta = dr
+                            if len(deep_b) > 0:
+                              skey = key + blockid[weight_index+1]
+                              for d in deep_b:
+                                if d.count(":") != 2 :continue
+                                dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+                                dbs,dws = dbs.split(" "), dws.split(" ")
+                                dbs = blocker_S(dbs)
+                                dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
+                                dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
+                                flag = dbn
+                                for db in dbs:
+                                  if db in skey:
+                                    flag = not dbn
+                                if flag:flag = dwn
+                                else:continue
+                                for dw in dws:
+                                  if dw in skey:
+                                    flag = not dwn
+                                if flag:
+                                  dr = float(dr)
+                                  current_beta = dr
                         theta_0[key] = weighted_sum(b, c, current_beta)
-                else:
-                    theta_0.update({key:theta_1[key]})
+                    else:
+                        theta_0.update({key:theta_1[key]})
             except NameError:
                 theta_0.update({key:theta_1[key]})
   del theta_1
