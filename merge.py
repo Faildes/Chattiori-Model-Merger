@@ -1284,7 +1284,7 @@ if mode != "NoIn":
                 if mode in ["TRS","ST"] and theta_2:
                     b = theta_1[key]
                     if key in theta_2:
-			c = theta_2[key]
+                        c = theta_2[key]
                         current_beta = beta
                         if (weights_a is not None or weights_b is not None) and 'model.diffusion_model.' in key:
                             # check block index
