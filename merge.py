@@ -823,7 +823,7 @@ merge_recipe = {
 "calculation": calcl,
 "save_as_half": args.save_half,
 "output_name": output_name,
-"bake_in_vae": vae_name if args.vae is not None and not args.discard_vae else False,
+"bake_in_vae": vae_name if args.vae is not None else False,
 "pruned": args.prune
 }
 metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
