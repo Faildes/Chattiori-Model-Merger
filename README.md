@@ -55,7 +55,8 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
     If SEED is not setted, it will be completely random (generates seed).  
     Or `"MIN, MAX, SEED, [Elemental merge args]"` if you want to specify.  
     Check out [Elemental Random](https://github.com/Faildes/merge-models/blob/main/elemental_random.md) for Elemental merge args.
-    - Optional: `--vae` sets the vae file by set the path, if omitted
+    - Optional: `--vae` sets the vae file by set the path, if omitted.  
+      If not, the vae stored inside the model will automatically discarded.
     - Optional: `--m0_name` determines the name that to write in the data for the model0, if omitted
     - Optional: `--m1_name` determines the name that to write in the data for the model1, if omitted
     - Optional: `--m2_name` determines the name that to write in the data for the model2, if omitted
