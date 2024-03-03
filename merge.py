@@ -649,6 +649,7 @@ beta_seed = None
 usebeta = False
 alpha_info = ""
 beta_info = ""
+weights_a = None
 weights_b = None
 beta = None
 if args.rand_alpha is not None:
@@ -1170,7 +1171,7 @@ if isxl:
 
 theta_0 = to_half_k(theta_0, args.save_half)
 if args.prune:
-    theta_0 = prune_model(theta_0, isxl)
+    theta_0 = prune_model(theta_0, "Model", isxl)
 
 # for safetensors contiguous error
 print("Check contiguous...")
