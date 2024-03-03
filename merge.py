@@ -65,39 +65,21 @@ weights_presets_list = tagdict(weights_presets)
 deep_a = []
 deep_b = []
 useblocks = False
-def wgta(string):
-    global deep_a
+def wgt(string, dp):
     if type(string) == int or type(string) == float:
-        return float(string)
+        return float(string), dp
     elif type(string) == list:
         useblocks = True
-        string, deep_a = deepblock(string)
+        string, dp = deepblock(string)
         while type(string) == list and len(string) == 1:
           string = string[0]
-        return string
+        return string, dp
     elif type(string) == str:
         useblocks = True
-        string, deep_a = deepblock([string])
+        string, dp = deepblock([string])
         while type(string) == list and len(string) == 1:
           string = string[0]
-        return string
-
-def wgtb(string):
-    global deep_b
-    if type(string) == int or type(string) == float:
-        return float(string)
-    elif type(string) == list:
-        useblocks = True
-        string, deep_b = deepblock(string)
-        while type(string) == list and len(string) == 1:
-          string = string[0]
-        return string
-    elif type(string) == str:
-        useblocks = True
-        string, deep_b = deepblock([string])
-        while type(string) == list and len(string) == 1:
-          string = string[0]
-        return string
+        return string, dp
 
 def deepblock(string):
     res1 = []
@@ -121,6 +103,45 @@ def deepblock(string):
                     res1.extend(cor1)
                     res2.extend(cor2)
     return res1, res2
+
+def rinfo(string, seed):
+    tram = string.split("[")
+    string = tram[0]
+    try:
+      fe = tram[1].replace("]","")
+    except:
+      fe = None
+    parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if (a != "" and a != " ")]
+    if type(parsed) is list:
+        try:
+            rmin = float(parsed[0])
+        except ValueError: rmin = 0.0
+        try:
+            try:
+                rmax = float(parsed[1])
+            except ValueError: rmax = 1.0
+        except IndexError: rmax = 1.0
+        try:
+            try:
+                get = int(parsed[2])
+            except ValueError: get = seed
+        except IndexError: get = seed
+    else:
+        rmin = 0.0
+        rmax = 1.0
+        get = seed
+    return f"({rmin},{rmax},{get},[{fe}])"
+
+def roundeep(term):
+    deep = term
+    if len(deep) > 0:
+        for d in deep:
+            dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+            dr = round(float(dr),3)
+            d = f"{dbs}:{dws}:{dr}"
+    else:
+        return None
+    return deep
 
 def rand_ratio(string):
     if type(string) is not str:
@@ -196,7 +217,9 @@ def rand_ratio(string):
                     dr0 = float(dr)
                     for db in dbs:
                         deep_res.append(f"{db}:{dws}:{dr0}")
-    return ratios, seed, deep_res
+    info = rinfo(string, seed)
+    base_ratio, deep_res = wgt(ratios, deep_res)
+    return ratios, seed, deep_res, info, base_ratio
 
 def fineman(fine):
     fine = [
@@ -208,6 +231,22 @@ def fineman(fine):
         [x*0.02 for x in fine[3:]]
                 ]
     return fine
+
+def parse_ratio(ratios, info, dp):
+    if type(ratios) == list:
+        weights = ratios
+        ratio = weights.pop(0)
+        rounded = [round(a, 3) for a in weights]
+        round_deep = roundeep(dp)
+        if info != "":
+            info = f"preset:[{info}],{round(ratio, 3)},[{rounded},[{round_deep}]]"
+        else:
+            info = f"{round(ratio,3)},[{rounded},[{round_deep}]]"
+    else:
+      weights = None
+      ratio = ratios
+      info = f"{round(ratios,3)}"
+    return weights, ratio, info
 
 FINETUNES = [
 "model.diffusion_model.input_blocks.0.0.weight",
@@ -231,9 +270,9 @@ parser.add_argument("--vae", type=str, help="Path to vae", default=None, require
 parser.add_argument("--use_dif_10", action="store_true", help="Use the difference of model 1 and model 0 as model 1", required=False)
 parser.add_argument("--use_dif_20", action="store_true", help="Use the difference of model 2 and model 0 as model 2", required=False)
 parser.add_argument("--use_dif_21", action="store_true", help="Use the difference of model 2 and model 1 as model 2", required=False)
-parser.add_argument("--alpha", type=wgta, help="Alpha value, optional, defaults to 0", default=0.0, required=False)
+parser.add_argument("--alpha", help="Alpha value, optional, defaults to 0", default=0.0, required=False)
 parser.add_argument("--rand_alpha", type=str, help="Random Alpha value, optional", default=None, required=False)
-parser.add_argument("--beta", type=wgtb, help="Beta value, optional, defaults to 0", default=0.0, required=False)
+parser.add_argument("--beta", help="Beta value, optional, defaults to 0", default=0.0, required=False)
 parser.add_argument("--rand_beta", type=str, help="Random Beta value, optional", default=None, required=False)
 parser.add_argument("--cosine0", action="store_true", help="Favors model 0's structure with details from 1", required=False)
 parser.add_argument("--cosine1", action="store_true", help="Favors model 1's structure with details from 0", required=False)
@@ -265,7 +304,8 @@ real_mode = {"WS": "Weighted Sum",
 args = parser.parse_args()
 device = args.device
 mode = args.mode
-
+args.alpha, deep_a = wgt(args.alpha, deep_a)
+args.beta, deep_b = wgt(args.beta, deep_b)
 if args.fine is not None:
     fine = [float(t) for t in args.fine.split(",")]
     fine = fineman(fine)
@@ -287,21 +327,6 @@ def to_half(tensor, enable):
 
     return tensor
 
-def load_weights(path, device):
-  if path.endswith(".safetensors"):
-      weights = safetensors.torch.load_file(path, device)
-  else:
-      weights = torch.load(path, device)
-  weights = weights["state_dict"] if "state_dict" in weights else weights
-  
-  return weights
-
-def save_weights(weights, path):
-  if path.endswith(".safetensors"):
-      safetensors.torch.save_file(weights, path)
-  else:
-      torch.save({"state_dict": weights}, path) 
-
 def cache(subsection):
     global cache_data
 
@@ -322,7 +347,21 @@ def dump_cache():
     with filelock.FileLock(f"{cache_filename}.lock"):
         with open(cache_filename, "w", encoding="utf8") as file:
             json.dump(cache_data, file, indent=4)
-	
+
+def model_hash(filename):
+    """old hash that only looks at a small part of the file and is prone to collisions"""
+
+    try:
+        with open(filename, "rb") as file:
+            import hashlib
+            m = hashlib.sha256()
+
+            file.seek(0x100000)
+            m.update(file.read(0x10000))
+            return m.hexdigest()[0:8]
+    except FileNotFoundError:
+        return 'NOFILE'
+    
 def sha256(filename, title):
     hashes = cache("hashes")
 
@@ -332,16 +371,19 @@ def sha256(filename, title):
 
     print(f"Calculating sha256 for {filename}: ", end='')
     sha256_value = calculate_sha256(filename)
+    hash_value = model_hash(filename)
     print(f"{sha256_value}")
 
     hashes[title] = {
         "mtime": os.path.getmtime(filename),
         "sha256": sha256_value,
+        "model_hash": hash_value,
     }
 
     dump_cache()
 
     return sha256_value
+
 
 def calculate_shorthash(filename):
     sha256 = sha256(filename, f"checkpoint/{os.path.splitext(os.path.basename(filename))[0]}")
@@ -369,31 +411,18 @@ def sha256_from_cache(filename, title, par = 0):
 
     if title not in hashes:
       if par == 0:
-        sh = sha256(filename, title)
+        sha256(filename, title)
       else:
         return None
 
     cached_sha256 = hashes[title].get("sha256", None)
+    cached_hash = hashes[title].get("model_hash",None)
     cached_mtime = hashes[title].get("mtime", 0)
 
     if ondisk_mtime > cached_mtime or cached_sha256 is None:
         return None
 
-    return cached_sha256
-
-def model_hash(filename):
-    """old hash that only looks at a small part of the file and is prone to collisions"""
-
-    try:
-        with open(filename, "rb") as file:
-            import hashlib
-            m = hashlib.sha256()
-
-            file.seek(0x100000)
-            m.update(file.read(0x10000))
-            return m.hexdigest()[0:8]
-    except FileNotFoundError:
-        return 'NOFILE'
+    return cached_sha256, cached_hash
 
 def read_metadata_from_safetensors(filename):
     import json
@@ -543,6 +572,58 @@ def prune_model_after(theta):
               sd_pruned[key] = theta[k_in]      
     return sd_pruned
 
+checkpoint_dict_replacements = {
+    'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
+    'cond_stage_model.transformer.encoder.': 'cond_stage_model.transformer.text_model.encoder.',
+    'cond_stage_model.transformer.final_layer_norm.': 'cond_stage_model.transformer.text_model.final_layer_norm.',
+}
+
+checkpoint_dict_skip_on_merge = ["cond_stage_model.transformer.text_model.embeddings.position_ids"]
+
+def transform_checkpoint_dict_key(k):
+  for text, replacement in checkpoint_dict_replacements.items():
+      if k.startswith(text):
+          k = replacement + k[len(text):]
+
+  return k
+
+vae_ignore_keys = {"model_ema.decay", "model_ema.num_updates"}
+
+def get_state_dict_from_checkpoint(pl_sd):
+  pl_sd = pl_sd.pop("state_dict", pl_sd)
+  pl_sd.pop("state_dict", None)
+
+  sd = {}
+  for k, v in pl_sd.items():
+      new_key = transform_checkpoint_dict_key(k)
+
+      if new_key is not None:
+          sd[new_key] = v
+
+  pl_sd.clear()
+  pl_sd.update(sd)
+
+  return pl_sd
+
+def load_model(path, device, sha256=True, prune=False):
+    if path.endswith(".safetensors"):
+        weights = safetensors.torch.load_file(path, device)
+        metadata = read_metadata_from_safetensors(path)
+    else:
+        weights = torch.load(path, device)
+        metadata = {}
+    if prune:
+        weights = prune_model(weights, bname)
+    bname = os.path.splitext(os.path.basename(path))[0]
+    if sha256:
+        s256, hashed = sha256_from_cache(path, f"checkpoint/{bname}")
+    else:
+        s256 = None
+        hashed = None
+        metadata = None
+    weights = get_state_dict_from_checkpoint(weights)
+    return weights, s256, hashed, metadata
+
 output_name = args.output
 if args.functn:
     if args.prune:
@@ -572,227 +653,62 @@ if os.path.isfile(output_path):
       output_path = os.path.join(model_path, output_file)
       fan += 1
     print(f"Setted the file name to {output_file}\n")
-	
-checkpoint_dict_replacements = {
-    'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
-    'cond_stage_model.transformer.encoder.': 'cond_stage_model.transformer.text_model.encoder.',
-    'cond_stage_model.transformer.final_layer_norm.': 'cond_stage_model.transformer.text_model.final_layer_norm.',
-}
-
-checkpoint_dict_skip_on_merge = ["cond_stage_model.transformer.text_model.embeddings.position_ids"]
-
-def transform_checkpoint_dict_key(k):
-  for text, replacement in checkpoint_dict_replacements.items():
-      if k.startswith(text):
-          k = replacement + k[len(text):]
-
-  return k
-
-def get_state_dict_from_checkpoint(pl_sd):
-  pl_sd = pl_sd.pop("state_dict", pl_sd)
-  pl_sd.pop("state_dict", None)
-
-  sd = {}
-  for k, v in pl_sd.items():
-      new_key = transform_checkpoint_dict_key(k)
-
-      if new_key is not None:
-          sd[new_key] = v
-
-  pl_sd.clear()
-  pl_sd.update(sd)
-
-  return pl_sd
-
-def read_state_dict(checkpoint_file, print_global_state=False, map_location=None):
-  _, extension = os.path.splitext(checkpoint_file)
-  if extension.lower() == ".safetensors":
-      device = map_location
-      pl_sd = safetensors.torch.load_file(checkpoint_file, device=device)
-  else:
-      pl_sd = torch.load(checkpoint_file, map_location=map_location)
-
-  if print_global_state and "global_step" in pl_sd:
-      print(f"Global Step: {pl_sd['global_step']}")
-
-  sd = get_state_dict_from_checkpoint(pl_sd)
-  return sd
-
-vae_ignore_keys = {"model_ema.decay", "model_ema.num_updates"}
 
 def load_vae_dict(filename, map_location):
     vae_ckpt = read_state_dict(filename, map_location=map_location)
     vae_dict_1 = {k: v for k, v in vae_ckpt.items() if k[0:4] != "loss" and k not in vae_ignore_keys}
     return vae_dict_1
 
-model_0_path = os.path.join(args.model_path, args.model_0)
-if args.model_1 is not None:
-    model_1_path = os.path.join(args.model_path, args.model_1)
-if args.model_2 is not None:
-  model_2_path = os.path.join(args.model_path, args.model_2)
-
-if mode in ["WS", "SIG", "GEO", "MAX","TS"]:
-  interp_method = 0
-  _, extension_0 = os.path.splitext(model_0_path)
-  if extension_0.lower() == ".safetensors":
-      model_0 = safetensors.torch.load_file(model_0_path, device=device)
-  else:
-      model_0 = torch.load(model_0_path, map_location=device)
-  _, extension_1 = os.path.splitext(model_1_path)
-  if extension_1.lower() == ".safetensors":
-      model_1 = safetensors.torch.load_file(model_1_path, device=device)
-  else:
-      model_1 = torch.load(model_1_path, map_location=device)
-		
-elif mode in ["sAD", "AD", "TRS", "ST", "TD","SIM","MD"]:
-  interp_method = 0
-  _, extension_0 = os.path.splitext(model_0_path)
-  if extension_0.lower() == ".safetensors":
-      model_0 = safetensors.torch.load_file(model_0_path, device=device)
-  else:
-      model_0 = torch.load(model_0_path, map_location=device)
-  _, extension_1 = os.path.splitext(model_1_path)
-  if extension_1.lower() == ".safetensors":
-      model_1 = safetensors.torch.load_file(model_1_path, device=device)
-  else:
-      model_1 = torch.load(model_1_path, map_location=device)
-  _, extension_2 = os.path.splitext(model_2_path)
-  if extension_2.lower() == ".safetensors":
-      model_2 = safetensors.torch.load_file(model_2_path, device=device)
-  else:
-      model_2 = torch.load(model_2_path, map_location=device)
-
-elif mode == "NoIn":
-  interp_method = 2
-  _, extension_0 = os.path.splitext(model_0_path)
-  if extension_0.lower() == ".safetensors":
-      model_0 = safetensors.torch.load_file(model_0_path, device=device)
-  else:
-      model_0 = torch.load(model_0_path, map_location=device)
-		
-elif mode == "RM":
-  print(sha256(model_0_path, f"checkpoint/{os.path.splitext(os.path.basename(model_0_path))[0]}"))
-  meta = read_metadata_from_safetensors(model_0_path)
-  print(json.dumps(meta, indent=2))
-  with open("./" + output_name + ".json", mode="a+") as dmp:
-    json.dump(meta, dmp, indent=4)
-  exit()
-	
-if args.vae is not None:
-    _, extension_vae = os.path.splitext(args.vae)
-    vae_name = os.path.splitext(os.path.basename(args.vae))[0]
-    if extension_vae.lower() == ".safetensors":
-      vae = safetensors.torch.load_file(args.vae, device=device)
-    else:
-      vae = torch.load(args.vae, map_location=device)
-
-def rinfo(string, seed):
-    tram = string.split("[")
-    string = tram[0]
-    try:
-      fe = tram[1].replace("]","")
-    except:
-      fe = None
-    parsed = [a for a in string.replace("\n",",").replace(","," ").split(" ") if (a != "" and a != " ")]
-    if type(parsed) is list:
-        try:
-            rmin = float(parsed[0])
-        except ValueError: rmin = 0.0
-        try:
-            try:
-                rmax = float(parsed[1])
-            except ValueError: rmax = 1.0
-        except IndexError: rmax = 1.0
-        try:
-            try:
-                get = int(parsed[2])
-            except ValueError: get = seed
-        except IndexError: get = seed
-    else:
-        rmin = 0.0
-        rmax = 1.0
-        get = seed
-    return f"({rmin},{rmax},{get},[{fe}])"
-
-def roundeep(term):
-    deep = term
-    if len(deep) > 0:
-        for d in deep:
-            dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
-            dr = round(float(dr),3)
-            d = f"{dbs}:{dws}:{dr}"
-    else:
-        return None
-    return deep
-            
 alpha_seed = None
 beta_seed = None
+use_beta = False
+alpha_info = ""
+beta_info = ""
+weights_b = None
+beta = None
 if args.rand_alpha is not None:
-    alphas, alpha_seed, deep_a = rand_ratio(args.rand_alpha)
-    alpha_info = rinfo(args.rand_alpha, alpha_seed)
-    args.alpha = wgta(alphas)
+    alphas, alpha_seed, deep_a, alpha_info, args.alpha = rand_ratio(args.rand_alpha)
 if args.rand_beta is not None:
-    betas, beta_seed, deep_b = rand_ratio(args.rand_beta)
-    beta_info = rinfo(args.rand_beta, beta_seed)
-    args.beta = wgtb(betas)
-	
-usebeta = False	
-if type(args.alpha) == list:
-    weights_a = args.alpha
-    alpha = weights_a.pop(0)
-    round_a = [round(a, 3) for a in weights_a]
-    round_deep_a = roundeep(deep_a)
-    if args.rand_alpha is not None:
-        alpha_info = f"preset:[{alpha_info}],{round(alpha, 3)},[{round_a},[{round_deep_a}]]"
-    else:
-        alpha_info = f"{round(alpha,3)},[{round_a},[{round_deep_a}]]"
+    betas, beta_seed, deep_b, beta_info, args.beta = rand_ratio(args.rand_beta)
+
+theta_0 = None
+theta_1 = None
+theta_2 = None
+model_0_sha256 = None
+model_1_sha256 = None
+model_2_sha256 = None
+if mode != "RM":
+    interp_method = 2
+    model_0_path = os.path.join(args.model_path, args.model_0)
+    model_0_name = args.m0_name if args.m0_name is not None else os.path.splitext(os.path.basename(model_0_path))[0]
+    print(f"Loading {model_0_name}...")
+    theta_0, model_0_sha256, model_0_hash, model_0_meta = load_model(model_0_path, device, prune=args.prune)
+    if mode != "NoIn":
+        interp_method = 0
+        model_1_path = os.path.join(args.model_path, args.model_1)
+        model_1_name = args.m1_name if args.m1_name is not None else os.path.splitext(os.path.basename(model_1_path))[0]
+        print(f"Loading {model_1_name}...")
+        theta_1, model_1_sha256, model_1_hash, model_1_meta = load_model(model_0_path, device, prune=args.prune)
+        weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
+        if mode in ["sAD", "AD", "TRS", "ST", "TD","SIM","MD"]:
+            model_2_path = os.path.join(args.model_path, args.model_2)
+            model_2_name = args.m2_name if args.m2_name is not None else os.path.splitext(os.path.basename(model_2_path))[0]
+            print(f"Loading {model_2_name}...")
+            theta_2, model_2_sha256, model_2_hash, model_2_meta = load_model(model_2_path, device, prune=args.prune)
+        if mode in ["TRS","ST","TS","SIM","MD"]:
+            usebeta = True
+            weights_b, beta, beta_info = parse_ratio(args.beta, beta_info, deep_b)
 else:
-  weights_a = None
-  round_a = None
-  alpha = args.alpha
-  alpha_info = f"{round(args.alpha,3)}"
+    print(sha256(model_0_path, f"checkpoint/{os.path.splitext(os.path.basename(model_0_path))[0]}"))
+    meta = read_metadata_from_safetensors(model_0_path)
+    print(json.dumps(meta, indent=2))
+    with open("./" + output_name + ".json", mode="a+") as dmp:
+        json.dump(meta, dmp, indent=4)
+    exit()
 	
-if mode in ["TRS","ST","TS","SIM","MD"]:
-  usebeta = True
-  if type(args.beta) == list:
-    weights_b = args.beta
-    beta = weights_b.pop(0)
-    round_b = [round(b, 3) for b in weights_b]
-    round_deep_b = roundeep(deep_b)
-    if args.rand_beta is not None:
-        beta_info = f"preset:[{beta_info}],{round(beta,3)},[{round_b},[{round_deep_b}]]"
-    else:
-        beta_info = f"{round(beta,3)},[{round_b},[{round_deep_b}]]"
-  else:
-    weights_b = None
-    round_b = None
-    beta = args.beta
-    beta_info = f"{round(args.beta,3)}"
-else:
-  weights_b = None
-  round_b = None
-  beta = None
-  beta_info = None
-	
-model_0_name = args.m0_name if args.m0_name is not None else os.path.splitext(os.path.basename(model_0_path))[0]
-model_0_bname = os.path.splitext(os.path.basename(model_0_path))[0]
-model_0_sha256 = sha256_from_cache(model_0_path, f"checkpoint/{model_0_bname}")
-if mode != "NoIn":
-  model_1_name = args.m1_name if args.m1_name is not None else os.path.splitext(os.path.basename(model_1_path))[0]
-  model_1_bname = os.path.splitext(os.path.basename(model_1_path))[0]
-  model_1_sha256 = sha256_from_cache(model_1_path, f"checkpoint/{model_1_bname}")
-if mode in ["sAD", "AD", "TRS", "ST", "TD","SIM","MD"]:
-  model_2_name = args.m2_name if args.m2_name is not None else os.path.splitext(os.path.basename(model_2_path))[0]
-  model_2_bname = os.path.splitext(os.path.basename(model_2_path))[0]
-  model_2_sha256 = sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}")
-if args.prune:
-  model_0 = prune_model(model_0, "model_0")
-  if mode != "NoIn":
-    model_1 = prune_model(model_1, "model_1")
-  if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"]:
-    model_2 = prune_model(model_2, "model_2")
 if args.vae is not None:
-  vae_name = os.path.splitext(os.path.basename(args.vae))[0]
+    vae_name = os.path.splitext(os.path.basename(args.vae))[0]
+    vae, _ , _ , _ = load_model(args.vae, device, sha256=False)
 
 metadata = {"format": "pt", "sd_merge_models": {}, "sd_merge_recipe": None}
 
@@ -813,13 +729,13 @@ calcl = ",".join(calculate) if calculate != [] else None
 
 merge_recipe = {
 "type": "merge-models-chattiori", # indicate this model was merged with chattiori's model mereger
-"primary_model_hash": sha256_from_cache(model_0_path, f"checkpoint/{model_0_bname}"),
-"secondary_model_hash": sha256_from_cache(model_1_path, f"checkpoint/{model_1_bname}") if mode != "NoIn" else None,
-"tertiary_model_hash": sha256_from_cache(model_2_path, f"checkpoint/{model_2_bname}") if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"] else None,
+"primary_model_hash": model_0_sha256,
+"secondary_model_hash": model_1_sha256 if mode != "NoIn" else None,
+"tertiary_model_hash": model_2_sha256 if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"] else None,
 "merge_method": real_mode[mode],
 "block_weights": (weights_a is not None or weights_b is not None),
-"alpha_info": alpha_info,
-"beta_info": beta_info,
+"alpha_info": alpha_info if alpha_info != "" else None,
+"beta_info": beta_info if beta_info != "" else None,
 "calculation": calcl,
 "save_as_half": args.save_half,
 "output_name": output_name,
@@ -828,27 +744,20 @@ merge_recipe = {
 }
 metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
 
-def add_model_metadata(filename, model_name):
-  sha256_t = sha256(filename, f"checkpoint/{os.path.splitext(os.path.basename(filename))[0]}")
-  hash_t = model_hash(filename)
-  _, extension_t = os.path.splitext(filename)
-  if extension_t.lower() == ".safetensors":
-    metadata_t = read_metadata_from_safetensors(filename)
-  else:
-    metadata_t = {}
-  metadata["sd_merge_models"][sha256_t] = {
+def add_model_metadata(s256, hashed, meta, model_name):
+  metadata["sd_merge_models"][s256] = {
   "name": model_name,
-  "legacy_hash": hash_t,
-  "sd_merge_recipe": metadata_t.get("sd_merge_recipe", None)
+  "legacy_hash": hashed,
+  "sd_merge_recipe": meta.get("sd_merge_recipe", None)
   }
 
-  metadata["sd_merge_models"].update(metadata_t.get("sd_merge_models", {}))
+  metadata["sd_merge_models"].update(meta.get("sd_merge_models", {}))
 
-add_model_metadata(model_0_path, model_0_name)
+add_model_metadata(model_0_sha256, model_0_hash, model_0_meta, model_0_name)
 if mode != "NoIn":
-  add_model_metadata(model_1_path, model_1_name)
+  add_model_metadata(model_1_sha256, model_1_hash, model_1_meta, model_1_name)
 if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"]:
-  add_model_metadata(model_2_path, model_2_name)
+  add_model_metadata(model_2_sha256, model_2_hash, model_2_meta, model_2_name)
 
 metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
 
@@ -952,16 +861,6 @@ theta_funcs = {
 }
 filename_generator, theta_func1, theta_func2 = theta_funcs[mode] 
 
-if mode in ["sAD", "AD", "TRS", "ST", "TD","SIM","MD"]:
-  print(f"Loading {model_2_name}...")
-  theta_2 = read_state_dict(model_2_path, map_location=device)
-
-if theta_func2:
-  print(f"Loading {model_1_name}...")
-  theta_1 = read_state_dict(model_1_path, map_location=device)
-else:
-  theta_1 = None
-
 if theta_func1:
   for key in tqdm(theta_1.keys(), desc="Getting Difference of Model 1 and 2"):
     if 'model' in key:
@@ -974,13 +873,11 @@ if theta_func1:
 
 print(f"Loading {model_0_name}...")
 if mode == "TS":
-    theta_t = read_state_dict(model_0_path, map_location=device)
+    theta_t = theta_0
     theta_0 ={}
     for key in theta_t:
         theta_0[key] = theta_t[key].clone()
     del theta_t
-else:
-    theta_0 = read_state_dict(model_0_path, map_location=device)
 
 if args.use_dif_21:
     theta_3 = copy.deepcopy(theta_1)
