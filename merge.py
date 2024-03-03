@@ -202,17 +202,17 @@ def rand_ratio(string):
                 if "(" in dr:
                     dr0, drat = float(dr.split("(")[0]), dr.split("(")[1].replace(")","")
                     for db in dbs:
-                        dr1 = ratios[blockid.index(db)]
+                        dr1 = ratios[BLOCKID.index(db)]
                         dr = dr1 * (1 - drat) + dr0 * drat
-                        ratios[blockid.index(db)] = dr
+                        ratios[BLOCKID.index(db)] = dr
                 else:
                     for db in dbs:
-                        ratios[blockid.index(db)] = float(dr)
+                        ratios[BLOCKID.index(db)] = float(dr)
             else:
                 if "(" in dr:
                     dr0, drat = float(dr.split("(")[0]), dr.split("(")[1].replace(")","")
                     for db in dbs:
-                        dr1 = ratios[blockid.index(db)]
+                        dr1 = ratios[BLOCKID.index(db)]
                         dr = dr1 * (1 - drat) + dr0 * drat
                         deep_res.append(f"{db}:{dws}:{dr}")
                 else:
@@ -238,7 +238,7 @@ def fineman(fine,isxl):
         1 - fine[1] * 0.01,
         1+ fine[1] * 0.02,
         1 - fine[2] * 0.01,
-        [fine[3]*0.02] + colorcalc([4:8],isxl)
+        [fine[3]*0.02] + colorcalc(fine[4:8],isxl)
                 ]
     return fine
 
@@ -270,19 +270,6 @@ FINETUNES = [
 "model.diffusion_model.out.2.weight",
 "model.diffusion_model.out.2.bias",
 ]
-
-def excluder(block:str,inex:bool,ex_blocks:list,ex_elems:list, key:str):
-    if ex_blocks == [] and ex_elems == [""]:
-        return False
-    out = True if inex == "Include" else False
-    if block in ex_blocks:out = not out
-    if "Adjust" in ex_blocks and key in FINETUNES:out = not out
-    for ke in ex_elems:
-        if ke != "" and ke in key:out = not out
-    if "VAE" in ex_blocks and "first_stage_model"in key:out = not out
-    if "print" in ex_blocks and (out ^ (inex == "Include")):
-        print("Include" if inex else "Exclude",block,ex_blocks,ex_elems,key)
-    return out
 
 parser = argparse.ArgumentParser(description="Merge two or three models")
 parser.add_argument("mode", choices=["WS","AD","NoIn","MD","SIM","TRS","ST","sAD","TD","TS","SIG","GEO","MAX","RM"], help="Merging mode")
@@ -344,10 +331,17 @@ cache_filename = os.path.join(args.model_path, "cache.json")
 cache_data = None
 
 def to_half(tensor, enable):
-    if enable and tensor.dtype == torch.float32:
+    if enable and tensor.dtype in {torch.float32, torch.float64, torch.bfloat16}:
         return tensor.half()
 
     return tensor
+
+def to_half_k(sd, enable):
+    if enable:
+      for key in sd.keys():
+          if 'model' in key and sd[key].dtype in {torch.float32, torch.float64, torch.bfloat16}:
+              sd[key] = sd[key].half()
+    return sd
 
 def cache(subsection):
     global cache_data
@@ -650,14 +644,9 @@ if os.path.isfile(output_path):
       fan += 1
     print(f"Setted the file name to {output_file}\n")
 
-def load_vae_dict(filename, map_location):
-    vae_ckpt = read_state_dict(filename, map_location=map_location)
-    vae_dict_1 = {k: v for k, v in vae_ckpt.items() if k[0:4] != "loss" and k not in vae_ignore_keys}
-    return vae_dict_1
-
 alpha_seed = None
 beta_seed = None
-use_beta = False
+usebeta = False
 alpha_info = ""
 beta_info = ""
 weights_b = None
@@ -673,9 +662,9 @@ theta_2 = None
 model_0_sha256 = None
 model_1_sha256 = None
 model_2_sha256 = None
+model_0_path = os.path.join(args.model_path, args.model_0)
 if mode != "RM":
     interp_method = 2
-    model_0_path = os.path.join(args.model_path, args.model_0)
     model_0_name = args.m0_name if args.m0_name is not None else os.path.splitext(os.path.basename(model_0_path))[0]
     print(f"Loading {model_0_name}...")
     theta_0, model_0_sha256, model_0_hash, model_0_meta = load_model(model_0_path, device)
@@ -684,7 +673,7 @@ if mode != "RM":
         model_1_path = os.path.join(args.model_path, args.model_1)
         model_1_name = args.m1_name if args.m1_name is not None else os.path.splitext(os.path.basename(model_1_path))[0]
         print(f"Loading {model_1_name}...")
-        theta_1, model_1_sha256, model_1_hash, model_1_meta = load_model(model_0_path, device)
+        theta_1, model_1_sha256, model_1_hash, model_1_meta = load_model(model_1_path, device)
         weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
         if mode in ["sAD", "AD", "TRS", "ST", "TD","SIM","MD"]:
             model_2_path = os.path.join(args.model_path, args.model_2)
@@ -705,57 +694,6 @@ else:
 if args.vae is not None:
     vae_name = os.path.splitext(os.path.basename(args.vae))[0]
     vae, _ , _ , _ = load_model(args.vae, device, sha256=False)
-
-metadata = {"format": "pt", "sd_merge_models": {}, "sd_merge_recipe": None}
-
-calculate = []
-if cosine0:
-  calculate.append("cosine_0")
-if cosine1:
-  calculate.append("cosine_1")
-if args.use_dif_10:
-    calculate.append("use_dif_10")
-if args.use_dif_20:
-    calculate.append("use_dif_20")
-if args.use_dif_21:
-    calculate.append("use_dif_21")
-if args.fine is not None:
-    calculate.append(f"fine[{fine}]")
-calcl = ",".join(calculate) if calculate != [] else None
-
-merge_recipe = {
-"type": "merge-models-chattiori", # indicate this model was merged with chattiori's model mereger
-"primary_model_hash": model_0_sha256,
-"secondary_model_hash": model_1_sha256 if mode != "NoIn" else None,
-"tertiary_model_hash": model_2_sha256 if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"] else None,
-"merge_method": real_mode[mode],
-"block_weights": (weights_a is not None or weights_b is not None),
-"alpha_info": alpha_info if alpha_info != "" else None,
-"beta_info": beta_info if beta_info != "" else None,
-"calculation": calcl,
-"save_as_half": args.save_half,
-"output_name": output_name,
-"bake_in_vae": vae_name if args.vae is not None else False,
-"pruned": args.prune
-}
-metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
-
-def add_model_metadata(s256, hashed, meta, model_name):
-  metadata["sd_merge_models"][s256] = {
-  "name": model_name,
-  "legacy_hash": hashed,
-  "sd_merge_recipe": meta.get("sd_merge_recipe", None)
-  }
-
-  metadata["sd_merge_models"].update(meta.get("sd_merge_models", {}))
-
-add_model_metadata(model_0_sha256, model_0_hash, model_0_meta, model_0_name)
-if mode != "NoIn":
-  add_model_metadata(model_1_sha256, model_1_hash, model_1_meta, model_1_name)
-if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"]:
-  add_model_metadata(model_2_sha256, model_2_hash, model_2_meta, model_2_name)
-
-metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
 
 def filename_weighted_sum():
   a = model_0_name
@@ -937,7 +875,6 @@ if theta_func1:
           theta_1[key] = torch.zeros_like(theta_1[key])
   del theta_2
 
-print(f"Loading {model_0_name}...")
 if mode == "TS":
     theta_t = theta_0
     theta_0 ={}
@@ -1047,7 +984,6 @@ if mode != "NoIn":
       
       block,blocks26 = blockfromkey(key,isxl)
       if block == "Not Merge": continue
-      if inex != "Off" and (ex_blocks or (ex_elems != [""])) and excluder(blocks26,inex,ex_blocks,ex_elems,key): continue
       weight_index = BLOCKIDXLL.index(blocks26) if isxl else BLOCKID.index(blocks26)
       if useblocks and weight_index >= 0:
             if weights_a is not None:
@@ -1195,7 +1131,6 @@ if mode != "NoIn":
                         
                         block,blocks26 = blockfromkey(key,isxl)
                         if block == "Not Merge": continue
-                        if inex != "Off" and (ex_blocks or (ex_elems != [""])) and excluder(blocks26,inex,ex_blocks,ex_elems,key): continue
                         weight_index = BLOCKIDXLL.index(blocks26) if isxl else BLOCKID.index(blocks26)
                         if useblocks and weight_index >= 0:
                             if weights_b is not None:
@@ -1221,12 +1156,11 @@ if mode != "NoIn":
 
 if args.vae is not None:
     print(f"Baking in VAE")
-    vae_dict = load_vae_dict(args.vae, map_location=device)
-    for key in vae_dict.keys():
+    for key in vae.keys():
         theta_0_key = 'first_stage_model.' + key
         if theta_0_key in theta_0:
-            theta_0[theta_0_key] = to_half(vae_dict[key], args.save_half)
-    del vae_dict
+            theta_0[theta_0_key] = to_half(vae[key], args.save_half)
+    del vae
 isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_0
 if isxl:
     # prune share memory tensors, "cond_stage_model." prefixed base tensors are share memory with "conditioner." prefixed tensors
@@ -1234,8 +1168,7 @@ if isxl:
         if "cond_stage_model." in key:
             del theta_0[key]
 
-if args.save_half:
-    theta_0 = to_half(theta_0)
+theta_0 = to_half_k(theta_0, args.save_half)
 if args.prune:
     theta_0 = prune_model(theta_0, isxl)
 
@@ -1245,6 +1178,57 @@ for key in theta_0.keys():
     v = theta_0[key]
     v = v.contiguous()
     theta_0[key] = v 
+
+metadata = {"format": "pt", "sd_merge_models": {}, "sd_merge_recipe": None}
+
+calculate = []
+if cosine0:
+  calculate.append("cosine_0")
+if cosine1:
+  calculate.append("cosine_1")
+if args.use_dif_10:
+    calculate.append("use_dif_10")
+if args.use_dif_20:
+    calculate.append("use_dif_20")
+if args.use_dif_21:
+    calculate.append("use_dif_21")
+if args.fine is not None:
+    calculate.append(f"fine[{fine}]")
+calcl = ",".join(calculate) if calculate != [] else None
+
+merge_recipe = {
+"type": "merge-models-chattiori", # indicate this model was merged with chattiori's model mereger
+"primary_model_hash": model_0_sha256,
+"secondary_model_hash": model_1_sha256 if mode != "NoIn" else None,
+"tertiary_model_hash": model_2_sha256 if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"] else None,
+"merge_method": real_mode[mode],
+"block_weights": (weights_a is not None or weights_b is not None),
+"alpha_info": alpha_info if alpha_info != "" else None,
+"beta_info": beta_info if beta_info != "" else None,
+"calculation": calcl,
+"save_as_half": args.save_half,
+"output_name": output_name,
+"bake_in_vae": vae_name if args.vae is not None else False,
+"pruned": args.prune
+}
+metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
+
+def add_model_metadata(s256, hashed, meta, model_name):
+  metadata["sd_merge_models"][s256] = {
+  "name": model_name,
+  "legacy_hash": hashed,
+  "sd_merge_recipe": meta.get("sd_merge_recipe", None)
+  }
+
+  metadata["sd_merge_models"].update(meta.get("sd_merge_models", {}))
+
+add_model_metadata(model_0_sha256, model_0_hash, model_0_meta, model_0_name)
+if mode != "NoIn":
+  add_model_metadata(model_1_sha256, model_1_hash, model_1_meta, model_1_name)
+if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"]:
+  add_model_metadata(model_2_sha256, model_2_hash, model_2_meta, model_2_name)
+
+metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
 
 loaded = None
 # check if output file already exists, ask to overwrite
