@@ -27,7 +27,9 @@ NUM_INPUT_BLOCKS = 12
 NUM_MID_BLOCK = 1
 NUM_OUTPUT_BLOCKS = 12
 NUM_TOTAL_BLOCKS = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + NUM_OUTPUT_BLOCKS
-blockid=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
+BLOCKID=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
+BLOCKIDXLL=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","VAE"]
+BLOCKIDXL=['BASE', 'IN0', 'IN1', 'IN2', 'IN3', 'IN4', 'IN5', 'IN6', 'IN7', 'IN8', 'M', 'OUT0', 'OUT1', 'OUT2', 'OUT3', 'OUT4', 'OUT5', 'OUT6', 'OUT7', 'OUT8', 'VAE']
 
 def tagdict(presets):
     presets=presets.splitlines()
@@ -221,16 +223,28 @@ def rand_ratio(string):
     base_ratio, deep_res = wgt(ratios, deep_res)
     return ratios, seed, deep_res, info, base_ratio
 
-def fineman(fine):
+COLS = [[-1,1/3,2/3],[1,1,0],[0,-1,-1],[1,0,1]]
+COLSXL = [[0,0,1],[1,0,0],[-1,-1,0],[-1,1,0]]
+
+def colorcalc(cols,isxl):
+    colors = COLSXL if isxl else COLS
+    outs = [[y * cols[i] * 0.02 for y in x] for i,x in enumerate(colors)]
+    return [sum(x) for x in zip(*outs)]
+
+def fineman(fine,isxl):
     fine = [
         1 - fine[0] * 0.01,
         1+ fine[0] * 0.02,
         1 - fine[1] * 0.01,
         1+ fine[1] * 0.02,
         1 - fine[2] * 0.01,
-        [x*0.02 for x in fine[3:]]
+        [fine[3]*0.02] + colorcalc([4:8],isxl)
                 ]
     return fine
+
+def weighttoxl(weight):
+    weight = weight[:9] + weight[12:22] +[0]
+    return weight
 
 def parse_ratio(ratios, info, dp):
     if type(ratios) == list:
@@ -256,6 +270,19 @@ FINETUNES = [
 "model.diffusion_model.out.2.weight",
 "model.diffusion_model.out.2.bias",
 ]
+
+def excluder(block:str,inex:bool,ex_blocks:list,ex_elems:list, key:str):
+    if ex_blocks == [] and ex_elems == [""]:
+        return False
+    out = True if inex == "Include" else False
+    if block in ex_blocks:out = not out
+    if "Adjust" in ex_blocks and key in FINETUNES:out = not out
+    for ke in ex_elems:
+        if ke != "" and ke in key:out = not out
+    if "VAE" in ex_blocks and "first_stage_model"in key:out = not out
+    if "print" in ex_blocks and (out ^ (inex == "Include")):
+        print("Include" if inex else "Exclude",block,ex_blocks,ex_elems,key)
+    return out
 
 parser = argparse.ArgumentParser(description="Merge two or three models")
 parser.add_argument("mode", choices=["WS","AD","NoIn","MD","SIM","TRS","ST","sAD","TD","TS","SIG","GEO","MAX","RM"], help="Merging mode")
@@ -306,11 +333,6 @@ device = args.device
 mode = args.mode
 args.alpha, deep_a = wgt(args.alpha, deep_a)
 args.beta, deep_b = wgt(args.beta, deep_b)
-if args.fine is not None:
-    fine = [float(t) for t in args.fine.split(",")]
-    fine = fineman(fine)
-else:
-    fine = []
 if (args.cosine0 and args.cosine1) or mode != "WS":
   cosine0 = False
   cosine1 = False
@@ -527,34 +549,10 @@ def similarity_add_difference(a, b, c, alpha, beta):
     ab_sum = (1 - alpha / 2) * a + (alpha / 2) * b
     return (1 - similarity) * ab_diff + similarity * ab_sum
 
-def prune_model(model, name):
-    sd = model
-    if 'state_dict' in sd:
-        sd = sd['state_dict']
+def prune_model(theta, name, isxl=False):
     sd_pruned = dict()
-    for k in tqdm(sd, desc=f"Pruning {name}..."):
-        cp = k.startswith('model.diffusion_model.') or k.startswith('depth_model.') or k.startswith('first_stage_model.') or k.startswith('cond_stage_model.')
-        if cp:
-            k_in = k
-            if args.keep_ema:
-                k_ema = 'model_ema.' + k[6:].replace('.', '')
-                if k_ema in sd:
-                    k_in = k_ema
-            if type(sd[k]) == torch.Tensor:
-              if not args.save_half and sd[k].dtype in {torch.float16, torch.float64, torch.bfloat16}:
-                  sd_pruned[k] = sd[k_in].to(torch.float32)
-              elif args.save_half and sd[k].dtype in {torch.float32, torch.float64, torch.bfloat16}:
-                  sd_pruned[k] = sd[k_in].to(torch.float16)
-              else:
-                  sd_pruned[k] = sd[k_in]
-            else:
-              sd_pruned[k] = sd[k_in]      
-    return sd_pruned
-
-def prune_model_after(theta):
-    sd_pruned = dict()
-    for key in tqdm(theta.keys(), desc="Pruning..."):
-        cp = key.startswith('model.diffusion_model.') or key.startswith('depth_model.') or key.startswith('first_stage_model.') or key.startswith('cond_stage_model.')
+    for key in tqdm(theta.keys(), desc=f"Pruning {name}..."):
+        cp = key.startswith('model.diffusion_model.') or key.startswith('depth_model.') or key.startswith('first_stage_model.') or key.startswith("conditioner." if isxl else 'cond_stage_model.')
         if cp:
             k_in = key
             if args.keep_ema:
@@ -605,15 +603,13 @@ def get_state_dict_from_checkpoint(pl_sd):
 
   return pl_sd
 
-def load_model(path, device, sha256=True, prune=False):
+def load_model(path, device, sha256=True):
     if path.endswith(".safetensors"):
         weights = safetensors.torch.load_file(path, device)
         metadata = read_metadata_from_safetensors(path)
     else:
         weights = torch.load(path, device)
         metadata = {}
-    if prune:
-        weights = prune_model(weights, bname)
     bname = os.path.splitext(os.path.basename(path))[0]
     if sha256:
         s256, hashed = sha256_from_cache(path, f"checkpoint/{bname}")
@@ -682,19 +678,19 @@ if mode != "RM":
     model_0_path = os.path.join(args.model_path, args.model_0)
     model_0_name = args.m0_name if args.m0_name is not None else os.path.splitext(os.path.basename(model_0_path))[0]
     print(f"Loading {model_0_name}...")
-    theta_0, model_0_sha256, model_0_hash, model_0_meta = load_model(model_0_path, device, prune=args.prune)
+    theta_0, model_0_sha256, model_0_hash, model_0_meta = load_model(model_0_path, device)
     if mode != "NoIn":
         interp_method = 0
         model_1_path = os.path.join(args.model_path, args.model_1)
         model_1_name = args.m1_name if args.m1_name is not None else os.path.splitext(os.path.basename(model_1_path))[0]
         print(f"Loading {model_1_name}...")
-        theta_1, model_1_sha256, model_1_hash, model_1_meta = load_model(model_0_path, device, prune=args.prune)
+        theta_1, model_1_sha256, model_1_hash, model_1_meta = load_model(model_0_path, device)
         weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
         if mode in ["sAD", "AD", "TRS", "ST", "TD","SIM","MD"]:
             model_2_path = os.path.join(args.model_path, args.model_2)
             model_2_name = args.m2_name if args.m2_name is not None else os.path.splitext(os.path.basename(model_2_path))[0]
             print(f"Loading {model_2_name}...")
-            theta_2, model_2_sha256, model_2_hash, model_2_meta = load_model(model_2_path, device, prune=args.prune)
+            theta_2, model_2_sha256, model_2_hash, model_2_meta = load_model(model_2_path, device)
         if mode in ["TRS","ST","TS","SIM","MD"]:
             usebeta = True
             weights_b, beta, beta_info = parse_ratio(args.beta, beta_info, deep_b)
@@ -825,25 +821,95 @@ def filename_add_difference():
 def filename_nothing():
   return model_0_name
 
-def blocker_S(blocks):
+def blocker(blocks,blockids):
     blocks = blocks.split(" ")
     output = ""
     for w in blocks:
-        flagger=[False]*26
+        flagger=[False]*len(blockids)
         changer = True
         if "-" in w:
             wt = [wt.strip() for wt in w.split('-')]
-            if  blockid.index(wt[1]) > blockid.index(wt[0]):
-                flagger[blockid.index(wt[0]):blockid.index(wt[1])+1] = [changer]*(blockid.index(wt[1])-blockid.index(wt[0])+1)
+            if  blockids.index(wt[1]) > blockids.index(wt[0]):
+                flagger[blockids.index(wt[0]):blockids.index(wt[1])+1] = [changer]*(blockids.index(wt[1])-blockids.index(wt[0])+1)
             else:
-                flagger[blockid.index(wt[1]):blockid.index(wt[0])+1] = [changer]*(blockid.index(wt[0])-blockid.index(wt[1])+1)
+                flagger[blockids.index(wt[1]):blockids.index(wt[0])+1] = [changer]*(blockids.index(wt[0])-blockids.index(wt[1])+1)
         else:
-            output = output + " " + w if output != "" else w
-            return output
-        for i in range(26):
-            if flagger[i]: output = output + " " + blockid[i] if output !="" else blockid[i]
-        return output
-    
+            output = output + " " + w if output else w
+        for i in range(len(blockids)):
+            if flagger[i]: output = output + " " + blockids[i] if output else blockids[i]
+    return output
+
+def blockfromkey(key,isxl):
+    if not isxl:
+        re_inp = re.compile(r'\.input_blocks\.(\d+)\.')  # 12
+        re_mid = re.compile(r'\.middle_block\.(\d+)\.')  # 1
+        re_out = re.compile(r'\.output_blocks\.(\d+)\.') # 12
+
+        weight_index = -1
+
+        NUM_INPUT_BLOCKS = 12
+        NUM_MID_BLOCK = 1
+        NUM_OUTPUT_BLOCKS = 12
+        NUM_TOTAL_BLOCKS = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + NUM_OUTPUT_BLOCKS
+
+        if 'time_embed' in key:
+            weight_index = -2                # before input blocks
+        elif '.out.' in key:
+            weight_index = NUM_TOTAL_BLOCKS - 1     # after output blocks
+        else:
+            m = re_inp.search(key)
+            if m:
+                inp_idx = int(m.groups()[0])
+                weight_index = inp_idx
+            else:
+                m = re_mid.search(key)
+                if m:
+                    weight_index = NUM_INPUT_BLOCKS
+                else:
+                    m = re_out.search(key)
+                    if m:
+                        out_idx = int(m.groups()[0])
+                        weight_index = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + out_idx
+        return BLOCKID[weight_index+1] ,BLOCKID[weight_index+1] 
+
+    else:
+        if not ("weight" in key or "bias" in key):return "Not Merge","Not Merge"
+        if "label_emb" in key or "time_embed" in key: return "Not Merge","Not Merge"
+        if "conditioner.embedders" in key : return "BASE","BASE"
+        if "first_stage_model" in key : return "VAE","BASE"
+        if "model.diffusion_model" in key:
+            if "model.diffusion_model.out." in key: return "OUT8","OUT08"
+            block = re.findall(r'input|mid|output', key)
+            block = block[0].upper().replace("PUT","") if block else ""
+            nums = re.sub(r"\D", "", key)[:1 if "MID" in block else 2] + ("0" if "MID" in block else "")
+            add = re.findall(r"transformer_blocks\.(\d+)\.",key)[0] if "transformer" in key else ""
+            return block + nums + add, block + "0" + nums[0] if "MID" not in block else "M00"
+
+    return "Not Merge", "Not Merge"
+
+def elementals(key,weight_index,deep,current_alpha):
+    skey = key + BLOCKID[weight_index+1]
+    for d in deep:
+        if d.count(":") != 2 :continue
+        dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
+        dbs = blocker(dbs,BLOCKID)
+        dbs,dws = dbs.split(" "), dws.split(" ")
+        dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
+        dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
+        flag = dbn
+        for db in dbs:
+            if db in skey:
+                flag = not dbn
+        if flag:flag = dwn
+        else:continue
+        for dw in dws:
+            if dw in skey:
+                flag = not dwn
+        if flag:
+            dr = float(dr)
+            current_alpha = dr
+    return current_alpha
+
 theta_funcs = {
     "WS":   (filename_weighted_sum, None, weighted_sum),
     "AD":   (filename_add_difference, get_difference, add_difference),
@@ -890,10 +956,6 @@ if args.use_dif_21:
           else:
               theta_2[key] = torch.zeros_like(theta_2[key])
     del theta_3
-
-re_inp = re.compile(r'\.input_blocks\.(\d+)\.')  # 12
-re_mid = re.compile(r'\.middle_block\.(\d+)\.')  # 1
-re_out = re.compile(r'\.output_blocks\.(\d+)\.') # 12
 
 if args.use_dif_10:
     theta_3 = copy.deepcopy(theta_0)
@@ -952,12 +1014,27 @@ if cosine1: #favors modelB's structure with details from A
     sims = np.delete(sims, np.where(sims > np.percentile(sims, 99, method='midpoint')))
 
 if mode != "NoIn":
+  isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_1.keys()
+  if args.fine is not None:
+    fine = [float(t) for t in args.fine.split(",")]
+    fine = fineman(fine,isxl)
+  else:
+    fine = ""
+  if isxl and useblocks:
+    if len(weights_a) == 25:
+        weights_a = weighttoxl(weights_a)
+        print(f"alpha weight converted for XL{weights_a}")
+    if usebeta:
+        if len(weights_b) == 25:
+            weights_b = weighttoxl(weights_b)
+            print(f"beta weight converted for XL{weights_b}")
+    if len(weights_a) == 19: weights_a = weights_a + [0]
+    if usebeta and len(weights_b) == 19: weights_b = weights_b + [0]
   for key in tqdm(theta_0.keys(), desc="Merging..."):
     if args.vae is None and "first_stage_model" in key: continue
     if theta_1 and "model" in key and key in theta_1:    
       if (usebeta or mode == "TD") and not key in theta_2:
          continue
-      weight_index = -1
       current_alpha = alpha
       current_beta = beta
       if key in checkpoint_dict_skip_on_merge:
@@ -967,33 +1044,12 @@ if mode != "NoIn":
       if usebeta:
         c = theta_2[key]
       # check weighted and U-Net or not
-      if (weights_a is not None or weights_b is not None) and 'model.diffusion_model.' in key:
-        # check block index
-        weight_index = -1
-
-        if 'time_embed' in key:
-            weight_index = 0                # before input blocks
-        elif '.out.' in key:
-            weight_index = NUM_TOTAL_BLOCKS - 1     # after output blocks
-        else:
-          m = re_inp.search(key)
-          if m:
-            inp_idx = int(m.groups()[0])
-            weight_index = inp_idx
-          else:
-            m = re_mid.search(key)
-          if m:
-              weight_index = NUM_INPUT_BLOCKS
-          else:
-              m = re_out.search(key)
-              if m:
-                out_idx = int(m.groups()[0])
-                weight_index = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + out_idx
-
-        if weight_index >= NUM_TOTAL_BLOCKS:
-            print(f"ERROR: illegal block index: {key}")
-
-        if weight_index >= 0:
+      
+      block,blocks26 = blockfromkey(key,isxl)
+      if block == "Not Merge": continue
+      if inex != "Off" and (ex_blocks or (ex_elems != [""])) and excluder(blocks26,inex,ex_blocks,ex_elems,key): continue
+      weight_index = BLOCKIDXLL.index(blocks26) if isxl else BLOCKID.index(blocks26)
+      if useblocks and weight_index >= 0:
             if weights_a is not None:
               current_alpha = weights_a[weight_index]
             if usebeta:
@@ -1001,48 +1057,10 @@ if mode != "NoIn":
                   current_beta = weights_b[weight_index]
 			
       if len(deep_a) > 0:
-        skey = key + blockid[weight_index+1]
-        for d in deep_a:
-          if d.count(":") != 2 :continue
-          dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
-          dbs = blocker_S(dbs)
-          dbs,dws = dbs.split(" "), dws.split(" ")
-          dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
-          dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
-          flag = dbn
-          for db in dbs:
-            if db in skey:
-              flag = not dbn
-          if flag:flag = dwn
-          else:continue
-          for dw in dws:
-            if dw in skey:
-              flag = not dwn
-          if flag:
-            dr = float(dr)
-            current_alpha = dr
+        current_alpha = elementals(key,weight_index,deep_a,current_alpha)
 
       if len(deep_b) > 0:
-        skey = key + blockid[weight_index+1]
-        for d in deep_b:
-          if d.count(":") != 2 :continue
-          dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
-          dbs,dws = dbs.split(" "), dws.split(" ")
-          dbs = blocker_S(dbs)
-          dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
-          dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
-          flag = dbn
-          for db in dbs:
-            if db in skey:
-              flag = not dbn
-          if flag:flag = dwn
-          else:continue
-          for dw in dws:
-            if dw in skey:
-              flag = not dwn
-          if flag:
-            dr = float(dr)
-            current_beta = dr
+        current_beta = elementals(key,weight_index,deep_b,current_beta)
 			
       # this enables merging an inpainting model (A) with another one (B);
       # where normal model would have 4 channels, for latenst space, inpainting model would
@@ -1163,15 +1181,7 @@ if mode != "NoIn":
             theta_0[key] = theta_func2(a, b, c, current_alpha, current_beta)
           else:
             theta_0[key] = theta_func2(a, b, current_alpha)
-
-      if any(item in key for item in FINETUNES) and fine:
-        index = FINETUNES.index(key)
-        print(key,fine[index])
-        if 5 > index : 
-            theta_0[key] =theta_0[key]* fine[index] 
-        else :theta_0[key] =theta_0[key] + torch.tensor(fine[5])
         
-      theta_0[key] = to_half(theta_0[key], args.save_half)
   for key in tqdm(theta_1.keys(), desc="Remerging..."):
         if key in checkpoint_dict_skip_on_merge:
             continue
@@ -1182,57 +1192,16 @@ if mode != "NoIn":
                     if key in theta_2:
                         c = theta_2[key]
                         current_beta = beta
-                        if (weights_a is not None or weights_b is not None) and 'model.diffusion_model.' in key:
-                            # check block index
-                            weight_index = -1
-
-                            if 'time_embed' in key:
-                                weight_index = 0                # before input blocks
-                            elif '.out.' in key:
-                                weight_index = NUM_TOTAL_BLOCKS - 1     # after output blocks
-                            else:
-                              m = re_inp.search(key)
-                              if m:
-                                inp_idx = int(m.groups()[0])
-                                weight_index = inp_idx
-                              else:
-                                m = re_mid.search(key)
-                              if m:
-                                  weight_index = NUM_INPUT_BLOCKS
-                              else:
-                                  m = re_out.search(key)
-                                  if m:
-                                    out_idx = int(m.groups()[0])
-                                    weight_index = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + out_idx
-
-                            if weight_index >= NUM_TOTAL_BLOCKS:
-                                print(f"ERROR: illegal block index: {key}")
-
-                            if weight_index >= 0:
-                              if weights_b is not None:
-                                  current_beta = weights_b[weight_index]
-
-                            if len(deep_b) > 0:
-                              skey = key + blockid[weight_index+1]
-                              for d in deep_b:
-                                if d.count(":") != 2 :continue
-                                dbs,dws,dr = d.split(":")[0],d.split(":")[1],d.split(":")[2]
-                                dbs,dws = dbs.split(" "), dws.split(" ")
-                                dbs = blocker_S(dbs)
-                                dbn,dbs = (True,dbs[1:]) if dbs[0] == "NOT" else (False,dbs)
-                                dwn,dws = (True,dws[1:]) if dws[0] == "NOT" else (False,dws)
-                                flag = dbn
-                                for db in dbs:
-                                  if db in skey:
-                                    flag = not dbn
-                                if flag:flag = dwn
-                                else:continue
-                                for dw in dws:
-                                  if dw in skey:
-                                    flag = not dwn
-                                if flag:
-                                  dr = float(dr)
-                                  current_beta = dr
+                        
+                        block,blocks26 = blockfromkey(key,isxl)
+                        if block == "Not Merge": continue
+                        if inex != "Off" and (ex_blocks or (ex_elems != [""])) and excluder(blocks26,inex,ex_blocks,ex_elems,key): continue
+                        weight_index = BLOCKIDXLL.index(blocks26) if isxl else BLOCKID.index(blocks26)
+                        if useblocks and weight_index >= 0:
+                            if weights_b is not None:
+                                current_beta = weights_b[weight_index]
+                        if len(deep_b) > 0:
+                            current_beta = elementals(key,weight_index,deep_b,current_beta)
                         theta_0[key] = weighted_sum(b, c, current_beta)
                     else:
                         theta_0.update({key:theta_1[key]})
@@ -1258,15 +1227,27 @@ if args.vae is not None:
         if theta_0_key in theta_0:
             theta_0[theta_0_key] = to_half(vae_dict[key], args.save_half)
     del vae_dict
-    
-if args.save_half and not theta_func2:
-    for key in theta_0.keys():
-        theta_0[key] = to_half(theta_0[key], args.save_half)   
+isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_0
+if isxl:
+    # prune share memory tensors, "cond_stage_model." prefixed base tensors are share memory with "conditioner." prefixed tensors
+    for i, key in enumerate(theta_0.keys()):
+        if "cond_stage_model." in key:
+            del theta_0[key]
+
+if args.save_half:
+    theta_0 = to_half(theta_0)
+if args.prune:
+    theta_0 = prune_model(theta_0, isxl)
+
+# for safetensors contiguous error
+print("Check contiguous...")
+for key in theta_0.keys():
+    v = theta_0[key]
+    v = v.contiguous()
+    theta_0[key] = v 
 
 loaded = None
 # check if output file already exists, ask to overwrite
-if args.prune:
-  theta_0 = prune_model_after(theta_0)
 print(f"Saving as {output_file}...")
 if args.save_safetensors:
   with torch.no_grad():
