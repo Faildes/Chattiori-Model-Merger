@@ -249,7 +249,7 @@ def weighttoxl(weight):
 def parse_ratio(ratios, info, dp):
     if type(ratios) == list:
         weights = ratios
-        ratio = weights.pop(0)
+        ratio = weights[0]
         rounded = [round(a, 3) for a in weights]
         round_deep = roundeep(dp)
         if info != "":
@@ -986,19 +986,19 @@ if mode != "NoIn":
       block,blocks26 = blockfromkey(key,isxl)
       if block == "Not Merge": continue
       weight_index = BLOCKIDXLL.index(blocks26) if isxl else BLOCKID.index(blocks26)
-      if useblocks and weight_index >= 0:
+      print(weight_index)
+      if weight_index >= 0:
             if weights_a is not None:
               current_alpha = weights_a[weight_index]
-            if usebeta:
-              if weights_b is not None:
-                  current_beta = weights_b[weight_index]
+            if usebeta and weights_b is not None:
+              current_beta = weights_b[weight_index]
 			
       if len(deep_a) > 0:
         current_alpha = elementals(key,weight_index,deep_a,current_alpha)
 
       if len(deep_b) > 0:
         current_beta = elementals(key,weight_index,deep_b,current_beta)
-			
+      print(current_alpha)
       # this enables merging an inpainting model (A) with another one (B);
       # where normal model would have 4 channels, for latenst space, inpainting model would
       # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
