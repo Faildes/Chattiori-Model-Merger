@@ -1131,7 +1131,7 @@ if mode != "NoIn":
                         block,blocks26 = blockfromkey(key,isxl)
                         if block == "Not Merge": continue
                         weight_index = BLOCKIDXLL.index(blocks26) if isxl else BLOCKID.index(blocks26)
-                        if useblocks and weight_index >= 0:
+                        if weight_index >= 0:
                             if weights_b is not None:
                                 current_beta = weights_b[weight_index]
                         if len(deep_b) > 0:
