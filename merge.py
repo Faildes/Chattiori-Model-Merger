@@ -435,7 +435,7 @@ def sha256_from_cache(filename, title, par = 0):
     cached_hash = hashes[title].get("model_hash",None)
     cached_mtime = hashes[title].get("mtime", 0)
 
-    if ondisk_mtime > cached_mtime or cached_sha256 is None:
+    if cached_sha256 is None:
         return None
 
     return cached_sha256, cached_hash
