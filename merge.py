@@ -986,7 +986,6 @@ if mode != "NoIn":
       block,blocks26 = blockfromkey(key,isxl)
       if block == "Not Merge": continue
       weight_index = BLOCKIDXLL.index(blocks26) if isxl else BLOCKID.index(blocks26)
-      print(weight_index)
       if weight_index >= 0:
             if weights_a is not None:
               current_alpha = weights_a[weight_index]
@@ -998,7 +997,6 @@ if mode != "NoIn":
 
       if len(deep_b) > 0:
         current_beta = elementals(key,weight_index,deep_b,current_beta)
-      print(current_alpha)
       # this enables merging an inpainting model (A) with another one (B);
       # where normal model would have 4 channels, for latenst space, inpainting model would
       # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
