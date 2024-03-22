@@ -299,7 +299,7 @@ parser.add_argument("--output", type=str, help="Output file name, without extens
 parser.add_argument("--functn", action="store_true", help="Add function name to the file", required=False)
 parser.add_argument("--delete_source", action="store_true", help="Delete the source checkpoint file", required=False)
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
-parser.add_argument("--delete_source_b", action="store_true", help="Delete the source checkpoint file", required=False)
+parser.add_argument("--no_metadata", action="store_true", help="Save without metadata", required=False)
 
 real_mode = {"WS": "Weighted Sum",
 	     "AD": "Add Difference",
@@ -1239,11 +1239,18 @@ if args.delete_source:
       os.remove(model_1_path)
     if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"]:
       os.remove(model_2_path)
-if args.save_safetensors:
-  with torch.no_grad():
-      safetensors.torch.save_file(theta_0, output_path, metadata=metadata)
+if args.no_metadata:
+    if args.save_safetensors:
+      with torch.no_grad():
+          safetensors.torch.save_file(theta_0, output_path)
+    else:
+        torch.save({"state_dict": theta_0}, output_path)
 else:
-    torch.save({"state_dict": theta_0}, output_path)
+    if args.save_safetensors:
+      with torch.no_grad():
+          safetensors.torch.save_file(theta_0, output_path, metadata=metadata)
+    else:
+        torch.save({"state_dict": theta_0}, output_path)
 del theta_0
 file_size = round(os.path.getsize(output_path) / 1073741824,2)
 print(f"Done! ({file_size}G)")
