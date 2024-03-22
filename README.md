@@ -76,6 +76,7 @@ Just like with the .bat method, I'd recommend creating a folder within your stab
     - Optional: `--output` is the filename of the merged file, without file extension. Defaults to "merged", if omitted
     - Optional: `--functn` determines whether add merge function names, if omitted
     - Optional: `--delete_source` determines whether to delete the source checkpoint files, not vae file, if omitted
+    - Optional: `--no_metadata` saves the checkpoint without metadata, if omitted
     - Optional: `--device` is the device that's going to be used to merge the models. Unless you have a ton of VRAM, you should probably just ignore this. Defaults to 'cpu', if omitted.
       - For `.ckpt` files, required VRAM seems to be roughly equivalent to the size of `(size of both models) * 1.15`. Merging 2 models at 3.76GB resulted in rougly 8.6GB of VRAM usage on top of everything else going on.
       - For `.safetensors`, required VRAM seems to be roughly equivalent to the size of `size of both models`. Merging 2 models at 3.76GB resulted in rougly 7.5GB of VRAM usage on top of everything else going on.
