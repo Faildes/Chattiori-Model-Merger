@@ -249,7 +249,7 @@ def weighttoxl(weight):
 def parse_ratio(ratios, info, dp):
     if type(ratios) == list:
         weights = ratios
-        ratio = weights[0]
+        ratio = weights.pop(0)
         rounded = [round(a, 3) for a in weights]
         round_deep = roundeep(dp)
         if info != "":
@@ -974,24 +974,28 @@ if mode != "NoIn":
     if theta_1 and "model" in key and key in theta_1:    
       if (usebeta or mode == "TD") and not key in theta_2:
          continue
+      weight_index = -1
       current_alpha = alpha
       current_beta = beta
       if key in checkpoint_dict_skip_on_merge:
         continue
       a = theta_0[key]
       b = theta_1[key]
+      al = list(theta_0[key].shape)
+      bl = list(theta_1[key].shape)
       if usebeta:
         c = theta_2[key]
+        cl = list(theta_2[key].shape)
       # check weighted and U-Net or not
       
       block,blocks26 = blockfromkey(key,isxl)
       if block == "Not Merge": continue
       weight_index = BLOCKIDXLL.index(blocks26) if isxl else BLOCKID.index(blocks26)
-      if weight_index >= 0:
+      if weight_index > 0:
             if weights_a is not None:
-              current_alpha = weights_a[weight_index]
+              current_alpha = weights_a[weight_index-1]
             if usebeta and weights_b is not None:
-              current_beta = weights_b[weight_index]
+              current_beta = weights_b[weight_index-1]
 			
       if len(deep_a) > 0:
         current_alpha = elementals(key,weight_index,deep_a,current_alpha)
@@ -1012,9 +1016,7 @@ if mode != "NoIn":
             dot_product = torch.dot(theta_0_norm.view(-1), theta_1_norm.view(-1))
             magnitude_similarity = dot_product / (torch.norm(theta_0_norm) * torch.norm(theta_1_norm))
             combined_similarity = (simab + magnitude_similarity) / 2.0
-            k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
-            k = k - abs(current_alpha)
-            k = k.clip(min=0,max=1.0)
+            k = (((combined_similarity - sims.min()) / (sims.max() - sims.min()))- abs(current_alpha)).clip(min=0,max=1.0)
             theta_0[key] = b * (1 - k) + a * k
 	
       elif cosine1:
@@ -1025,9 +1027,7 @@ if mode != "NoIn":
             dot_product = torch.dot(a.view(-1).to(torch.float32), b.view(-1).to(torch.float32))
             magnitude_similarity = dot_product / (torch.norm(a.to(torch.float32)) * torch.norm(b.to(torch.float32)))
             combined_similarity = (simab + magnitude_similarity) / 2.0
-            k = (combined_similarity - sims.min()) / (sims.max() - sims.min())
-            k = k - current_alpha
-            k = k.clip(min=0,max=1.0)
+            k = (((combined_similarity - sims.min()) / (sims.max() - sims.min()))- abs(current_alpha)).clip(min=0,max=1.0)
             theta_0[key] = b * (1 - k) + a * k
 		
       elif mode == "sAD":
@@ -1093,30 +1093,19 @@ if mode != "NoIn":
                     theta_t[talphas:talphae,:,:,:] = theta_0[key][talphas:talphae,:,:,:].clone()
                 theta_0[key] = theta_t
       else:
-        if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
-          if a.shape[1] == 4 and b.shape[1] == 9:
-            raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
-          if a.shape[1] == 4 and b.shape[1] == 8:
-            raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
-
-          if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
-            if usebeta:
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
-            else:
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
-            result_is_instruct_pix2pix_model = True
-          else:
-            assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
-            if usebeta:
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, c, current_alpha, current_beta)
-            else:
-              theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, current_alpha)
-            result_is_inpainting_model = True
+        if al != bl and al[0:1] + al[2:] == bl[0:1] + bl[2:]:
+          ad = a[:, 0:4, :, :]
+          result_is_instruct_pix2pix_model = (al[1] == 8 and bl[1] == 4)
+          assert al[1] == 9 and bl[1] == 4, f"Bad dimensions for merged layer {key}: A={al}, B={bl}"
+          result_is_inpainting_model = not result_is_instruct_pix2pix_model
         else:
-          if usebeta:
-            theta_0[key] = theta_func2(a, b, c, current_alpha, current_beta)
-          else:
-            theta_0[key] = theta_func2(a, b, current_alpha)
+          ad = a
+          result_is_instruct_pix2pix_model = False
+          result_is_inpainting_model = False
+        if usebeta:
+          theta_0[key] = theta_func2(ad, b, c, current_alpha, current_beta)
+        else:
+          theta_0[key] = theta_func2(ad, b, current_alpha)
         
   for key in tqdm(theta_1.keys(), desc="Remerging..."):
         if key in checkpoint_dict_skip_on_merge:
@@ -1155,7 +1144,7 @@ if mode != "NoIn":
     pass
 
 if args.vae is not None:
-    print(f"Baking in VAE")
+    print(f"Baking in VAE: {vae_name}")
     for key in vae.keys():
         theta_0_key = 'first_stage_model.' + key
         if theta_0_key in theta_0:
@@ -1239,18 +1228,14 @@ if args.delete_source:
       os.remove(model_1_path)
     if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"]:
       os.remove(model_2_path)
-if args.no_metadata:
-    if args.save_safetensors:
-      with torch.no_grad():
-          safetensors.torch.save_file(theta_0, output_path)
-    else:
-        torch.save({"state_dict": theta_0}, output_path)
+if args.save_safetensors:
+    with torch.no_grad():
+      if args.no_metadata:
+        safetensors.torch.save_file(theta_0, output_path)
+      else:
+        safetensors.torch.save_file(theta_0, output_path, metadata=metadata)
 else:
-    if args.save_safetensors:
-      with torch.no_grad():
-          safetensors.torch.save_file(theta_0, output_path, metadata=metadata)
-    else:
-        torch.save({"state_dict": theta_0}, output_path)
+    torch.save({"state_dict": theta_0}, output_path)
 del theta_0
 file_size = round(os.path.getsize(output_path) / 1073741824,2)
 print(f"Done! ({file_size}G)")
