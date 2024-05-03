@@ -1,98 +1,380 @@
-import math
-import argparse
-import os
-import time
+import json
 import torch
-from safetensors.torch import load_file, save_file
-from library import sai_model_spec, train_util
-import library.model_util as model_util
-import lora
+import safetensors.torch
+import os
+import filelock
+import hashlib
+import re
+
+BLOCKID26=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
+BLOCKID17=["BASE","IN01","IN02","IN04","IN05","IN07","IN08","M00","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
+BLOCKID12=["BASE","IN04","IN05","IN07","IN08","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05"]
+BLOCKID20=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08"]
+BLOCKNUMS = [12,17,20,26]
+BLOCKIDS=[BLOCKID12,BLOCKID17,BLOCKID20,BLOCKID26]
+LBLOCKS26=["encoder",
+"diffusion_model_input_blocks_0_",
+"diffusion_model_input_blocks_1_",
+"diffusion_model_input_blocks_2_",
+"diffusion_model_input_blocks_3_",
+"diffusion_model_input_blocks_4_",
+"diffusion_model_input_blocks_5_",
+"diffusion_model_input_blocks_6_",
+"diffusion_model_input_blocks_7_",
+"diffusion_model_input_blocks_8_",
+"diffusion_model_input_blocks_9_",
+"diffusion_model_input_blocks_10_",
+"diffusion_model_input_blocks_11_",
+"diffusion_model_middle_block_",
+"diffusion_model_output_blocks_0_",
+"diffusion_model_output_blocks_1_",
+"diffusion_model_output_blocks_2_",
+"diffusion_model_output_blocks_3_",
+"diffusion_model_output_blocks_4_",
+"diffusion_model_output_blocks_5_",
+"diffusion_model_output_blocks_6_",
+"diffusion_model_output_blocks_7_",
+"diffusion_model_output_blocks_8_",
+"diffusion_model_output_blocks_9_",
+"diffusion_model_output_blocks_10_",
+"diffusion_model_output_blocks_11_",
+"embedders"]
+checkpoint_dict_replacements = {
+    'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
+    'cond_stage_model.transformer.encoder.': 'cond_stage_model.transformer.text_model.encoder.',
+    'cond_stage_model.transformer.final_layer_norm.': 'cond_stage_model.transformer.text_model.final_layer_norm.',
+}
+
+checkpoint_dict_skip_on_merge = ["cond_stage_model.transformer.text_model.embeddings.position_ids"]
 
 
-def load_state_dict(file_name, dtype):
-    if os.path.splitext(file_name)[1] == ".safetensors":
-        sd = load_file(file_name)
-        metadata = train_util.load_metadata_from_safetensors(file_name)
+re_digits = re.compile(r"\d+")
+re_x_proj = re.compile(r"(.*)_([qkv]_proj)$")
+re_compiled = {}
+
+suffix_conversion = {
+    "attentions": {},
+    "resnets": {
+        "conv1": "in_layers_2",
+        "conv2": "out_layers_3",
+        "norm1": "in_layers_0",
+        "norm2": "out_layers_0",
+        "time_emb_proj": "emb_layers_1",
+        "conv_shortcut": "skip_connection",
+    }
+}
+
+def convert_diffusers_name_to_compvis(key, is_sd2):
+    def match(match_list, regex_text):
+        regex = re_compiled.get(regex_text)
+        if regex is None:
+            regex = re.compile(regex_text)
+            re_compiled[regex_text] = regex
+
+        r = re.match(regex, key)
+        if not r:
+            return False
+
+        match_list.clear()
+        match_list.extend([int(x) if re.match(re_digits, x) else x for x in r.groups()])
+        return True
+
+    m = []
+
+    if match(m, r"lora_unet_conv_in(.*)"):
+        return f'diffusion_model_input_blocks_0_0{m[0]}'
+
+    if match(m, r"lora_unet_conv_out(.*)"):
+        return f'diffusion_model_out_2{m[0]}'
+
+    if match(m, r"lora_unet_time_embedding_linear_(\d+)(.*)"):
+        return f"diffusion_model_time_embed_{m[0] * 2 - 2}{m[1]}"
+
+    if match(m, r"lora_unet_down_blocks_(\d+)_(attentions|resnets)_(\d+)_(.+)"):
+        suffix = suffix_conversion.get(m[1], {}).get(m[3], m[3])
+        return f"diffusion_model_input_blocks_{1 + m[0] * 3 + m[2]}_{1 if m[1] == 'attentions' else 0}_{suffix}"
+
+    if match(m, r"lora_unet_mid_block_(attentions|resnets)_(\d+)_(.+)"):
+        suffix = suffix_conversion.get(m[0], {}).get(m[2], m[2])
+        return f"diffusion_model_middle_block_{1 if m[0] == 'attentions' else m[1] * 2}_{suffix}"
+
+    if match(m, r"lora_unet_up_blocks_(\d+)_(attentions|resnets)_(\d+)_(.+)"):
+        suffix = suffix_conversion.get(m[1], {}).get(m[3], m[3])
+        return f"diffusion_model_output_blocks_{m[0] * 3 + m[2]}_{1 if m[1] == 'attentions' else 0}_{suffix}"
+
+    if match(m, r"lora_unet_down_blocks_(\d+)_downsamplers_0_conv"):
+        return f"diffusion_model_input_blocks_{3 + m[0] * 3}_0_op"
+
+    if match(m, r"lora_unet_up_blocks_(\d+)_upsamplers_0_conv"):
+        return f"diffusion_model_output_blocks_{2 + m[0] * 3}_{2 if m[0]>0 else 1}_conv"
+
+    if match(m, r"lora_te_text_model_encoder_layers_(\d+)_(.+)"):
+        if is_sd2:
+            if 'mlp_fc1' in m[1]:
+                return f"model_transformer_resblocks_{m[0]}_{m[1].replace('mlp_fc1', 'mlp_c_fc')}"
+            elif 'mlp_fc2' in m[1]:
+                return f"model_transformer_resblocks_{m[0]}_{m[1].replace('mlp_fc2', 'mlp_c_proj')}"
+            else:
+                return f"model_transformer_resblocks_{m[0]}_{m[1].replace('self_attn', 'attn')}"
+
+        return f"transformer_text_model_encoder_layers_{m[0]}_{m[1]}"
+
+    if match(m, r"lora_te2_text_model_encoder_layers_(\d+)_(.+)"):
+        if 'mlp_fc1' in m[1]:
+            return f"1_model_transformer_resblocks_{m[0]}_{m[1].replace('mlp_fc1', 'mlp_c_fc')}"
+        elif 'mlp_fc2' in m[1]:
+            return f"1_model_transformer_resblocks_{m[0]}_{m[1].replace('mlp_fc2', 'mlp_c_proj')}"
+        else:
+            return f"1_model_transformer_resblocks_{m[0]}_{m[1].replace('self_attn', 'attn')}"
+
+    return key
+
+def transform_checkpoint_dict_key(k):
+  for text, replacement in checkpoint_dict_replacements.items():
+      if k.startswith(text):
+          k = replacement + k[len(text):]
+
+  return k
+def get_state_dict_from_checkpoint(pl_sd):
+  pl_sd = pl_sd.pop("state_dict", pl_sd)
+  pl_sd.pop("state_dict", None)
+
+  sd = {}
+  for k, v in pl_sd.items():
+      new_key = transform_checkpoint_dict_key(k)
+
+      if new_key is not None:
+          sd[new_key] = v
+
+  pl_sd.clear()
+  pl_sd.update(sd)
+
+  return pl_sd
+
+def read_metadata_from_safetensors(filename):
+    import json
+
+    with open(filename, mode="rb") as file:
+        metadata_len = file.read(8)
+        metadata_len = int.from_bytes(metadata_len, "little")
+        json_start = file.read(2)
+
+        assert metadata_len > 2 and json_start in (b'{"', b"{'"), f"{filename} is not a safetensors file"
+        json_data = json_start + file.read(metadata_len-2)
+        json_obj = json.loads(json_data)
+
+        res = {}
+        for k, v in json_obj.get("__metadata__", {}).items():
+            res[k] = v
+            if isinstance(v, str) and v[0:1] == '{':
+                try:
+                    res[k] = json.loads(v)
+                except Exception as e:
+                    pass
+
+        return res
+
+def load_model(model_path, device="cpu"):
+    if os.path.splitext(model_path)[1] == ".safetensors":
+        model = safetensors.torch.load_file(model_path, device=device)
     else:
-        sd = torch.load(file_name, map_location="cpu")
+        model = torch.load(model_path, map_location=device)
+    sd = get_state_dict_from_checkpoint(model)
+    metadata = read_metadata_from_safetensors(model_path)
+    return sd, metadata
+
+def load_metadata_from_safetensors(safetensors_file: str) -> dict:
+    """
+    This method locks the file. see https://github.com/huggingface/safetensors/issues/164
+    If the file isn't .safetensors or doesn't have metadata, return empty dict.
+    """
+    if os.path.splitext(safetensors_file)[1] != ".safetensors":
+        return {}
+
+    with safetensors.safe_open(safetensors_file, framework="pt", device="cpu") as f:
+        metadata = f.metadata()
+    if metadata is None:
         metadata = {}
+    return metadata
+
+def load_state_dict(file_name, dtype, device = "cpu"):
+    if os.path.splitext(file_name)[1] == ".safetensors":
+        sd = safetensors.torch.load_file(file_name,device=device)
+        metadata = load_metadata_from_safetensors(file_name)
+    else:
+        sd = torch.load(file_name, map_location=device)
+        metadata = {}
+
+    isv2 = False
 
     for key in list(sd.keys()):
         if type(sd[key]) == torch.Tensor:
-            sd[key] = sd[key].to(dtype)
+            sd[key] = sd[key].to(dtype = dtype, device = device)
+            if "resblocks" in key:
+                isv2 = True
 
-    return sd, metadata
+    if isv2: print("SD2.X")
+
+    return sd, metadata, isv2
+cache_data = None
+def pluslora(lora_list: list,model,output,device="cpu"):
+    cache_filename = os.path.join(model_path, "cache.json")
+    def cache(subsection):
+        global cache_data
+        if cache_data is None:
+            with filelock.FileLock(f"{cache_filename}.lock"):
+                if not os.path.isfile(cache_filename):
+                    cache_data = {}
+                else:
+                    with open(cache_filename, "r", encoding="utf8") as file:
+                        cache_data = json.load(file)
+
+        s = cache_data.get(subsection, {})
+        cache_data[subsection] = s
+
+        return s
+
+    def dump_cache():
+        with filelock.FileLock(f"{cache_filename}.lock"):
+            with open(cache_filename, "w", encoding="utf8") as file:
+                json.dump(cache_data, file, indent=4)
+
+    def sha256(filename, title):
+        hashes = cache("hashes")
+
+        sha256_value = sha256_from_cache(filename, title, 1)
+        if sha256_value is not None:
+            return sha256_value
+
+        print(f"Calculating sha256 for {filename}: ", end='')
+        sha256_value = calculate_sha256(filename)
+        print(f"{sha256_value}")
+
+        hashes[title] = {
+            "mtime": os.path.getmtime(filename),
+            "sha256": sha256_value,
+        }
+
+        dump_cache()
+
+        return sha256_value
+
+    def calculate_shorthash(filename):
+        sha256 = sha256(filename, f"checkpoint/{os.path.splitext(os.path.basename(filename))[0]}")
+        if sha256 is None:
+            return
+
+        shorthash = sha256[0:10]
+
+        return shorthash
+
+    def calculate_sha256(filename):
+        hash_sha256 = hashlib.sha256()
+        blksize = 1024 * 1024
+
+        with open(filename, "rb") as f:
+            for chunk in iter(lambda: f.read(blksize), b""):
+                hash_sha256.update(chunk)
+
+        return hash_sha256.hexdigest()
 
 
-def save_to_file(file_name, model, state_dict, dtype, metadata):
-    if dtype is not None:
-        for key in list(state_dict.keys()):
-            if type(state_dict[key]) == torch.Tensor:
-                state_dict[key] = state_dict[key].to(dtype)
+    def sha256_from_cache(filename, title, par = 0):
+        hashes = cache("hashes")
+        ondisk_mtime = os.path.getmtime(filename)
 
-    if os.path.splitext(file_name)[1] == ".safetensors":
-        save_file(model, file_name, metadata=metadata)
-    else:
-        torch.save(model, file_name)
+        if title not in hashes:
+          if par == 0:
+            sh = sha256(filename, title)
+          else:
+            return None
 
+        cached_sha256 = hashes[title].get("sha256", None)
+        cached_mtime = hashes[title].get("mtime", 0)
 
-def merge_to_sd_model(text_encoder, unet, models, ratios, merge_dtype):
-    text_encoder.to(merge_dtype)
-    unet.to(merge_dtype)
+        if ondisk_mtime > cached_mtime or cached_sha256 is None:
+            return None
 
-    # create module map
-    name_to_module = {}
-    for i, root_module in enumerate([text_encoder, unet]):
-        if i == 0:
-            prefix = lora.LoRANetwork.LORA_PREFIX_TEXT_ENCODER
-            target_replace_modules = lora.LoRANetwork.TEXT_ENCODER_TARGET_REPLACE_MODULE
-        else:
-            prefix = lora.LoRANetwork.LORA_PREFIX_UNET
-            target_replace_modules = (
-                lora.LoRANetwork.UNET_TARGET_REPLACE_MODULE + lora.LoRANetwork.UNET_TARGET_REPLACE_MODULE_CONV2D_3X3
-            )
+        return cached_sha256
+    if model == []: return "ERROR: No model Selected"
+    if lora_model == []: return "ERROR: No LoRA Selected"
 
-        for name, module in root_module.named_modules():
-            if module.__class__.__name__ in target_replace_modules:
-                for child_name, child_module in module.named_modules():
-                    if child_module.__class__.__name__ == "Linear" or child_module.__class__.__name__ == "Conv2d":
-                        lora_name = prefix + "." + name + "." + child_name
-                        lora_name = lora_name.replace(".", "_")
-                        name_to_module[lora_name] = child_module
+    add = ""
+    print("Plus LoRA start")
+    import lora
 
-    for model, ratio in zip(models, ratios):
-        print(f"loading: {model}")
-        lora_sd, _ = load_state_dict(model, merge_dtype)
+    print(f"Loading {model}")
+    theta_0, metadata = load_model(model, device=device)
+    model_name = os.path.splitext(os.path.basename(model))[0]
+    isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_0.keys()
+    isv2 = "cond_stage_model.model.transformer.resblocks.0.attn.out_proj.weight" in theta_0.keys()
 
-        print(f"merging...")
+    keychanger = {}
+    for key in theta_0.keys():
+        if "model" in key:
+            skey = key.replace(".","_").replace("_weight","")
+            if "conditioner_embedders_" in skey:
+                keychanger[skey.split("conditioner_embedders_",1)[1]] = key
+            else:
+                if "wrapped" in skey:
+                    keychanger[skey.split("wrapped_",1)[1]] = key
+                else:
+                    keychanger[skey.split("model_",1)[1]] = key
+    lr=[]
+    lh={}
+    for lora_model, loraratio in lora_list:
+        print(f"loading: {lora_model}")
+        loraratios=[float(x) for x in loraratio.replace(" ","").split(",")]
+        lr.append("["+",".join(loraratios)+"]")
+        
+        lora_sd, lora_metadata, lisv2 = load_state_dict(lora_model, torch.float)
+        lora_name = os.path.splitext(os.path.basename(lora_model))[0]
+        lora_hash = sha256_from_cache(lora_model, f"lora/{lora_name}")
+        lh[lora_hash]=lora_metadata
+
+        print(f"merging..." ,lora_model)
         for key in lora_sd.keys():
+            
+            ratio = loraratios[0]
+
+            import lora
+            fullkey = convert_diffusers_name_to_compvis(key,lisv2)
+            #print(fullkey)
+            msd_key = fullkey.split(".", 1)[0]
+            if isxl:
+                if "lora_unet" in msd_key:
+                    msd_key = msd_key.replace("lora_unet", "diffusion_model")
+                elif "lora_te1_text_model" in msd_key:
+                    msd_key = msd_key.replace("lora_te1_text_model", "0_transformer_text_model")
+
+            for i,block in enumerate(LBLOCKS26):
+                if block in fullkey or block in msd_key:
+                    try:
+                        ratio = loraratios[i]
+                    except:
+                        ratio = loraratios[0]
+            if msd_key not in keychanger.keys():
+                  continue
             if "lora_down" in key:
                 up_key = key.replace("lora_down", "lora_up")
-                alpha_key = key[: key.index("lora_down")] + "alpha"
+                alpha_key = key[:key.index("lora_down")] + 'alpha'
 
-                # find original module for this lora
-                module_name = ".".join(key.split(".")[:-2])  # remove trailing ".lora_down.weight"
-                if module_name not in name_to_module:
-                    print(f"no module found for LoRA weight: {key}")
-                    continue
-                module = name_to_module[module_name]
                 # print(f"apply {key} to {module}")
 
-                down_weight = lora_sd[key]
-                up_weight = lora_sd[up_key]
+                down_weight = lora_sd[key].to(device="cpu")
+                up_weight = lora_sd[up_key].to(device="cpu")
 
                 dim = down_weight.size()[0]
                 alpha = lora_sd.get(alpha_key, dim)
                 scale = alpha / dim
-
                 # W <- W + U * D
-                weight = module.weight
+                
+                weight = theta_0[keychanger[msd_key]].to(device="cpu")
+
                 if len(weight.size()) == 2:
                     # linear
-                    if len(up_weight.size()) == 4:  # use linear projection mismatch
-                        up_weight = up_weight.squeeze(3).squeeze(2)
-                        down_weight = down_weight.squeeze(3).squeeze(2)
                     weight = weight + ratio * (up_weight @ down_weight) * scale
+
                 elif down_weight.size()[2:4] == (1, 1):
                     # conv2d 1x1
                     weight = (
@@ -106,252 +388,23 @@ def merge_to_sd_model(text_encoder, unet, models, ratios, merge_dtype):
                     conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
                     # print(conved.size(), weight.size(), module.stride, module.padding)
                     weight = weight + ratio * conved * scale
+                theta_0[keychanger[msd_key]] = torch.nn.Parameter(weight)
+    #usemodelgen(theta_0,model)
+    output_name = os.path.splitext(os.path.basename(output))[0]
+    new_metadata = {"sd_merge_models": {}, "checkpoint": {}, "lora": {}}
+    merge_recipe = {
+        "type": "pluslora-chattiori", # indicate this model was merged with chattiori's model mereger
+        "checkpoint_hash": sha256_from_cache(model, f"checkpoint/{model_name}"),
+        "lora_hash": ",".join(lh.keys()),
+        "alpha_info": ",".join(lr),
+        "output_name": output_name,
+        }
+    new_metadata["sd_merge_models"] = json.dumps(merge_recipe)
+    new_metadata["checkpoint"] = json.dumps(metadata)
+    for hs, mt in lh.items():
+        new_metadata["lora"][hs] = mt
+    new_metadata["lora"] = json.dumps(new_metadata["lora"])
+    safetensors.torch.save_file(theta_0, output, metadata=new_metadata)
 
-                module.weight = torch.nn.Parameter(weight)
-
-
-def merge_lora_models(models, ratios, merge_dtype, concat=False, shuffle=False):
-    base_alphas = {}  # alpha for merged model
-    base_dims = {}
-
-    merged_sd = {}
-    v2 = None
-    base_model = None
-    for model, ratio in zip(models, ratios):
-        print(f"loading: {model}")
-        lora_sd, lora_metadata = load_state_dict(model, merge_dtype)
-
-        if lora_metadata is not None:
-            if v2 is None:
-                v2 = lora_metadata.get(train_util.SS_METADATA_KEY_V2, None)  # return string
-            if base_model is None:
-                base_model = lora_metadata.get(train_util.SS_METADATA_KEY_BASE_MODEL_VERSION, None)
-
-        # get alpha and dim
-        alphas = {}  # alpha for current model
-        dims = {}  # dims for current model
-        for key in lora_sd.keys():
-            if "alpha" in key:
-                lora_module_name = key[: key.rfind(".alpha")]
-                alpha = float(lora_sd[key].detach().numpy())
-                alphas[lora_module_name] = alpha
-                if lora_module_name not in base_alphas:
-                    base_alphas[lora_module_name] = alpha
-            elif "lora_down" in key:
-                lora_module_name = key[: key.rfind(".lora_down")]
-                dim = lora_sd[key].size()[0]
-                dims[lora_module_name] = dim
-                if lora_module_name not in base_dims:
-                    base_dims[lora_module_name] = dim
-
-        for lora_module_name in dims.keys():
-            if lora_module_name not in alphas:
-                alpha = dims[lora_module_name]
-                alphas[lora_module_name] = alpha
-                if lora_module_name not in base_alphas:
-                    base_alphas[lora_module_name] = alpha
-
-        print(f"dim: {list(set(dims.values()))}, alpha: {list(set(alphas.values()))}")
-
-        # merge
-        print(f"merging...")
-        for key in lora_sd.keys():
-            if "alpha" in key:
-                continue
-            if "lora_up" in key and concat:
-                concat_dim = 1
-            elif "lora_down" in key and concat:
-                concat_dim = 0
-            else:
-                concat_dim = None
-
-            lora_module_name = key[: key.rfind(".lora_")]
-
-            base_alpha = base_alphas[lora_module_name]
-            alpha = alphas[lora_module_name]
-
-            scale = math.sqrt(alpha / base_alpha) * ratio
-            scale = abs(scale) if "lora_up" in key else scale # マイナスの重みに対応する。
-
-            if key in merged_sd:
-                assert (
-                    merged_sd[key].size() == lora_sd[key].size() or concat_dim is not None
-                ), f"weights shape mismatch merging v1 and v2, different dims? / 重みのサイズが合いません。v1とv2、または次元数の異なるモデルはマージできません"
-                if concat_dim is not None:
-                    merged_sd[key] = torch.cat([merged_sd[key], lora_sd[key] * scale], dim=concat_dim)
-                else:
-                    merged_sd[key] = merged_sd[key] + lora_sd[key] * scale
-            else:
-                merged_sd[key] = lora_sd[key] * scale
-
-    # set alpha to sd
-    for lora_module_name, alpha in base_alphas.items():
-        key = lora_module_name + ".alpha"
-        merged_sd[key] = torch.tensor(alpha)
-        if shuffle:
-            key_down = lora_module_name + ".lora_down.weight"
-            key_up = lora_module_name + ".lora_up.weight"
-            dim = merged_sd[key_down].shape[0]
-            perm = torch.randperm(dim)
-            merged_sd[key_down] = merged_sd[key_down][perm]
-            merged_sd[key_up] = merged_sd[key_up][:,perm]
-
-    print("merged model")
-    print(f"dim: {list(set(base_dims.values()))}, alpha: {list(set(base_alphas.values()))}")
-
-    # check all dims are same
-    dims_list = list(set(base_dims.values()))
-    alphas_list = list(set(base_alphas.values()))
-    all_same_dims = True
-    all_same_alphas = True
-    for dims in dims_list:
-        if dims != dims_list[0]:
-            all_same_dims = False
-            break
-    for alphas in alphas_list:
-        if alphas != alphas_list[0]:
-            all_same_alphas = False
-            break
-
-    # build minimum metadata
-    dims = f"{dims_list[0]}" if all_same_dims else "Dynamic"
-    alphas = f"{alphas_list[0]}" if all_same_alphas else "Dynamic"
-    metadata = train_util.build_minimum_network_metadata(v2, base_model, "networks.lora", dims, alphas, None)
-
-    return merged_sd, metadata, v2 == "True"
-
-
-def merge(args):
-    assert len(args.models) == len(args.ratios), f"number of models must be equal to number of ratios / モデルの数と重みの数は合わせてください"
-
-    def str_to_dtype(p):
-        if p == "float":
-            return torch.float
-        if p == "fp16":
-            return torch.float16
-        if p == "bf16":
-            return torch.bfloat16
-        return None
-
-    merge_dtype = str_to_dtype(args.precision)
-    save_dtype = str_to_dtype(args.save_precision)
-    if save_dtype is None:
-        save_dtype = merge_dtype
-
-    if args.sd_model is not None:
-        print(f"loading SD model: {args.sd_model}")
-
-        text_encoder, vae, unet = model_util.load_models_from_stable_diffusion_checkpoint(args.v2, args.sd_model)
-
-        merge_to_sd_model(text_encoder, unet, args.models, args.ratios, merge_dtype)
-
-        if args.no_metadata:
-            sai_metadata = None
-        else:
-            merged_from = sai_model_spec.build_merged_from([args.sd_model] + args.models)
-            title = os.path.splitext(os.path.basename(args.save_to))[0]
-            sai_metadata = sai_model_spec.build_metadata(
-                None,
-                args.v2,
-                args.v2,
-                False,
-                False,
-                False,
-                time.time(),
-                title=title,
-                merged_from=merged_from,
-                is_stable_diffusion_ckpt=True,
-            )
-            if args.v2:
-                # TODO read sai modelspec
-                print(
-                    "Cannot determine if model is for v-prediction, so save metadata as v-prediction / modelがv-prediction用か否か不明なため、仮にv-prediction用としてmetadataを保存します"
-                )
-
-        print(f"saving SD model to: {args.save_to}")
-        model_util.save_stable_diffusion_checkpoint(
-            args.v2, args.save_to, text_encoder, unet, args.sd_model, 0, 0, sai_metadata, save_dtype, vae
-        )
-    else:
-        state_dict, metadata, v2 = merge_lora_models(args.models, args.ratios, merge_dtype, args.concat, args.shuffle)
-
-        print(f"calculating hashes and creating metadata...")
-
-        model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(state_dict, metadata)
-        metadata["sshs_model_hash"] = model_hash
-        metadata["sshs_legacy_hash"] = legacy_hash
-
-        if not args.no_metadata:
-            merged_from = sai_model_spec.build_merged_from(args.models)
-            title = os.path.splitext(os.path.basename(args.save_to))[0]
-            sai_metadata = sai_model_spec.build_metadata(
-                state_dict, v2, v2, False, True, False, time.time(), title=title, merged_from=merged_from
-            )
-            if v2:
-                # TODO read sai modelspec
-                print(
-                    "Cannot determine if LoRA is for v-prediction, so save metadata as v-prediction / LoRAがv-prediction用か否か不明なため、仮にv-prediction用としてmetadataを保存します"
-                )
-            metadata.update(sai_metadata)
-
-        print(f"saving model to: {args.save_to}")
-        save_to_file(args.save_to, state_dict, state_dict, save_dtype, metadata)
-
-
-def setup_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--v2", action="store_true", help="load Stable Diffusion v2.x model / Stable Diffusion 2.xのモデルを読み込む")
-    parser.add_argument(
-        "--save_precision",
-        type=str,
-        default=None,
-        choices=[None, "float", "fp16", "bf16"],
-        help="precision in saving, same to merging if omitted / 保存時に精度を変更して保存する、省略時はマージ時の精度と同じ",
-    )
-    parser.add_argument(
-        "--precision",
-        type=str,
-        default="float",
-        choices=["float", "fp16", "bf16"],
-        help="precision in merging (float is recommended) / マージの計算時の精度（floatを推奨）",
-    )
-    parser.add_argument(
-        "--sd_model",
-        type=str,
-        default=None,
-        help="Stable Diffusion model to load: ckpt or safetensors file, merge LoRA models if omitted / 読み込むモデル、ckptまたはsafetensors。省略時はLoRAモデル同士をマージする",
-    )
-    parser.add_argument(
-        "--save_to", type=str, default=None, help="destination file name: ckpt or safetensors file / 保存先のファイル名、ckptまたはsafetensors"
-    )
-    parser.add_argument(
-        "--models", type=str, nargs="*", help="LoRA models to merge: ckpt or safetensors file / マージするLoRAモデル、ckptまたはsafetensors"
-    )
-    parser.add_argument("--ratios", type=float, nargs="*", help="ratios for each model / それぞれのLoRAモデルの比率")
-    parser.add_argument(
-        "--no_metadata",
-        action="store_true",
-        help="do not save sai modelspec metadata (minimum ss_metadata for LoRA is saved) / "
-        + "sai modelspecのメタデータを保存しない（LoRAの最低限のss_metadataは保存される）",
-    )
-    parser.add_argument(
-        "--concat",
-        action="store_true",
-        help="concat lora instead of merge (The dim(rank) of the output LoRA is the sum of the input dims) / "
-        + "マージの代わりに結合する（LoRAのdim(rank)は入力dimの合計になる）",
-    )
-    parser.add_argument(
-        "--shuffle",
-        action="store_true",
-        help="shuffle lora weight./ "
-        + "LoRAの重みをシャッフルする",
-    )
-    
-    return parser
-
-
-if __name__ == "__main__":
-    parser = setup_parser()
-
-    args = parser.parse_args()
-    merge(args)
+    del theta_0
+    return "Done"
