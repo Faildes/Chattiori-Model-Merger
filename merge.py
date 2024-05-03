@@ -1219,7 +1219,6 @@ if mode in ["sAD", "AD", "TRS", "ST","TD","SIM","MD"]:
 
 metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
 
-loaded = None
 # check if output file already exists, ask to overwrite
 print(f"Saving as {output_file}...")
 if args.delete_source:
