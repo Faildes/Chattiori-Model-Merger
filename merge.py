@@ -547,6 +547,7 @@ def similarity_add_difference(a, b, c, alpha, beta):
 
 def dare_merge(theta0, theta1, alpha):
     rand_generator = torch.Generator()
+    m = torch.bernoulli(torch.full_like(input=theta0.float(), fill_value=p), generator=rand_generator)
     alpha = torch.mul(m, alpha / (0.5))
     return torch.lerp(theta0.float(), theta1.float(), alpha).to(theta0.dtype)
 
