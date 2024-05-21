@@ -20,6 +20,7 @@ The mode is:
 - "ST" for Sum Twice (requires model2 and beta)
 - "NoIn" for No Interporation
 - "RM" for Read Metadata
+- "DARE" for DARE Merge
 
 The ratio works as follows:
 
@@ -114,4 +115,5 @@ Run `merge.py`.
 - [s1dlx](https://github.com/s1dlx/meh) for Multiply Difference and Similarity Add Difference.
 - [hako-mikan](https://github.com/hako-mikan/sd-webui-supermerger) for Tensor Sum, Train Difference, Triple Sum, Sum twice, Smooth Add Difference, Finetuning, Cosine Merging and Elemental Merge.
 - [bbc-mc](https://github.com/bbc-mc/sdweb-merge-block-weighted-gui) for Block Weighted Merge.
+- [martyn](https://github.com/martyn/safetensors-merge-supermario) for DARE Merge.
 - Eyriewow got the merging logic in `merge.py` from [this post](https://discord.com/channels/1010980909568245801/1011008178957320282/1018117933894996038) by r_Sh4d0w, who seems to have gotten it from [mlfoundations/wise-ft](https://github.com/mlfoundations/wise-ft)
