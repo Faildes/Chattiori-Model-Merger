@@ -272,7 +272,7 @@ FINETUNES = [
 ]
 
 parser = argparse.ArgumentParser(description="Merge two or three models")
-parser.add_argument("mode", choices=["WS","AD","NoIn","MD","SIM","TRS","ST","sAD","TD","TS","SIG","GEO","MAX","RM"], help="Merging mode")
+parser.add_argument("mode", choices=["DARE","WS","AD","NoIn","MD","SIM","TRS","ST","sAD","TD","TS","SIG","GEO","MAX","RM"], help="Merging mode")
 parser.add_argument("model_path", type=str, help="Path to models")
 parser.add_argument("model_0", type=str, help="Name of model 0")
 parser.add_argument("model_1", type=str, help="Optional, Name of model 1", default=None)
@@ -314,7 +314,8 @@ real_mode = {"WS": "Weighted Sum",
 	     "SIG": "Sigmoid Merge",
 	     "GEO": "Geometric Sum",
 	     "MAX": "Max Merge",
-	     "RM": "Read Metadata"}
+	     "RM": "Read Metadata",
+             "DARE":"DARE Merge"}
 
 args = parser.parse_args()
 device = args.device
@@ -543,6 +544,11 @@ def similarity_add_difference(a, b, c, alpha, beta):
     ab_diff = a + alpha * (b - c)
     ab_sum = (1 - alpha / 2) * a + (alpha / 2) * b
     return (1 - similarity) * ab_diff + similarity * ab_sum
+
+def dare_merge(theta0, theta1, alpha):
+    rand_generator = torch.Generator()
+    alpha = torch.mul(m, alpha / (0.5))
+    return torch.lerp(theta0.float(), theta1.float(), alpha).to(theta0.dtype)
 
 def prune_model(theta, name, isxl=False):
     sd_pruned = dict()
@@ -853,7 +859,7 @@ def elementals(key,weight_index,deep,current_alpha):
 theta_funcs = {
     "WS":   (filename_weighted_sum, None, weighted_sum),
     "AD":   (filename_add_difference, get_difference, add_difference),
-    "sAD":   (filename_add_difference, get_difference, add_difference),
+    "sAD":  (filename_add_difference, get_difference, add_difference),
     "MD":   (filename_add_difference, None, multiply_difference),
     "SIM":  (filename_add_difference, None, similarity_add_difference),
     "TD":   (filename_add_difference, None, add_difference),
@@ -864,6 +870,7 @@ theta_funcs = {
     "SIG":  (filename_sigmoid, None, sigmoid),
     "GEO":  (filename_geom, None, geom),
     "MAX":  (filename_max, None, weight_max),
+    "DARE": (filename_weighted_sum, None, dare_merge)
 }
 filename_generator, theta_func1, theta_func2 = theta_funcs[mode] 
 
