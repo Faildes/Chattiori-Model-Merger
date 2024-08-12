@@ -5,6 +5,7 @@ import os
 import filelock
 import hashlib
 import re
+import argparse
 
 BLOCKID26=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
 BLOCKID17=["BASE","IN01","IN02","IN04","IN05","IN07","IN08","M00","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
@@ -63,6 +64,15 @@ suffix_conversion = {
         "conv_shortcut": "skip_connection",
     }
 }
+
+parser = argparse.ArgumentParser(description="Merge several loras to checkpoint")
+parser.add_argument("model_path", type=str, help="Path to models")
+parser.add_argument("checkpoint", type=str, help="Name of the checkpoint")
+parser.add_argument("loras", type=str, help="Path and alpha of LoRAs eg.)\"Path:alpha,Path:alpha, ...\"")
+parser.add_argument("--save_safetensors", action="store_true", help="Save as .safetensors", required=False)
+parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
+parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
+args = parser.parse_args()
 
 def convert_diffusers_name_to_compvis(key, is_sd2):
     def match(match_list, regex_text):
@@ -216,8 +226,17 @@ def load_state_dict(file_name, dtype, device = "cpu"):
     if isv2: print("SD2.X")
 
     return sd, metadata, isv2
+
+def get_loralist(string):
+    res = []
+    g = string.split(",")
+    for x in g:
+        y = x.split(":")
+        res.append(y)
+    return res
+
 cache_data = None
-def pluslora(lora_list: list,model,output,device="cpu"):
+def pluslora(lora_list: list,model,output,model_path,device="cpu"):
     cache_filename = os.path.join(model_path, "cache.json")
     def cache(subsection):
         global cache_data
@@ -297,15 +316,16 @@ def pluslora(lora_list: list,model,output,device="cpu"):
 
         return cached_sha256
     if model == []: return "ERROR: No model Selected"
-    if lora_model == []: return "ERROR: No LoRA Selected"
+    if lora_list == []: return "ERROR: No LoRA Selected"
 
     add = ""
     print("Plus LoRA start")
     import lora
 
     print(f"Loading {model}")
-    theta_0, metadata = load_model(model, device=device)
-    model_name = os.path.splitext(os.path.basename(model))[0]
+    mpath = os.path.join(model_path, model)
+    theta_0, metadata = load_model(mpath, device=device)
+    model_name = os.path.splitext(os.path.basename(mpath))[0]
     isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_0.keys()
     isv2 = "cond_stage_model.model.transformer.resblocks.0.attn.out_proj.weight" in theta_0.keys()
 
@@ -324,11 +344,15 @@ def pluslora(lora_list: list,model,output,device="cpu"):
     lh={}
     for lora_model, loraratio in lora_list:
         print(f"loading: {lora_model}")
-        loraratios=[float(x) for x in loraratio.replace(" ","").split(",")]
-        lr.append("["+",".join(loraratios)+"]")
-        
-        lora_sd, lora_metadata, lisv2 = load_state_dict(lora_model, torch.float)
-        lora_name = os.path.splitext(os.path.basename(lora_model))[0]
+        if type(loraratio) == str:
+            loraratios=[float(x) for x in loraratio.replace(" ","").split(",")]
+        else:
+            loraratios=[loraratio]*len(BLOCKID26)
+        lr.append("["+",".join(str(x) for x in loraratios)+"]")
+
+        lpath = os.path.join(model_path, lora_model)
+        lora_sd, lora_metadata, lisv2 = load_state_dict(lpath, torch.float)
+        lora_name = os.path.splitext(os.path.basename(lpath))[0]
         lora_hash = sha256_from_cache(lora_model, f"lora/{lora_name}")
         lh[lora_hash]=lora_metadata
 
@@ -404,7 +428,19 @@ def pluslora(lora_list: list,model,output,device="cpu"):
     for hs, mt in lh.items():
         new_metadata["lora"][hs] = mt
     new_metadata["lora"] = json.dumps(new_metadata["lora"])
-    safetensors.torch.save_file(theta_0, output, metadata=new_metadata)
+    print(f"Saving to {output}...")
+    if output.endswith(".safetensors"):
+        safetensors.torch.save_file(theta_0, output, metadata=new_metadata)
+    else:
+        torch.save({"state_dict": theta_0}, output)
 
     del theta_0
-    return "Done"
+    file_size = round(os.path.getsize(output) / 1073741824,2)
+    print(f"Done! ({file_size}G)")
+
+ll = get_loralist(args.loras)
+if args.save_safetensors:
+    output = os.path.join(args.model_path,f"{args.output}.safetensors")
+else:
+    output = os.path.join(args.model_path,f"{args.output}.ckpt")
+pluslora(ll,args.checkpoint,output,args.model_path,args.device)
