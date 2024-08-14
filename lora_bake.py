@@ -353,7 +353,7 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
         lpath = os.path.join(model_path, lora_model)
         lora_sd, lora_metadata, lisv2 = load_state_dict(lpath, torch.float)
         lora_name = os.path.splitext(os.path.basename(lpath))[0]
-        lora_hash = sha256_from_cache(lora_model, f"lora/{lora_name}")
+        lora_hash = sha256_from_cache(lpath, f"lora/{lora_name}")
         lh[lora_hash]=lora_metadata
 
         print(f"merging..." ,lora_model)
@@ -418,7 +418,7 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
     new_metadata = {"sd_merge_models": {}, "checkpoint": {}, "lora": {}}
     merge_recipe = {
         "type": "pluslora-chattiori", # indicate this model was merged with chattiori's model mereger
-        "checkpoint_hash": sha256_from_cache(model, f"checkpoint/{model_name}"),
+        "checkpoint_hash": sha256_from_cache(mpath, f"checkpoint/{model_name}"),
         "lora_hash": ",".join(lh.keys()),
         "alpha_info": ",".join(lr),
         "output_name": output_name,
