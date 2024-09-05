@@ -232,7 +232,7 @@ def colorcalc(cols,isxl):
     return [sum(x) for x in zip(*outs)]
 
 def fineman(fine,isxl):
-    fine = [
+    r = [
         1 - fine[0] * 0.01,
         1+ fine[0] * 0.02,
         1 - fine[1] * 0.01,
@@ -240,7 +240,7 @@ def fineman(fine,isxl):
         1 - fine[2] * 0.01,
         [fine[3]*0.02] + colorcalc(fine[4:8],isxl)
                 ]
-    return fine
+    return r
 
 def weighttoxl(weight):
     weight = weight[:9] + weight[12:22] +[0]
@@ -1115,6 +1115,11 @@ if mode != "NoIn":
           theta_0[key] = theta_func2(ad, b, c, current_alpha, current_beta)
         else:
           theta_0[key] = theta_func2(ad, b, current_alpha)
+      if any(item in key for item in FINETUNES) and fine:
+            index = FINETUNES.index(key)
+            if 5 > index : 
+                theta_0[key] =theta_0[key]* fine[index] 
+            else :theta_0[key] =theta_0[key] + torch.tensor(fine[5]).to(theta_0[key].device)
         
   for key in tqdm(theta_1.keys(), desc="Remerging..."):
         if key in checkpoint_dict_skip_on_merge:
