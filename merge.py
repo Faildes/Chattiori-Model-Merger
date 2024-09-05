@@ -1157,6 +1157,20 @@ if mode != "NoIn":
   except NameError:
     pass
 
+else:
+    isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_0.keys()
+    if args.fine is not None:
+        fine = [float(t) for t in args.fine.split(",")]
+        fine = fineman(fine,isxl)
+        for key in tqdm(theta_0.keys(), desc="Merging..."):
+            if args.vae is None and "first_stage_model" in key: continue
+            if any(item in key for item in FINETUNES) and fine:
+                index = FINETUNES.index(key)
+                if 5 > index : 
+                    theta_0[key] =theta_0[key]* fine[index] 
+                else :theta_0[key] =theta_0[key] + torch.tensor(fine[5]).to(theta_0[key].device)
+    else:
+        fine = ""
 if args.vae is not None:
     print(f"Baking in VAE: {vae_name}")
     for key in vae.keys():
