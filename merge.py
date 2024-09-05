@@ -22,7 +22,7 @@ import safetensors
 import random
 from tqdm import tqdm
 
-FINETUNEX = ["IN","OUT","OUT2","CONT","COL1","COL2","COL3"]
+FINETUNEX = ["IN","OUT","OUT2","CONT","BRI","COL1","COL2","COL3"]
 NUM_INPUT_BLOCKS = 12
 NUM_MID_BLOCK = 1
 NUM_OUTPUT_BLOCKS = 12
