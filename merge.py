@@ -293,6 +293,7 @@ parser.add_argument("--cosine1", action="store_true", help="Favors model 1's str
 parser.add_argument("--fine", type=str, help="Finetune the given keys on model 0", default=None, required=False)
 parser.add_argument("--save_half", action="store_true", help="Save as float16", required=False)
 parser.add_argument("--prune", action="store_true", help="Prune Model", required=False)
+parser.add_argument("--save_quarter", action="store_true", help="Save as float8", required=False)
 parser.add_argument("--save_safetensors", action="store_true", help="Save as .safetensors", required=False)
 parser.add_argument("--keep_ema", action="store_true", help="Keep ema", required=False)
 parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
@@ -561,7 +562,9 @@ def prune_model(theta, name, isxl=False):
                 if k_ema in theta:
                     k_in = k_ema
             if type(theta[key]) == torch.Tensor:
-              if not args.save_half and theta[key].dtype in {torch.float16, torch.float64, torch.bfloat16}:
+              if args.save_quarter and theta[key].dtype in {torch.float32, torch.float16, torch.float64, torch.bfloat16}:
+                  sd_pruned[key] = theta[k_in].to(torch.float8_e4m3fn)
+              elif not args.save_half and theta[key].dtype in {torch.float16, torch.float64, torch.bfloat16}:
                   sd_pruned[key] = theta[k_in].to(torch.float32)
               elif args.save_half and theta[key].dtype in {torch.float32, torch.float64, torch.bfloat16}:
                   sd_pruned[key] = theta[k_in].to(torch.float16)
@@ -1188,7 +1191,6 @@ if isxl:
 theta_0 = to_half_k(theta_0, args.save_half)
 if args.prune:
     theta_0 = prune_model(theta_0, "Model", isxl)
-
 # for safetensors contiguous error
 print("Check contiguous...")
 for key in theta_0.keys():
@@ -1213,6 +1215,12 @@ if args.fine is not None:
     calculate.append(f"fine[{fine}]")
 calcl = ",".join(calculate) if calculate != [] else None
 
+if args.save_quarter:
+    fp = "fp8"
+elif args.save_half:
+    fp = "fp16"
+else:
+    fp = "fp32"
 merge_recipe = {
 "type": "merge-models-chattiori", # indicate this model was merged with chattiori's model mereger
 "primary_model_hash": model_0_sha256,
@@ -1223,7 +1231,7 @@ merge_recipe = {
 "alpha_info": alpha_info if alpha_info != "" else None,
 "beta_info": beta_info if beta_info != "" else None,
 "calculation": calcl,
-"save_as_half": args.save_half,
+"fp": fp,
 "output_name": output_name,
 "bake_in_vae": vae_name if args.vae is not None else False,
 "pruned": args.prune
