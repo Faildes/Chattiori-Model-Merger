@@ -6,6 +6,9 @@ import filelock
 import hashlib
 import re
 import argparse
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+import torch.nn.functional as F
 
 BLOCKID26=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
 BLOCKID17=["BASE","IN01","IN02","IN04","IN05","IN07","IN08","M00","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
@@ -69,6 +72,7 @@ parser = argparse.ArgumentParser(description="Merge several loras to checkpoint"
 parser.add_argument("model_path", type=str, help="Path to models")
 parser.add_argument("checkpoint", type=str, help="Name of the checkpoint")
 parser.add_argument("loras", type=str, help="Path and alpha of LoRAs eg.)\"Path:alpha,Path:alpha, ...\"")
+parser.add_argument("--dare", action="store_true", help="Use DARE Merge")
 parser.add_argument("--save_safetensors", action="store_true", help="Save as .safetensors", required=False)
 parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
@@ -234,6 +238,87 @@ def get_loralist(string):
         y = x.split(":")
         res.append(y)
     return res
+
+def _L2Normalize(v, eps=1e-12):
+    return v/(torch.norm(v) + eps)
+
+def spectral_norm(W, u=None, Num_iter=10):
+    '''
+    Spectral Norm of a Matrix is its maximum singular value.
+    This function employs the Power iteration procedure to
+    compute the maximum singular value.
+    ---------------------
+    :param W: Input(weight) matrix - autograd.variable
+    :param u: Some initial random vector - FloatTensor
+    :param Num_iter: Number of Power Iterations
+    :return: Spectral Norm of W, orthogonal vector _u
+    '''
+    if not Num_iter >= 1:
+        raise ValueError("Power iteration must be a positive integer")
+    if u is None:
+        u = torch.FloatTensor(1, W.size(0)).normal_(0,1).cuda()
+    W = W.to(u.device).type(torch.FloatTensor)
+    # Power iteration
+    wdata = W.data.to(u.device)
+    for _ in range(Num_iter):
+        wdata = wdata.view(u.shape[-1],-1)
+        v = _L2Normalize(torch.matmul(u, wdata))
+        u = _L2Normalize(torch.matmul(v, torch.transpose(wdata,0, 1)))
+    sigma = torch.sum(F.linear(u, torch.transpose(wdata, 0,1)) * v)
+    return sigma, u
+
+def apply_dare(delta, p):
+    # Generate the mask m^t from Bernoulli distribution
+    m = torch.bernoulli(torch.full(delta.shape, p)).to(delta.dtype)
+    # Apply the mask to the delta to get δ̃^t
+    delta_tilde = m * delta
+    # Scale the masked delta by the dropout rate to get δ̂^t
+    delta_hat = delta_tilde / (1 - p)
+    return delta_hat
+
+def apply_spectral_norm(lora_weights, scale):
+    lips = []
+    for key in lora_weights.keys():
+        if "alpha" in key:
+            continue
+        name = key.split(".")[0]
+        sn = spectral_norm(lora_weights[key])[0].cpu()
+        lips.append(sn)
+
+    sn = max(lips)
+    #print("Regularizing lipschitz ", sn, "to", scale)
+    for key in lora_weights.keys():
+        if("alpha" not in key):
+            lora_weights[key] *= scale / sn
+
+    return lora_weights
+
+def merge_weights(lora, isv2, isxl, p, lambda_val, scale, strengths, count_merged):
+    merged_tensors = {}
+    keys = set(lora.keys())
+
+    for key in keys:
+        strength = strengths[0]
+        import lora
+        fullkey = convert_diffusers_name_to_compvis(key,isv2)
+        msd_key = fullkey.split(".", 1)[0]
+        if isxl:
+            if "lora_unet" in msd_key:
+                msd_key = msd_key.replace("lora_unet", "diffusion_model")
+            elif "lora_te1_text_model" in msd_key:
+                msd_key = msd_key.replace("lora_te1_text_model", "0_transformer_text_model")
+
+        for i,block in enumerate(LBLOCKS26):
+            if block in fullkey or block in msd_key:
+                try:
+                    strength = strengths[i]
+                except:
+                    strength = strengths[0]
+        diff = strength * lambda_val * apply_dare(lora[key], p)
+        merged_tensors[key] = diff
+        name = key.split(".")[0]
+
+    return merged_tensors
 
 cache_data = None
 def pluslora(lora_list: list,model,output,model_path,device="cpu"):
@@ -438,9 +523,219 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
     file_size = round(os.path.getsize(output) / 1073741824,2)
     print(f"Done! ({file_size}G)")
 
+def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
+    cache_filename = os.path.join(model_path, "cache.json")
+    def cache(subsection):
+        global cache_data
+        if cache_data is None:
+            with filelock.FileLock(f"{cache_filename}.lock"):
+                if not os.path.isfile(cache_filename):
+                    cache_data = {}
+                else:
+                    with open(cache_filename, "r", encoding="utf8") as file:
+                        cache_data = json.load(file)
+
+        s = cache_data.get(subsection, {})
+        cache_data[subsection] = s
+
+        return s
+
+    def dump_cache():
+        with filelock.FileLock(f"{cache_filename}.lock"):
+            with open(cache_filename, "w", encoding="utf8") as file:
+                json.dump(cache_data, file, indent=4)
+
+    def sha256(filename, title):
+        hashes = cache("hashes")
+
+        sha256_value = sha256_from_cache(filename, title, 1)
+        if sha256_value is not None:
+            return sha256_value
+
+        print(f"Calculating sha256 for {filename}: ", end='')
+        sha256_value = calculate_sha256(filename)
+        print(f"{sha256_value}")
+
+        hashes[title] = {
+            "mtime": os.path.getmtime(filename),
+            "sha256": sha256_value,
+        }
+
+        dump_cache()
+
+        return sha256_value
+
+    def calculate_shorthash(filename):
+        sha256 = sha256(filename, f"checkpoint/{os.path.splitext(os.path.basename(filename))[0]}")
+        if sha256 is None:
+            return
+
+        shorthash = sha256[0:10]
+
+        return shorthash
+
+    def calculate_sha256(filename):
+        hash_sha256 = hashlib.sha256()
+        blksize = 1024 * 1024
+
+        with open(filename, "rb") as f:
+            for chunk in iter(lambda: f.read(blksize), b""):
+                hash_sha256.update(chunk)
+
+        return hash_sha256.hexdigest()
+
+
+    def sha256_from_cache(filename, title, par = 0):
+        hashes = cache("hashes")
+        ondisk_mtime = os.path.getmtime(filename)
+
+        if title not in hashes:
+          if par == 0:
+            sh = sha256(filename, title)
+          else:
+            return None
+
+        cached_sha256 = hashes[title].get("sha256", None)
+        cached_mtime = hashes[title].get("mtime", 0)
+
+        if ondisk_mtime > cached_mtime or cached_sha256 is None:
+            return None
+
+        return cached_sha256
+    if model == []: return "ERROR: No model Selected"
+    if lora_list == []: return "ERROR: No LoRA Selected"
+
+    add = ""
+    print("Plus LoRA start")
+    import lora
+
+    print(f"Loading {model}")
+    mpath = os.path.join(model_path, model)
+    theta_0, metadata = load_model(mpath, device=device)
+    model_name = os.path.splitext(os.path.basename(mpath))[0]
+    isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_0.keys()
+    isv2 = "cond_stage_model.model.transformer.resblocks.0.attn.out_proj.weight" in theta_0.keys()
+
+    keychanger = {}
+    for key in theta_0.keys():
+        if "model" in key:
+            skey = key.replace(".","_").replace("_weight","")
+            if "conditioner_embedders_" in skey:
+                keychanger[skey.split("conditioner_embedders_",1)[1]] = key
+            else:
+                if "wrapped" in skey:
+                    keychanger[skey.split("wrapped_",1)[1]] = key
+                else:
+                    keychanger[skey.split("model_",1)[1]] = key
+    lr=[]
+    lh={}
+    main_weights = {}
+    main_sd, main_meta, mlv2 = load_state_dict(mainlora, torch.float)
+    lambda_val = 1.5
+    p = 0.13
+    scale = 0.2
+    torch.manual_seed(0)
+    for key in main_sd.keys():
+        main_weights[key]=torch.zeros_like(main_sd[key])
+    for lora_model, loraratio in lora_list:
+        print(f"loading: {lora_model}")
+        if type(loraratio) == str:
+            loraratios=[float(x) for x in loraratio.replace(" ","").split(",")]
+        else:
+            loraratios=[loraratio]*len(BLOCKID26)
+        lr.append("["+",".join(str(x) for x in loraratios)+"]")
+
+        lpath = os.path.join(model_path, lora_model)
+        lora_sd, lora_metadata, lisv2 = load_state_dict(lpath, torch.float)
+        lora_name = os.path.splitext(os.path.basename(lpath))[0]
+        lora_hash = sha256_from_cache(lpath, f"lora/{lora_name}")
+        lh[lora_hash]=lora_metadata
+
+        print(f"merging..." ,lora_model)
+        lora_weights = merge_weights(lora_sd, lisv2, isxl, p, lambda_val, 1, loraratios, len(lora_list))
+        for key in main_sd.keys():
+            main_sd[key] += lora_weights[key]
+    if scale > 0:
+        main_sd = apply_spectral_norm(main_sd, scale)
+    for key in main_sd.keys():
+        if("alpha" in key):
+            main_sd[key]=torch.ones_like(main_sd[key])
+    for key in main_sd.keys():
+        fullkey = convert_diffusers_name_to_compvis(key,mlv2)
+        #print(fullkey)
+        msd_key = fullkey.split(".", 1)[0]
+        if isxl:
+            if "lora_unet" in msd_key:
+                msd_key = msd_key.replace("lora_unet", "diffusion_model")
+            elif "lora_te1_text_model" in msd_key:
+                msd_key = msd_key.replace("lora_te1_text_model", "0_transformer_text_model")
+        if msd_key not in keychanger.keys():
+              continue
+        if "lora_down" in key:
+            up_key = key.replace("lora_down", "lora_up")
+            alpha_key = key[:key.index("lora_down")] + 'alpha'
+
+            # print(f"apply {key} to {module}")
+
+            down_weight = main_sd[key].to(device="cpu")
+            up_weight = main_sd[up_key].to(device="cpu")
+
+            dim = down_weight.size()[0]
+            alpha = main_sd.get(alpha_key, dim)
+            sc = alpha / dim
+            # W <- W + U * D
+            
+            weight = theta_0[keychanger[msd_key]].to(device="cpu")
+
+            if len(weight.size()) == 2:
+                # linear
+                weight = weight + (up_weight @ down_weight) * sc
+
+            elif down_weight.size()[2:4] == (1, 1):
+                # conv2d 1x1
+                weight = (
+                    weight
+                    + (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+                    * sc
+                )
+            else:
+                # conv2d 3x3
+                conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
+                # print(conved.size(), weight.size(), module.stride, module.padding)
+                weight = weight + conved * sc
+            theta_0[keychanger[msd_key]] = torch.nn.Parameter(weight)
+    #usemodelgen(theta_0,model)
+    output_name = os.path.splitext(os.path.basename(output))[0]
+    new_metadata = {"sd_merge_models": {}, "checkpoint": {}, "lora": {}}
+    merge_recipe = {
+        "type": "pluslora-chattiori", # indicate this model was merged with chattiori's model mereger
+        "checkpoint_hash": sha256_from_cache(mpath, f"checkpoint/{model_name}"),
+        "lora_hash": ",".join(lh.keys()),
+        "alpha_info": "DARE:" + ",".join(lr),
+        "output_name": output_name,
+        }
+    new_metadata["sd_merge_models"] = json.dumps(merge_recipe)
+    new_metadata["checkpoint"] = json.dumps(metadata)
+    for hs, mt in lh.items():
+        new_metadata["lora"][hs] = mt
+    new_metadata["lora"] = json.dumps(new_metadata["lora"])
+    print(f"Saving to {output}...")
+    if output.endswith(".safetensors"):
+        safetensors.torch.save_file(theta_0, output, metadata=new_metadata)
+    else:
+        torch.save({"state_dict": theta_0}, output)
+
+    del theta_0
+    file_size = round(os.path.getsize(output) / 1073741824,2)
+    print(f"Done! ({file_size}G)")
+
 ll = get_loralist(args.loras)
 if args.save_safetensors:
     output = os.path.join(args.model_path,f"{args.output}.safetensors")
 else:
     output = os.path.join(args.model_path,f"{args.output}.ckpt")
-pluslora(ll,args.checkpoint,output,args.model_path,args.device)
+if args.dare:
+    mainlora = os.path.join(args.model_path, ll[0][0])
+    darelora(mainlora, ll, args.checkpoint,output,args.model_path,args.device)
+else:
+    pluslora(ll,args.checkpoint,output,args.model_path,args.device)
