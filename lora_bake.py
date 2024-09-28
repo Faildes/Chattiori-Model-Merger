@@ -469,7 +469,10 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
                 alpha_key = key[:key.index("lora_down")] + 'alpha'
 
                 # print(f"apply {key} to {module}")
-
+                try:
+                    lora_sd[key]
+                except:
+                    continue
                 down_weight = lora_sd[key].to(device="cpu")
                 up_weight = lora_sd[up_key].to(device="cpu")
 
