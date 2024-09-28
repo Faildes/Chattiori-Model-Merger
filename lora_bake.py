@@ -653,14 +653,14 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
 
         print(f"merging..." ,lora_model)
         lora_weights = merge_weights(lora_sd, lisv2, isxl, p, lambda_val, 1, loraratios, len(lora_list))
-        for key in main_sd.keys():
-            main_sd[key] += lora_weights[key]
+        for key in main_weights.keys():
+            main_weights[key] += lora_weights[key]
     if scale > 0:
-        main_sd = apply_spectral_norm(main_sd, scale)
-    for key in main_sd.keys():
+        main_weights = apply_spectral_norm(main_weights, scale)
+    for key in main_weights.keys():
         if("alpha" in key):
-            main_sd[key]=torch.ones_like(main_sd[key])
-    for key in main_sd.keys():
+            main_weights[key]=torch.ones_like(main_weights[key])
+    for key in main_weights.keys():
         fullkey = convert_diffusers_name_to_compvis(key,mlv2)
         #print(fullkey)
         msd_key = fullkey.split(".", 1)[0]
@@ -677,11 +677,11 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
 
             # print(f"apply {key} to {module}")
 
-            down_weight = main_sd[key].to(device="cpu")
-            up_weight = main_sd[up_key].to(device="cpu")
+            down_weight = main_weights[key].to(device="cpu")
+            up_weight = main_weights[up_key].to(device="cpu")
 
             dim = down_weight.size()[0]
-            alpha = main_sd.get(alpha_key, dim)
+            alpha = main_weights.get(alpha_key, dim)
             sc = alpha / dim
             # W <- W + U * D
             
