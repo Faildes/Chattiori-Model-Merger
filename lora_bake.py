@@ -314,6 +314,7 @@ def merge_weights(lora, isv2, isxl, p, lambda_val, scale, strengths, count_merge
                     strength = strengths[i]
                 except:
                     strength = strengths[0]
+        print(lora[key])
         diff = strength * lambda_val * apply_dare(lora[key], p)
         merged_tensors[key] = diff
         name = key.split(".")[0]
