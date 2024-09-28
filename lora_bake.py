@@ -653,61 +653,52 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
 
         print(f"merging..." ,lora_model)
         lora_weights = merge_weights(lora_sd, lisv2, isxl, p, lambda_val, 1, loraratios, len(lora_list))
+        if scale > 0:
+            lora_weights = apply_spectral_norm(lora_weights, scale)
         for key in main_weights.keys():
-            try:
-                main_weights[key] += lora_weights[key]
-            except:
-                print(key)
-                main_weights[key] += lora_weights[key]
-    if scale > 0:
-        main_weights = apply_spectral_norm(main_weights, scale)
-    for key in main_weights.keys():
-        if("alpha" in key):
-            main_weights[key]=torch.ones_like(main_weights[key])
-    for key in main_weights.keys():
-        fullkey = convert_diffusers_name_to_compvis(key,mlv2)
-        #print(fullkey)
-        msd_key = fullkey.split(".", 1)[0]
-        if isxl:
-            if "lora_unet" in msd_key:
-                msd_key = msd_key.replace("lora_unet", "diffusion_model")
-            elif "lora_te1_text_model" in msd_key:
-                msd_key = msd_key.replace("lora_te1_text_model", "0_transformer_text_model")
-        if msd_key not in keychanger.keys():
-              continue
-        if "lora_down" in key:
-            up_key = key.replace("lora_down", "lora_up")
-            alpha_key = key[:key.index("lora_down")] + 'alpha'
+            fullkey = convert_diffusers_name_to_compvis(key,mlv2)
+            #print(fullkey)
+            msd_key = fullkey.split(".", 1)[0]
+            if isxl:
+                if "lora_unet" in msd_key:
+                    msd_key = msd_key.replace("lora_unet", "diffusion_model")
+                elif "lora_te1_text_model" in msd_key:
+                    msd_key = msd_key.replace("lora_te1_text_model", "0_transformer_text_model")
+            if msd_key not in keychanger.keys():
+                  continue
+            if "lora_down" in key:
+                up_key = key.replace("lora_down", "lora_up")
+                alpha_key = key[:key.index("lora_down")] + 'alpha'
 
-            # print(f"apply {key} to {module}")
+                # print(f"apply {key} to {module}")
 
-            down_weight = main_weights[key].to(device="cpu")
-            up_weight = main_weights[up_key].to(device="cpu")
+                down_weight = lora_weights[key].to(device="cpu")
+                up_weight = lora_weights[key].to(device="cpu")
 
-            dim = down_weight.size()[0]
-            alpha = main_weights.get(alpha_key, dim)
-            sc = alpha / dim
-            # W <- W + U * D
-            
-            weight = theta_0[keychanger[msd_key]].to(device="cpu")
+                dim = down_weight.size()[0]
+                alpha = lora_weights.get(alpha_key, dim)
+                sc = alpha / dim
+                # W <- W + U * D
+                
+                weight = theta_0[keychanger[msd_key]].to(device="cpu")
 
-            if len(weight.size()) == 2:
-                # linear
-                weight = weight + (up_weight @ down_weight) * sc
+                if len(weight.size()) == 2:
+                    # linear
+                    weight = weight + (up_weight @ down_weight) * sc
 
-            elif down_weight.size()[2:4] == (1, 1):
-                # conv2d 1x1
-                weight = (
-                    weight
-                    + (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
-                    * sc
-                )
-            else:
-                # conv2d 3x3
-                conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
-                # print(conved.size(), weight.size(), module.stride, module.padding)
-                weight = weight + conved * sc
-            theta_0[keychanger[msd_key]] = torch.nn.Parameter(weight)
+                elif down_weight.size()[2:4] == (1, 1):
+                    # conv2d 1x1
+                    weight = (
+                        weight
+                        + (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+                        * sc
+                    )
+                else:
+                    # conv2d 3x3
+                    conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
+                    # print(conved.size(), weight.size(), module.stride, module.padding)
+                    weight = weight + conved * sc
+                theta_0[keychanger[msd_key]] = torch.nn.Parameter(weight)
     #usemodelgen(theta_0,model)
     output_name = os.path.splitext(os.path.basename(output))[0]
     new_metadata = {"sd_merge_models": {}, "checkpoint": {}, "lora": {}}
