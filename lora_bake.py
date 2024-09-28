@@ -669,7 +669,9 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
                 elif "lora_te1_text_model" in msd_key:
                     msd_key = msd_key.replace("lora_te1_text_model", "0_transformer_text_model")
             if msd_key not in keychanger.keys():
-                  continue
+                continue
+            if key not in lora_weights.keys():
+                continue
             if "lora_down" in key:
                 up_key = key.replace("lora_down", "lora_up")
                 alpha_key = key[:key.index("lora_down")] + 'alpha'
