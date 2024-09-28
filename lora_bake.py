@@ -302,6 +302,8 @@ def merge_weights(lora, isv2, isxl, p, lambda_val, scale, strengths, count_merge
         strength = strengths[0]
         fullkey = convert_diffusers_name_to_compvis(key,isv2)
         msd_key = fullkey.split(".", 1)[0]
+        if 'alpha' in key:
+            continue
         if isxl:
             if "lora_unet" in msd_key:
                 msd_key = msd_key.replace("lora_unet", "diffusion_model")
