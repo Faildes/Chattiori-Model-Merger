@@ -212,7 +212,7 @@ def load_metadata_from_safetensors(safetensors_file: str) -> dict:
         metadata = {}
     return metadata
 
-def load_state_dict(file_name, dtype, device = "cpu"):
+def load_state_dict(file_name, dtype, device = "cpu", depatch=True):
     if os.path.splitext(file_name)[1] == ".safetensors":
         sd = safetensors.torch.load_file(file_name,device=device)
         metadata = load_metadata_from_safetensors(file_name)
@@ -223,10 +223,10 @@ def load_state_dict(file_name, dtype, device = "cpu"):
     isv2 = False
 
     for key in list(sd.keys()):
-        if type(sd[key]) == torch.Tensor:
+        if type(sd[key]) == torch.Tensor and depatch:
             sd[key] = sd[key].to(dtype = dtype, device = device)
-            if "resblocks" in key:
-                isv2 = True
+        if "resblocks" in key:
+            isv2 = True
 
     if isv2: print("SD2.X")
 
@@ -606,7 +606,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     if lora_list == []: return "ERROR: No LoRA Selected"
 
     add = ""
-    print("Plus LoRA start")
+    print("Plus LoRA DARE start")
     import lora
 
     print(f"Loading {model}")
@@ -630,7 +630,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     lr=[]
     lh={}
     main_weights = {}
-    main_sd, main_meta, mlv2 = load_state_dict(mainlora, torch.float)
+    main_sd, main_meta, mlv2 = load_state_dict(mainlora, torch.float, depatch=False)
     lambda_val = 1.5
     p = 0.13
     scale = 0.2
@@ -646,7 +646,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
         lr.append("["+",".join(str(x) for x in loraratios)+"]")
 
         lpath = os.path.join(model_path, lora_model)
-        lora_sd, lora_metadata, lisv2 = load_state_dict(lpath, torch.float)
+        lora_sd, lora_metadata, lisv2 = load_state_dict(lpath, torch.float, depatch=False)
         lora_name = os.path.splitext(os.path.basename(lpath))[0]
         lora_hash = sha256_from_cache(lpath, f"lora/{lora_name}")
         lh[lora_hash]=lora_metadata
