@@ -673,7 +673,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
                 # print(f"apply {key} to {module}")
 
                 down_weight = lora_weights[key].to(device="cpu")
-                up_weight = lora_weights[key].to(device="cpu")
+                up_weight = lora_weights[up_key].to(device="cpu")
 
                 dim = down_weight.size()[0]
                 alpha = lora_weights.get(alpha_key, dim)
