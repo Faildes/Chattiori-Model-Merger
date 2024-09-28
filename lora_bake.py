@@ -302,8 +302,6 @@ def merge_weights(lora, isv2, isxl, p, lambda_val, scale, strengths, count_merge
         strength = strengths[0]
         fullkey = convert_diffusers_name_to_compvis(key,isv2)
         msd_key = fullkey.split(".", 1)[0]
-        if 'alpha' in key:
-            continue
         if isxl:
             if "lora_unet" in msd_key:
                 msd_key = msd_key.replace("lora_unet", "diffusion_model")
@@ -656,7 +654,11 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
         print(f"merging..." ,lora_model)
         lora_weights = merge_weights(lora_sd, lisv2, isxl, p, lambda_val, 1, loraratios, len(lora_list))
         for key in main_weights.keys():
-            main_weights[key] += lora_weights[key]
+            try:
+                main_weights[key] += lora_weights[key]
+            except:
+                print(key)
+                main_weights[key] += lora_weights[key]
     if scale > 0:
         main_weights = apply_spectral_norm(main_weights, scale)
     for key in main_weights.keys():
