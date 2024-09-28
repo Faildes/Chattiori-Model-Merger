@@ -9,6 +9,7 @@ import argparse
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import torch.nn.functional as F
+from tqdm import tqdm
 
 BLOCKID26=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
 BLOCKID17=["BASE","IN01","IN02","IN04","IN05","IN07","IN08","M00","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
@@ -658,7 +659,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
         lora_weights = merge_weights(lora_sd, lisv2, isxl, p, lambda_val, 1, loraratios, len(lora_list))
         if scale > 0:
             lora_weights = apply_spectral_norm(lora_weights, scale)
-        for key in main_weights.keys():
+        for key in tqdm(main_weights.keys(), desc=f"Merging {lora_model}..."):
             fullkey = convert_diffusers_name_to_compvis(key,mlv2)
             #print(fullkey)
             msd_key = fullkey.split(".", 1)[0]
