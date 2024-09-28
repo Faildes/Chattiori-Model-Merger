@@ -79,6 +79,7 @@ parser.add_argument("--device", type=str, help="Device to use, defaults to cpu",
 args = parser.parse_args()
 
 def convert_diffusers_name_to_compvis(key, is_sd2):
+    import lora
     def match(match_list, regex_text):
         regex = re_compiled.get(regex_text)
         if regex is None:
@@ -299,7 +300,6 @@ def merge_weights(lora, isv2, isxl, p, lambda_val, scale, strengths, count_merge
 
     for key in keys:
         strength = strengths[0]
-        import lora
         fullkey = convert_diffusers_name_to_compvis(key,isv2)
         msd_key = fullkey.split(".", 1)[0]
         if isxl:
@@ -314,7 +314,6 @@ def merge_weights(lora, isv2, isxl, p, lambda_val, scale, strengths, count_merge
                     strength = strengths[i]
                 except:
                     strength = strengths[0]
-        print(lora[key])
         diff = strength * lambda_val * apply_dare(lora[key], p)
         merged_tensors[key] = diff
         name = key.split(".")[0]
