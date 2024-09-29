@@ -1191,8 +1191,7 @@ theta_0 = to_half_k(theta_0, args.save_half)
 if args.prune:
     theta_0 = prune_model(theta_0, "Model", isxl)
 # for safetensors contiguous error
-print("Check contiguous...")
-for key in theta_0.keys():
+for key in tqdm(theta_0.keys(), desc="Check contiguous..."):
     v = theta_0[key]
     v = v.contiguous()
     theta_0[key] = v 
