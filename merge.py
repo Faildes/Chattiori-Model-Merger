@@ -1165,7 +1165,7 @@ else:
     if args.fine is not None:
         fine = [float(t) for t in args.fine.split(",")]
         fine = fineman(fine,isxl)
-        for key in tqdm(theta_0.keys(), desc="Merging..."):
+        for key in tqdm(theta_0.keys(), desc="Fine Tuning ..."):
             if args.vae is None and "first_stage_model" in key: continue
             if any(item in key for item in FINETUNES) and fine:
                 index = FINETUNES.index(key)
@@ -1175,8 +1175,7 @@ else:
     else:
         fine = ""
 if args.vae is not None:
-    print(f"Baking in VAE: {vae_name}")
-    for key in vae.keys():
+    for key in tqdm(vae.keys(), desc=f"Baking in VAE[{vae_name}] ..."):
         theta_0_key = 'first_stage_model.' + key
         if theta_0_key in theta_0:
             theta_0[theta_0_key] = to_half(vae[key], args.save_half)
