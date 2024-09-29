@@ -73,11 +73,38 @@ parser = argparse.ArgumentParser(description="Merge several loras to checkpoint"
 parser.add_argument("model_path", type=str, help="Path to models")
 parser.add_argument("checkpoint", type=str, help="Name of the checkpoint")
 parser.add_argument("loras", type=str, help="Path and alpha of LoRAs eg.)\"Path:alpha,Path:alpha, ...\"")
+parser.add_argument("--save_half", action="store_true", help="Save as float16", required=False)
+parser.add_argument("--prune", action="store_true", help="Prune Model", required=False)
+parser.add_argument("--save_quarter", action="store_true", help="Save as float8", required=False)
+parser.add_argument("--keep_ema", action="store_true", help="Keep ema", required=False)
 parser.add_argument("--dare", action="store_true", help="Use DARE Merge")
 parser.add_argument("--save_safetensors", action="store_true", help="Save as .safetensors", required=False)
 parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
 args = parser.parse_args()
+
+def prune_model(theta, name, isxl=False):
+    sd_pruned = dict()
+    for key in tqdm(theta.keys(), desc=f"Pruning {name}..."):
+        cp = key.startswith('model.diffusion_model.') or key.startswith('depth_model.') or key.startswith('first_stage_model.') or key.startswith("conditioner." if isxl else 'cond_stage_model.')
+        if cp:
+            k_in = key
+            if args.keep_ema:
+                k_ema = 'model_ema.' + key[6:].replace('.', '')
+                if k_ema in theta:
+                    k_in = k_ema
+            if type(theta[key]) == torch.Tensor:
+                if args.save_quarter and theta[key].dtype in {torch.float32, torch.float16, torch.float64, torch.bfloat16}:
+                    sd_pruned[key] = theta[k_in].to(torch.float8_e4m3fn)
+                elif not args.save_half and theta[key].dtype in {torch.float16, torch.float64, torch.bfloat16}:
+                    sd_pruned[key] = theta[k_in].to(torch.float32)
+                elif args.save_half and theta[key].dtype in {torch.float32, torch.float64, torch.bfloat16}:
+                    sd_pruned[key] = theta[k_in].to(torch.float16)
+                else:
+                    sd_pruned[key] = theta[k_in]
+            else:
+                sd_pruned[key] = theta[k_in]      
+    return sd_pruned
 
 def convert_diffusers_name_to_compvis(key, is_sd2):
     import lora
@@ -516,6 +543,12 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
     for hs, mt in lh.items():
         new_metadata["lora"][hs] = mt
     new_metadata["lora"] = json.dumps(new_metadata["lora"])
+    theta_0 = prune_model(theta_0, "Model", isxl)
+    # for safetensors contiguous error
+    for key in tqdm(theta_0.keys(), desc="Check contiguous..."):
+        v = theta_0[key]
+        v = v.contiguous()
+        theta_0[key] = v 
     print(f"Saving as {output}...")
     if output.endswith(".safetensors"):
         safetensors.torch.save_file(theta_0, output, metadata=new_metadata)
@@ -718,6 +751,12 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     for hs, mt in lh.items():
         new_metadata["lora"][hs] = mt
     new_metadata["lora"] = json.dumps(new_metadata["lora"])
+    theta_0 = prune_model(theta_0, "Model", isxl)
+    # for safetensors contiguous error
+    for key in tqdm(theta_0.keys(), desc="Check contiguous..."):
+        v = theta_0[key]
+        v = v.contiguous()
+        theta_0[key] = v 
     print(f"Saving as {output}...")
     if output.endswith(".safetensors"):
         safetensors.torch.save_file(theta_0, output, metadata=new_metadata)
