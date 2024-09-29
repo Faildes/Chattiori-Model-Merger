@@ -442,8 +442,7 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
         lora_hash = sha256_from_cache(lpath, f"lora/{lora_name}")
         lh[lora_hash]=lora_metadata
 
-        print(f"merging..." ,lora_model)
-        for key in lora_sd.keys():
+        for key in tqdm(lora_sd.keys(), desc=f"Merging {lora_model}..."):
             
             ratio = loraratios[0]
 
@@ -517,7 +516,7 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
     for hs, mt in lh.items():
         new_metadata["lora"][hs] = mt
     new_metadata["lora"] = json.dumps(new_metadata["lora"])
-    print(f"Saving to {output}...")
+    print(f"Saving as {output}...")
     if output.endswith(".safetensors"):
         safetensors.torch.save_file(theta_0, output, metadata=new_metadata)
     else:
@@ -655,7 +654,6 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
         lora_hash = sha256_from_cache(lpath, f"lora/{lora_name}")
         lh[lora_hash]=lora_metadata
 
-        print(f"merging..." ,lora_model)
         lora_weights = merge_weights(lora_sd, lisv2, isxl, p, lambda_val, 1, loraratios, len(lora_list))
         if scale > 0:
             lora_weights = apply_spectral_norm(lora_weights, scale)
@@ -720,7 +718,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     for hs, mt in lh.items():
         new_metadata["lora"][hs] = mt
     new_metadata["lora"] = json.dumps(new_metadata["lora"])
-    print(f"Saving to {output}...")
+    print(f"Saving as {output}...")
     if output.endswith(".safetensors"):
         safetensors.torch.save_file(theta_0, output, metadata=new_metadata)
     else:
