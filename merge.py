@@ -862,22 +862,22 @@ def elementals(key,weight_index,deep,current_alpha):
     return current_alpha
 
 theta_funcs = {
-    "WS":   (filename_weighted_sum, None, weighted_sum),
-    "AD":   (filename_add_difference, get_difference, add_difference),
-    "sAD":  (filename_add_difference, get_difference, add_difference),
-    "MD":   (filename_add_difference, None, multiply_difference),
-    "SIM":  (filename_add_difference, None, similarity_add_difference),
-    "TD":   (filename_add_difference, None, add_difference),
-    "TS":   (filename_weighted_sum, None, weighted_sum),
-    "TRS":  (filename_triple_sum, None, triple_sum),
-    "ST":   (filename_sum_twice, None, sum_twice),
-    "NoIn": (filename_nothing, None, None),
-    "SIG":  (filename_sigmoid, None, sigmoid),
-    "GEO":  (filename_geom, None, geom),
-    "MAX":  (filename_max, None, weight_max),
-    "DARE": (filename_weighted_sum, None, dare_merge)
+    "WS":   (filename_weighted_sum, None, weighted_sum,"Weighted Sum"),
+    "AD":   (filename_add_difference, get_difference, add_difference, "Add Difference"),
+    "sAD":  (filename_add_difference, get_difference, add_difference, "Smooth Add Difference"),
+    "MD":   (filename_add_difference, None, multiply_difference, "Multiply Difference"),
+    "SIM":  (filename_add_difference, None, similarity_add_difference, "Similarity Add Difference"),
+    "TD":   (filename_add_difference, None, add_difference, "Training Difference"),
+    "TS":   (filename_weighted_sum, None, weighted_sum, "Tensor Sum"),
+    "TRS":  (filename_triple_sum, None, triple_sum, "Triple Sum"),
+    "ST":   (filename_sum_twice, None, sum_twice, "Sum Twice"),
+    "NoIn": (filename_nothing, None, None, "No Interpolation"),
+    "SIG":  (filename_sigmoid, None, sigmoid, "Sigmoid"),
+    "GEO":  (filename_geom, None, geom, "Geometric"),
+    "MAX":  (filename_max, None, weight_max, "Max"),
+    "DARE": (filename_weighted_sum, None, dare_merge, "DARE")
 }
-filename_generator, theta_func1, theta_func2 = theta_funcs[mode] 
+filename_generator, theta_func1, theta_func2, merge_name = theta_funcs[mode] 
 
 if theta_func1:
   for key in tqdm(theta_1.keys(), desc="Getting Difference of Model 1 and 2"):
@@ -981,7 +981,7 @@ if mode != "NoIn":
             print(f"beta weight converted for XL{weights_b}")
     if len(weights_a) == 19: weights_a = weights_a + [0]
     if usebeta and len(weights_b) == 19: weights_b = weights_b + [0]
-  for key in tqdm(theta_0.keys(), desc="Merging..."):
+  for key in tqdm(theta_0.keys(), desc=f"{merge_name} Merging..."):
     if args.vae is None and "first_stage_model" in key: continue
     if theta_1 and "model" in key and key in theta_1:    
       if (usebeta or mode == "TD") and not key in theta_2:
