@@ -20,7 +20,7 @@ import shutil
 import safetensors.torch
 import safetensors
 import random
-from tq import tqdm
+from tqdm.auto import tqdm
 
 FINETUNEX = ["IN","OUT","OUT2","CONT","BRI","COL1","COL2","COL3"]
 NUM_INPUT_BLOCKS = 12
@@ -553,8 +553,7 @@ def dare_merge(theta0, theta1, alpha):
 
 def prune_model(theta, name, isxl=False):
     sd_pruned = dict()
-    pr = tqdm(theta.keys(), desc=f"Pruning {name}...")
-    for key in pr:
+    for key in tqdm(theta.keys(), desc=f"Pruning {name}..."):
         cp = key.startswith('model.diffusion_model.') or key.startswith('depth_model.') or key.startswith('first_stage_model.') or key.startswith("conditioner." if isxl else 'cond_stage_model.')
         if cp:
             k_in = key
@@ -881,8 +880,7 @@ theta_funcs = {
 filename_generator, theta_func1, theta_func2, merge_name = theta_funcs[mode] 
 
 if theta_func1:
-  pr = tqdm(theta_1.keys(), desc="Getting Difference of Model 1 and 2")
-  for key in pr:
+  for key in tqdm(theta_1.keys(), desc="Getting Difference of Model 1 and 2"):
     if 'model' in key:
       if key in theta_2:
           t2 = theta_2.get(key, torch.zeros_like(theta_1[key]))
@@ -901,8 +899,7 @@ if mode == "TS":
 if args.use_dif_21:
     theta_3 = copy.deepcopy(theta_1)
     func1 = get_difference
-    pr = tqdm(theta_2.keys(), desc="Getting Difference of Model 1 and 2")
-    for key in pr:
+    for key in tqdm(theta_2.keys(), desc="Getting Difference of Model 1 and 2"):
         if 'model' in key:
           if key in theta_3:
               t2 = theta_3.get(key, torch.zeros_like(theta_2[key]))
@@ -914,8 +911,7 @@ if args.use_dif_21:
 if args.use_dif_10:
     theta_3 = copy.deepcopy(theta_0)
     func1 = get_difference
-    pr = tqdm(theta_1.keys(), desc="Getting Difference of Model 0 and 1")
-    for key in pr:
+    for key in tqdm(theta_1.keys(), desc="Getting Difference of Model 0 and 1"):
         if 'model' in key:
           if key in theta_3:
               t2 = theta_3.get(key, torch.zeros_like(theta_1[key]))
@@ -927,8 +923,7 @@ if args.use_dif_10:
 if args.use_dif_20:
     theta_3 = copy.deepcopy(theta_0)
     func1 = get_difference
-    pr = tqdm(theta_2.keys(), desc="Getting Difference of Model 0 and 2")
-    for key in pr:
+    for key in tqdm(theta_2.keys(), desc="Getting Difference of Model 0 and 2"):
         if 'model' in key:
           if key in theta_3:
               t2 = theta_3.get(key, torch.zeros_like(theta_2[key]))
@@ -941,8 +936,7 @@ if args.use_dif_20:
 if cosine0: #favors modelA's structure with details from B
     sim = torch.nn.CosineSimilarity(dim=0)
     sims = np.array([], dtype=np.float64)
-    pr = tqdm(theta_0.keys(), desc="Caluculating Cosine 0")
-    for key in pr:
+    for key in (tqdm(theta_0.keys(), desc="Caluculating Cosine 0")):
         # skip VAE model parameters to get better results
         if "first_stage_model" in key: continue
         if "model" in key and key in theta_1:
@@ -957,8 +951,7 @@ if cosine0: #favors modelA's structure with details from B
 if cosine1: #favors modelB's structure with details from A
     sim = torch.nn.CosineSimilarity(dim=0)
     sims = np.array([], dtype=np.float64)
-    pr = tqdm(theta_0.keys(), desc="Caluculating Cosine 1")
-    for key in pr:
+    for key in (tqdm(theta_0.keys(), desc="Caluculating Cosine 1")):
         # skip VAE model parameters to get better results
         if "first_stage_model" in key: continue
         if "model" in key and key in theta_1:
@@ -988,8 +981,7 @@ if mode != "NoIn":
             print(f"beta weight converted for XL{weights_b}")
     if len(weights_a) == 19: weights_a = weights_a + [0]
     if usebeta and len(weights_b) == 19: weights_b = weights_b + [0]
-  pr = tqdm(theta_0.keys(), desc=f"{merge_name} Merging...")
-  for key in pr:
+  for key in tqdm(theta_0.keys(), desc=f"{merge_name} Merging..."):
     if args.vae is None and "first_stage_model" in key: continue
     if theta_1 and "model" in key and key in theta_1:    
       if (usebeta or mode == "TD") and not key in theta_2:
@@ -1131,8 +1123,8 @@ if mode != "NoIn":
             if 5 > index : 
                 theta_0[key] =theta_0[key]* fine[index] 
             else :theta_0[key] =theta_0[key] + torch.tensor(fine[5]).to(theta_0[key].device)
-  pr = tqdm(theta_1.keys(), desc="Remerging...")
-  for key in pr:
+        
+  for key in tqdm(theta_1.keys(), desc="Remerging..."):
         if key in checkpoint_dict_skip_on_merge:
             continue
         if "model" in key and key not in theta_0:
@@ -1159,8 +1151,7 @@ if mode != "NoIn":
   del theta_1
   try:
     if theta_2:
-        pr = tqdm(theta_2.keys(), desc="Remerging...")
-        for key in pr:
+        for key in tqdm(theta_2.keys(), desc="Remerging..."):
             if key in checkpoint_dict_skip_on_merge:
                 continue
             if "model" in key and key not in theta_0:
@@ -1174,8 +1165,7 @@ else:
     if args.fine is not None:
         fine = [float(t) for t in args.fine.split(",")]
         fine = fineman(fine,isxl)
-        pr = tqdm(theta_0.keys(), desc="Fine Tuning ...")
-        for key in pr:
+        for key in tqdm(theta_0.keys(), desc="Fine Tuning ..."):
             if args.vae is None and "first_stage_model" in key: continue
             if any(item in key for item in FINETUNES) and fine:
                 index = FINETUNES.index(key)
@@ -1185,8 +1175,7 @@ else:
     else:
         fine = ""
 if args.vae is not None:
-    pr = tqdm(vae.keys(), desc=f"Baking in VAE[{vae_name}] ...")
-    for key in pr:
+    for key in tqdm(vae.keys(), desc=f"Baking in VAE[{vae_name}] ..."):
         theta_0_key = 'first_stage_model.' + key
         if theta_0_key in theta_0:
             theta_0[theta_0_key] = to_half(vae[key], args.save_half)
@@ -1202,8 +1191,7 @@ theta_0 = to_half_k(theta_0, args.save_half)
 if args.prune:
     theta_0 = prune_model(theta_0, "Model", isxl)
 # for safetensors contiguous error
-pr = tqdm(theta_0.keys(), desc="Check contiguous...")
-for key in pr:
+for key in tqdm(theta_0.keys(), desc="Check contiguous..."):
     v = theta_0[key]
     v = v.contiguous()
     theta_0[key] = v 
