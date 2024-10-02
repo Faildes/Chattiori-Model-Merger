@@ -20,7 +20,7 @@ import shutil
 import safetensors.torch
 import safetensors
 import random
-from tqdm import tqdm_notebook as tqdm
+import tqdm.notebook.tqdm as tqdm
 
 FINETUNEX = ["IN","OUT","OUT2","CONT","BRI","COL1","COL2","COL3"]
 NUM_INPUT_BLOCKS = 12
