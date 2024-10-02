@@ -9,7 +9,7 @@ import argparse
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import torch.nn.functional as F
-from tq import tqdm
+from tqdm.auto import tqdm
 
 BLOCKID26=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
 BLOCKID17=["BASE","IN01","IN02","IN04","IN05","IN07","IN08","M00","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
@@ -85,8 +85,7 @@ args = parser.parse_args()
 
 def prune_model(theta, name, isxl=False):
     sd_pruned = dict()
-    pr = tqdm(theta.keys(), desc=f"Pruning {name}...")
-    for key in pr:
+    for key in tqdm(theta.keys(), desc=f"Pruning {name}..."):
         cp = key.startswith('model.diffusion_model.') or key.startswith('depth_model.') or key.startswith('first_stage_model.') or key.startswith("conditioner." if isxl else 'cond_stage_model.')
         if cp:
             k_in = key
@@ -469,8 +468,8 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
         lora_name = os.path.splitext(os.path.basename(lpath))[0]
         lora_hash = sha256_from_cache(lpath, f"lora/{lora_name}")
         lh[lora_hash]=lora_metadata
-        pr = tqdm(lora_sd.keys(), desc=f"Merging {lora_model}...")
-        for key in pr:
+
+        for key in tqdm(lora_sd.keys(), desc=f"Merging {lora_model}..."):
             
             ratio = loraratios[0]
 
@@ -546,8 +545,7 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
     new_metadata["lora"] = json.dumps(new_metadata["lora"])
     theta_0 = prune_model(theta_0, "Model", isxl)
     # for safetensors contiguous error
-    pr = tqdm(theta_0.keys(), desc="Check contiguous...")
-    for key in pr:
+    for key in tqdm(theta_0.keys(), desc="Check contiguous..."):
         v = theta_0[key]
         v = v.contiguous()
         theta_0[key] = v 
@@ -692,8 +690,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
         lora_weights = merge_weights(lora_sd, lisv2, isxl, p, lambda_val, 1, loraratios, len(lora_list))
         if scale > 0:
             lora_weights = apply_spectral_norm(lora_weights, scale)
-        pr = tqdm(main_weights.keys(), desc=f"Merging {lora_model}...")
-        for key in pr:
+        for key in tqdm(main_weights.keys(), desc=f"Merging {lora_model}..."):
             fullkey = convert_diffusers_name_to_compvis(key,mlv2)
             #print(fullkey)
             msd_key = fullkey.split(".", 1)[0]
@@ -756,8 +753,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     new_metadata["lora"] = json.dumps(new_metadata["lora"])
     theta_0 = prune_model(theta_0, "Model", isxl)
     # for safetensors contiguous error
-    pr = tqdm(theta_0.keys(), desc="Check contiguous...")
-    for key in pr:
+    for key in tqdm(theta_0.keys(), desc="Check contiguous..."):
         v = theta_0[key]
         v = v.contiguous()
         theta_0[key] = v 
