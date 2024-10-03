@@ -546,10 +546,34 @@ def similarity_add_difference(a, b, c, alpha, beta):
     ab_sum = (1 - alpha / 2) * a + (alpha / 2) * b
     return (1 - similarity) * ab_diff + similarity * ab_sum
 
+def resize_tensors(tensor1, tensor2):
+    if len(tensor1.shape) not in [1, 2]:
+        return tensor1, tensor2
+
+    # Pad along the last dimension (width)
+    if tensor1.shape[-1] < tensor2.shape[-1]:
+        padding_size = tensor2.shape[-1] - tensor1.shape[-1]
+        tensor1 = F.pad(tensor1, (0, padding_size, 0, 0))
+    elif tensor2.shape[-1] < tensor1.shape[-1]:
+        padding_size = tensor1.shape[-1] - tensor2.shape[-1]
+        tensor2 = F.pad(tensor2, (0, padding_size, 0, 0))
+
+    # Pad along the first dimension (height)
+    if tensor1.shape[0] < tensor2.shape[0]:
+        padding_size = tensor2.shape[0] - tensor1.shape[0]
+        tensor1 = F.pad(tensor1, (0, 0, 0, padding_size))
+    elif tensor2.shape[0] < tensor1.shape[0]:
+        padding_size = tensor1.shape[0] - tensor2.shape[0]
+        tensor2 = F.pad(tensor2, (0, 0, 0, padding_size))
+
+    return tensor1, tensor2
+
 def dare_merge(theta0, theta1, alpha):
-    m = torch.bernoulli(torch.full_like(input=theta0.float(), fill_value=0.5), generator=rand_generator)
+    d = theta0.dtype
+    theta0, theta1 = resize_tensors(theta0, theta1)
+    m = torch.bernoulli(torch.full_like(input=t0n.float(), fill_value=0.5), generator=rand_generator)
     alpha = torch.mul(m, alpha / 0.5)
-    return torch.lerp(theta0.float(), theta1.float(), alpha).to(theta0.dtype)
+    return torch.lerp(t0n.float(), t1n.float(), alpha).to(d)
 
 def prune_model(theta, name, isxl=False):
     sd_pruned = dict()
