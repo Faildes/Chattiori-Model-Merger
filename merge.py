@@ -13,6 +13,7 @@ import copy
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import scipy.ndimage
 from scipy.ndimage import median_filter as filter
 import re
