@@ -571,9 +571,9 @@ def resize_tensors(tensor1, tensor2):
 def dare_merge(theta0, theta1, alpha):
     d = theta0.dtype
     theta0, theta1 = resize_tensors(theta0, theta1)
-    m = torch.bernoulli(torch.full_like(input=t0n.float(), fill_value=0.5), generator=rand_generator)
+    m = torch.bernoulli(torch.full_like(input=theta0.float(), fill_value=0.5), generator=rand_generator)
     alpha = torch.mul(m, alpha / 0.5)
-    return torch.lerp(t0n.float(), t1n.float(), alpha).to(d)
+    return torch.lerp(theta0.float(), theta1.float(), alpha).to(d)
 
 def prune_model(theta, name, isxl=False):
     sd_pruned = dict()
