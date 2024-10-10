@@ -543,7 +543,8 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
     for hs, mt in lh.items():
         new_metadata["lora"][hs] = mt
     new_metadata["lora"] = json.dumps(new_metadata["lora"])
-    theta_0 = prune_model(theta_0, "Model", isxl)
+    if args.prune:
+        theta_0 = prune_model(theta_0, "Model", isxl)
     # for safetensors contiguous error
     for key in tqdm(theta_0.keys(), desc="Check contiguous..."):
         v = theta_0[key]
@@ -751,7 +752,8 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     for hs, mt in lh.items():
         new_metadata["lora"][hs] = mt
     new_metadata["lora"] = json.dumps(new_metadata["lora"])
-    theta_0 = prune_model(theta_0, "Model", isxl)
+    if args.prune:
+        theta_0 = prune_model(theta_0, "Model", isxl)
     # for safetensors contiguous error
     for key in tqdm(theta_0.keys(), desc="Check contiguous..."):
         v = theta_0[key]
