@@ -15,6 +15,7 @@ BLOCKID26=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08"
 BLOCKID17=["BASE","IN01","IN02","IN04","IN05","IN07","IN08","M00","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
 BLOCKID12=["BASE","IN04","IN05","IN07","IN08","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05"]
 BLOCKID20=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08"]
+BLOCKIDFLUX = ["CLIP", "T5", "IN"] + ["D{:002}".format(x) for x in range(19)] + ["S{:002}".format(x) for x in range(38)] + ["OUT"] # Len: 61
 BLOCKNUMS = [12,17,20,26]
 BLOCKIDS=[BLOCKID12,BLOCKID17,BLOCKID20,BLOCKID26]
 LBLOCKS26=["encoder",
@@ -441,6 +442,7 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
     model_name = os.path.splitext(os.path.basename(mpath))[0]
     isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_0.keys()
     isv2 = "cond_stage_model.model.transformer.resblocks.0.attn.out_proj.weight" in theta_0.keys()
+    isflux = any("double_block" in k for k in theta_0.keys())
 
     keychanger = {}
     for key in theta_0.keys():
@@ -451,7 +453,9 @@ def pluslora(lora_list: list,model,output,model_path,device="cpu"):
             else:
                 if "wrapped" in skey:
                     keychanger[skey.split("wrapped_",1)[1]] = key
-                else:
+                elif "clip_l" in skey or "t5xxl" in skey:
+                    keychanger[skey.split("text_encoders_","")] = key
+                elif "model_" in skey:
                     keychanger[skey.split("model_",1)[1]] = key
     lr=[]
     lh={}
