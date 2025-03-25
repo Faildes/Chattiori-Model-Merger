@@ -32,6 +32,7 @@ NUM_TOTAL_BLOCKS = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + NUM_OUTPUT_BLOCKS
 BLOCKID=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
 BLOCKIDXLL=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","VAE"]
 BLOCKIDXL=['BASE', 'IN0', 'IN1', 'IN2', 'IN3', 'IN4', 'IN5', 'IN6', 'IN7', 'IN8', 'M', 'OUT0', 'OUT1', 'OUT2', 'OUT3', 'OUT4', 'OUT5', 'OUT6', 'OUT7', 'OUT8', 'VAE']
+BLOCKIDFLUX = ["CLIP", "T5", "IN"] + ["D{:002}".format(x) for x in range(19)] + ["S{:002}".format(x) for x in range(38)] + ["OUT"] # Len: 61
 
 def tagdict(presets):
     presets=presets.splitlines()
@@ -648,6 +649,56 @@ def load_model(path, device, sha256=True):
     weights = get_state_dict_from_checkpoint(weights)
     return weights, s256, hashed, metadata
 
+def qdtyper(sd):
+    if any("fp4" in k for k in sd):
+        return "fp4"
+    elif any("nf4" in k for k in sd):
+        return "nf4"
+    for key in sd:
+        if hasattr(sd[key],"dtype"):
+            return sd[key].dtype
+
+def to_qdtype(sd_1, sd_2, qd_1, qd_2, device):
+    if qd_1 in QTYPES and qd_2 in QTYPES:
+        t1 = t2 = torch.float16
+    else:
+        t1 = t2 = None
+    
+    if qd_1 in QTYPES:
+        sd_1, qd_1 = q_dequantize(sd_1,qd_1,device,qd_2)
+
+    if qd_2 in QTYPES: 
+        sd_2, qd_2 = q_dequantize(sd_2,qd_2,device,qd_1)
+
+    return sd_1, sd_2
+    
+def q_dequantize(sd,qtype,device,dtype,setbnb = True):
+    dellist = [] 
+    from bitsandbytes.functional import dequantize_4bit
+    for key in tqdm(sd):
+        if ("weight" in key) and ("weight." not in key) and (key + BNB + qtype in sd):
+            qs = q_tensor_to_dict(sd[key + BNB + qtype])
+            out = torch.empty(qs["shape"],device="cuda:0")
+            sd[key] = dequantize_4bit(sd[key].to("cuda:0"),out=out, absmax=sd[key + ".absmax"].to("cuda:0"),blocksize=qs["blocksize"],quant_type=qs["quant_type"]).to(device,dtype)
+            dellist.append(key + ".absmax")
+            if setbnb:dellist.append(key + BNB + qtype)
+            dellist.append(key + ".quant_map")
+        elif isinstance(sd[key], torch.Tensor):
+            sd[key] = sd[key].to(dtype)
+
+    for key in dellist:
+        if key in sd:
+            del sd[key]
+    return sd, dtype
+
+def q_tensor_to_dict(tensor):
+    num_list = tensor.tolist()
+    char_list = [chr(num) for num in num_list]
+    json_string = ''.join(char_list)
+
+    tensor_dict = json.loads(json_string)
+    return tensor_dict
+
 output_name = args.output
 if args.functn:
     if args.prune:
@@ -703,18 +754,21 @@ if mode != "RM":
     model_0_name = args.m0_name if args.m0_name is not None else os.path.splitext(os.path.basename(model_0_path))[0]
     print(f"Loading {model_0_name}...")
     theta_0, model_0_sha256, model_0_hash, model_0_meta = load_model(model_0_path, device)
+    qd0 = qdtyper(theta_0)
     if mode != "NoIn":
         interp_method = 0
         model_1_path = os.path.join(args.model_path, args.model_1)
         model_1_name = args.m1_name if args.m1_name is not None else os.path.splitext(os.path.basename(model_1_path))[0]
         print(f"Loading {model_1_name}...")
         theta_1, model_1_sha256, model_1_hash, model_1_meta = load_model(model_1_path, device)
+        qd1 = qdtyper(theta_1)
         weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
         if mode in ["sAD", "AD", "TRS", "ST", "TD","SIM","MD"]:
             model_2_path = os.path.join(args.model_path, args.model_2)
             model_2_name = args.m2_name if args.m2_name is not None else os.path.splitext(os.path.basename(model_2_path))[0]
             print(f"Loading {model_2_name}...")
             theta_2, model_2_sha256, model_2_hash, model_2_meta = load_model(model_2_path, device)
+            qd2 = qdtyper(theta_2)
         if mode in ["TRS","ST","TS","SIM","MD","DARE"]:
             usebeta = True
             weights_b, beta, beta_info = parse_ratio(args.beta, beta_info, deep_b)
@@ -732,6 +786,10 @@ if args.vae is not None:
 
 if mode == "DARE":
     rand_generator = torch.Generator()
+
+if mode != "NoIn":
+    isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_1.keys()
+    isflux = any("double_block" in k for k in theta_1.keys())
 
 def filename_weighted_sum():
   a = model_0_name
@@ -824,8 +882,8 @@ def blocker(blocks,blockids):
             if flagger[i]: output = output + " " + blockids[i] if output else blockids[i]
     return output
 
-def blockfromkey(key,isxl):
-    if not isxl:
+def blockfromkey(key,isxl,isflux=False):
+    if not isxl and not isflux:
         re_inp = re.compile(r'\.input_blocks\.(\d+)\.')  # 12
         re_mid = re.compile(r'\.middle_block\.(\d+)\.')  # 1
         re_out = re.compile(r'\.output_blocks\.(\d+)\.') # 12
@@ -855,7 +913,26 @@ def blockfromkey(key,isxl):
                     if m:
                         out_idx = int(m.groups()[0])
                         weight_index = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + out_idx
-        return BLOCKID[weight_index+1] ,BLOCKID[weight_index+1] 
+        return BLOCKID[weight_index+1] ,BLOCKID[weight_index+1]
+    elif isflux:
+        # Extract the two-digit number using regex
+        if "vae" in key:
+            return "VAE", "Not Merge"
+        if "t5xxl" in key:
+            return "T5", "T5"
+        if "text_encoders.clip" in key:
+            return "CLIP", "CLIP"
+        
+        match = re.search(r'\.(\d+)\.', key)
+        if "double_blocks" in key:
+            return f"D{match.group(1).zfill(2) }", f"D{match.group(1).zfill(2) }"
+        if "single_blocks" in key:
+            return f"S{match.group(1).zfill(2) }", f"S{match.group(1).zfill(2) }"
+        if "_in" in key:
+            return "IN", "IN"
+        if "final_layer" in key:
+            return "OUT", "OUT"
+        return "Not Merge"
 
     else:
         if not ("weight" in key or "bias" in key):return "Not Merge","Not Merge"
@@ -895,6 +972,7 @@ def elementals(key,weight_index,deep,current_alpha):
             current_alpha = dr
     return current_alpha
 
+
 theta_funcs = {
     "WS":   (filename_weighted_sum, None, weighted_sum,"Weighted Sum"),
     "AD":   (filename_add_difference, get_difference, add_difference, "Add Difference"),
@@ -914,6 +992,8 @@ theta_funcs = {
 filename_generator, theta_func1, theta_func2, merge_name = theta_funcs[mode] 
 
 if theta_func1:
+  if isflux and qd1 != qd2:
+      theta_1, theta_2 = to_qdtype(theta_1, theta_2, qd1, qd2, device)
   for key in tqdm(theta_1.keys(), desc="Getting Difference of Model 1 and 2"):
     if 'model' in key:
       if key in theta_2:
@@ -923,6 +1003,12 @@ if theta_func1:
           theta_1[key] = torch.zeros_like(theta_1[key])
   del theta_2
 
+if qd0 != qd1:
+    theta_0, theta_1 = to_qdtype(theta_0, theta_1, qd0, qd1, device)
+
+if theta_2 is not None:
+    theta_0, theta_2 = to_qdtype(theta_0, theta_2, qd0, qd2, device)
+    
 if mode == "TS":
     theta_t = theta_0
     theta_0 ={}
@@ -999,7 +1085,6 @@ if cosine1: #favors modelB's structure with details from A
     sims = np.delete(sims, np.where(sims > np.percentile(sims, 99, method='midpoint')))
 
 if mode != "NoIn":
-  isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_1.keys()
   if args.fine is not None:
     fine = [float(t) for t in args.fine.split(",")]
     fine = fineman(fine,isxl)
@@ -1017,7 +1102,7 @@ if mode != "NoIn":
     if usebeta and len(weights_b) == 19: weights_b = weights_b + [0]
   for key in tqdm(theta_0.keys(), desc=f"{merge_name} Merging..."):
     if args.vae is None and "first_stage_model" in key: continue
-    if theta_1 and "model" in key and key in theta_1:    
+    if theta_1 and "model" in key and key in theta_1:
       if mode != "DARE":
           if (usebeta or mode == "TD") and not key in theta_2:
              continue
@@ -1035,9 +1120,17 @@ if mode != "NoIn":
         cl = list(theta_2[key].shape)
       # check weighted and U-Net or not
       
-      block,blocks26 = blockfromkey(key,isxl)
+      block,blocks26 = blockfromkey(key,isxl,isflux)
       if block == "Not Merge": continue
-      weight_index = BLOCKIDXLL.index(blocks26) if isxl else BLOCKID.index(blocks26)
+      if isflux and blocks26 in BLOCKIDFLUX:
+          weight_index = BLOCKIDFLUX.index(blocks26)
+      elif isxl and blocks26 in BLOCKIDXLL:
+          weight_index = BLOCKIDXLL.index(blocks26)
+      elif blocks26 in BLOCKID:
+          weight_index = BLOCKID.index(block26)
+      else:
+          continue
+        
       if weight_index > 0:
             if weights_a is not None:
               current_alpha = weights_a[weight_index-1]
@@ -1162,7 +1255,7 @@ if mode != "NoIn":
             else :theta_0[key] =theta_0[key] + torch.tensor(fine[5]).to(theta_0[key].device)
   if mode != "DARE":
       for key in tqdm(theta_1.keys(), desc="Remerging..."):
-            if key in checkpoint_dict_skip_on_merge:
+            if key in checkpoint_dict_skip_on_merge or isflux:
                 continue
             if "model" in key and key not in theta_0:
                 try:
@@ -1172,9 +1265,17 @@ if mode != "NoIn":
                             c = theta_2[key]
                             current_beta = beta
                             
-                            block,blocks26 = blockfromkey(key,isxl)
+                            block,blocks26 = blockfromkey(key,isxl,isflux)
                             if block == "Not Merge": continue
-                            weight_index = BLOCKIDXLL.index(blocks26) if isxl else BLOCKID.index(blocks26)
+                            if isflux and blocks26 in BLOCKIDFLUX:
+                                weight_index = BLOCKIDFLUX.index(blocks26)
+                            elif isxl and blocks26 in BLOCKIDXLL:
+                                weight_index = BLOCKIDXLL.index(blocks26)
+                            elif blocks26 in BLOCKID:
+                                weight_index = BLOCKID.index(block26)
+                            else:
+                                continue
+                            
                             if weight_index >= 0:
                                 if weights_b is not None:
                                     current_beta = weights_b[weight_index]
