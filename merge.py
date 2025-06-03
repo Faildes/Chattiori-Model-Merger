@@ -576,10 +576,13 @@ def dare_merge(theta0, theta1, alpha, beta):
     delta_hat = delta_tilde / (1 - beta)
     return theta0 + alpha * delta_hat
 
-def prune_model(theta, name, isxl=False):
+def prune_model(theta, name, isxl=False, isflux=False):
     sd_pruned = dict()
+    if isflux: "clip.cond_stage_model."
+    elif isxl: condname = "conditioner."
+    else: condname = 'cond_stage_model.'
     for key in tqdm(theta.keys(), desc=f"Pruning {name}..."):
-        cp = key.startswith('model.diffusion_model.') or key.startswith('depth_model.') or key.startswith('first_stage_model.') or key.startswith("conditioner." if isxl else 'cond_stage_model.')
+        cp = key.startswith('model.diffusion_model.') or key.startswith('depth_model.') or key.startswith('first_stage_model.') or key.startswith(condname)
         if cp:
             k_in = key
             if args.keep_ema:
@@ -1319,6 +1322,7 @@ if args.vae is not None:
             theta_0[theta_0_key] = to_half(vae[key], args.save_half)
     del vae
 isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_0
+isflux = any("double_block" in k for k in theta_0.keys())
 if isxl:
     # prune share memory tensors, "cond_stage_model." prefixed base tensors are share memory with "conditioner." prefixed tensors
     for i, key in enumerate(theta_0.keys()):
@@ -1327,7 +1331,7 @@ if isxl:
 
 theta_0 = to_half_k(theta_0, args.save_half)
 if args.prune:
-    theta_0 = prune_model(theta_0, "Model", isxl)
+    theta_0 = prune_model(theta_0, "Model", isxl, isflux)
 # for safetensors contiguous error
 for key in tqdm(theta_0.keys(), desc="Check contiguous..."):
     v = theta_0[key]
