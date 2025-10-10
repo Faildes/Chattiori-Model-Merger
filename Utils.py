@@ -549,3 +549,354 @@ def np_trim_percentiles(arr, lo=1, hi=99):
         return arr
     lo_v, hi_v = np.percentile(arr, lo, method='midpoint'), np.percentile(arr, hi, method='midpoint')
     return arr[(arr >= lo_v) & (arr <= hi_v)]
+
+def _normalize_components_list(alpha_text: str):
+    # "UNet, CLIP-L, VAE" -> {'unet','clip-l','vae'}
+    if not alpha_text:
+        return set()
+    tokens = [t.strip().lower() for t in alpha_text.replace(";", ",").split(",") if t.strip()]
+    syn = {
+        "u": "unet", "unet": "unet",
+        "v": "vae", "vae": "vae",
+        "clip": "clip", "text": "clip", "te": "clip",
+        "clip-l": "clip-l", "clipl": "clip-l", "clip_l": "clip-l", "l": "clip-l", "text-l": "clip-l",
+        "clip-g": "clip-g", "clipg": "clip-g", "clip_g": "clip-g", "g": "clip-g", "text-g": "clip-g",
+        "denoiser":"transformer", "denoise":"transformer", "transformer":"transformer", "mmdit":"transformer",
+        "t5":"text", "t5-xxl":"text", "text1":"text", "text2":"text2",
+        "all": "all",
+    }
+    mapped = [syn.get(t, t) for t in tokens]
+    if "all" in mapped or not mapped:
+        return {"unet", "vae", "clip-l", "clip-g", "clip", "transformer", "text", "text2"}
+    return set(mapped)
+
+def _component_prefix_map(isxl: bool, isflux: bool = False):
+    if isflux:
+        return {
+            "transformer": ["transformer."],
+            "vae":         ["vae.", "first_stage_model."],
+            "text":        ["text_encoder.", "conditioner.embedders.", "clip.", "t5."],
+            "text2":       ["text_encoder_2."],
+            "unet":        ["transformer."],
+            "clip":        ["text_encoder.", "text_encoder_2.", "conditioner.embedders.", "clip."],
+            "clip-l":      ["text_encoder."],
+            "clip-g":      ["text_encoder_2."],
+        }
+    if isxl:
+        return {
+            "unet":   ["model.diffusion_model."],
+            "vae":    ["first_stage_model."],
+            "clip-l": [
+                "conditioner.embedders.0.",
+                "text_encoders.encoder_l.",
+                "clip_l.", "clip_l/"
+            ],
+            "clip-g": [
+                "conditioner.embedders.1.",
+                "text_encoders.encoder_g.",
+                "clip_g.", "clip_g/"
+            ],
+            "clip": [
+                "conditioner.embedders.",
+                "text_encoders.", "clip_l.", "clip_g."
+            ],
+        }
+    else:
+        return {
+            "unet": ["model.diffusion_model."],
+            "vae":  ["first_stage_model."],
+            "clip": ["cond_stage_model.", "clip."],
+        }
+
+def _key_belongs_to_component(key: str, prefixes: list[str]) -> bool:
+    for p in prefixes:
+        if key.startswith(p):
+            return True
+        if p.endswith(".") and key.startswith(p[:-1] + "/"):
+            return True
+    return False
+
+def _swap_components_inplace(theta_dst: dict, theta_src: dict, components: set[str], isxl: bool, isflux: bool):
+    pref = _component_prefix_map(isxl, isflux)
+    selected = set()
+    for c in components:
+        if c in pref:
+            selected.add(c)
+        elif c in {"clip-l","clip-g"} and "clip" in pref:
+            selected.add(c)
+        elif c == "clip" and "clip" in pref:
+            selected.add("clip")
+    prefixes = [p for c in selected for p in pref.get(c, [])]
+
+    moved, created, skipped_shape = 0, 0, 0
+    for k, v in theta_src.items():
+        if not prefixes or _key_belongs_to_component(k, prefixes):
+            if k in theta_dst and tuple(theta_dst[k].shape) != tuple(v.shape):
+                skipped_shape += 1
+                continue
+            if k in theta_dst:
+                theta_dst[k] = v.to(dtype=theta_dst[k].dtype, device=theta_dst[k].device)
+                moved += 1
+            else:
+                theta_dst[k] = v
+                created += 1
+    return moved, created, skipped_shape, theta_dst
+
+def _is_clip_key(key: str, isxl: bool, isflux: bool) -> bool:
+    if isflux:
+        prefixes = ["text_encoder.", "text_encoder_2.", "conditioner.embedders.", "clip.", "t5."]
+    elif isxl:
+        prefixes = ["conditioner.embedders.", "text_encoders.", "clip_l.", "clip_g."]
+    else:
+        prefixes = ["cond_stage_model.", "clip."]
+    return any(key.startswith(p) for p in prefixes)
+
+def _elemwise_union_minus_intersection(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    same_sign = torch.sign(a) == torch.sign(b)
+    overlap = torch.where(
+        same_sign,
+        torch.sign(a) * torch.minimum(a.abs(), b.abs()),
+        torch.zeros_like(a)
+    )
+    return a + b - overlap
+
+def _elemwise_union_minus_intersection_with_base(base, A, B):
+    dA, dB = A - base, B - base
+    same_sign = torch.sign(dA) == torch.sign(dB)
+    overlap = torch.where(
+        same_sign,
+        torch.sign(dA) * torch.minimum(dA.abs(), dB.abs()),
+        torch.zeros_like(dA)
+    )
+    return base + (dA + dB - overlap)
+
+def _projective_intersection_union(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    a32 = a.detach().float().view(-1); b32 = b.detach().float().view(-1)
+    if a32.numel() == 0:
+        return a
+    proj_b_on_a = (torch.dot(b32, a32) / (a32.norm()**2 + 1e-12)) * a32
+    u = (a32 + b32 - proj_b_on_a).view_as(a)
+    return u.to(a.dtype)
+
+def _tensor_cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    a32 = a.detach().float().view(-1); b32 = b.detach().float().view(-1)
+    if a32.numel() == 0:
+        return torch.tensor(1.0, device=a.device)
+    num = torch.dot(a32, b32)
+    den = (a32.norm() * b32.norm()).clamp_min(1e-12)
+    return (num / den).clamp(-1.0, 1.0)
+
+def _cosine_gate(a: torch.Tensor, b: torch.Tensor, tau: float = 0.30, sharp: float = 0.10) -> torch.Tensor:
+    cos = _tensor_cosine(a, b)
+    g = torch.sigmoid((cos - float(tau)) / max(float(sharp), 1e-3))
+    return g.to(a.dtype)
+
+def _maybe_skip_small_norm_bias_for_clipxor(key: str, tens: torch.Tensor) -> bool:
+    if tens.numel() < 128:
+        return True
+    lk = key.lower()
+    if lk.endswith(".bias") or ".bias" in lk:
+        return True
+    if ("norm" in lk) or (".ln" in lk) or (".bn" in lk):
+        return True
+    if ("emb" in lk) or ("pos" in lk):
+        return True
+    if ("text_projection" in lk) or ("logit_scale" in lk):
+        return True
+    return False
+
+def _collect_clipxor_targets(theta_base: dict, theta_other: dict, isxl: bool, isflux: bool):
+    targets = []
+    for k, A in theta_base.items():
+        if not _is_clip_key(k, isxl, isflux):
+            continue
+        B = theta_other.get(k)
+        if getattr(A, "shape", None) != getattr(B, "shape", None):
+            continue
+        if _maybe_skip_small_norm_bias_for_clipxor(k, A):
+            continue
+        targets.append(k)
+    return targets
+
+def _clip_roots_for_arch(isxl: bool, isflux: bool):
+    if isflux:
+        # Flux: T5 / text encoders
+        return [
+            "text_encoder.", "text_encoder_2.", "conditioner.embedders.", "clip.", "t5."
+        ]
+    if isxl:
+        # SDXL: CLIP-L / CLIP-G
+        return [
+            "conditioner.embedders.0.", "conditioner.embedders.1.",
+            "text_encoders.encoder_l.", "text_encoders.encoder_g.",
+            "clip_l.", "clip_g."
+        ]
+    # SD1.x / SD2.x (non-XL)
+    return ["cond_stage_model.", "clip."]
+
+def _iter_clip_items(sd: dict, isxl: bool, isflux: bool):
+    roots = _clip_roots_for_arch(isxl, isflux)
+    for k, v in sd.items():
+        for r in roots:
+            if k.startswith(r):
+                # canonical suffix after the first root occurrence
+                suffix = k[len(r):]
+                yield (k, r, suffix, v)
+                break
+
+def _collect_clip_pairs_by_suffix(sd_a: dict, sd_b: dict,
+                                  isxl_a: bool, isflux_a: bool,
+                                  isxl_b: bool, isflux_b: bool):
+    # map suffix -> (orig_key, tensor) for A and B separately
+    map_a = {}
+    for k, root, suf, v in _iter_clip_items(sd_a, isxl_a, isflux_a):
+        map_a[suf] = (k, v)
+    map_b = {}
+    for k, root, suf, v in _iter_clip_items(sd_b, isxl_b, isflux_b):
+        map_b[suf] = (k, v)
+
+    # intersect by suffix and by matching shape
+    pairs = []
+    for suf, (ka, va) in map_a.items():
+        kb_v = map_b.get(suf)
+        if kb_v is None:
+            continue
+        kb, vb = kb_v
+        if getattr(va, "shape", None) == getattr(vb, "shape", None):
+            pairs.append((suf, ka, kb))  # use A's key for writing back
+    return pairs  # list of (suffix, key_in_A, key_in_B)
+
+def _clip_tier_for_xl(key: str) -> str:
+    k = key.lower()
+    if ("clip_l" in k) or ("text_model" in k and "clip" in k):
+        return "clip-l"
+    if ("clip_g" in k) or ("text2_model" in k and "clip" in k) or ("open_clip" in k):
+        return "clip-g"
+    return "other"
+
+def _clip_tier_for_flux(key: str) -> str:
+    k = key.lower()
+    if ("t5" in k) or ("text_encoder" in k) or ("textencoder" in k) or ("conditioner.embedders" in k):
+        return "t5"
+    if ("clip" in k) and ("text" in k or "emb" in k or "proj" in k):
+        return "clip"
+    return "other"
+
+def _norm_stats(t: torch.Tensor):
+    v = t.detach().float().view(-1)
+    if v.numel() == 0:
+        return t.new_tensor(0.0), t.new_tensor(1.0)
+    return v.mean(), v.std().clamp_min(1e-6)
+
+def _apply_stat_alignment(out: torch.Tensor, ref: torch.Tensor, strength: float = 0.5):
+    m_ref, s_ref = _norm_stats(ref)
+    m_out, s_out = _norm_stats(out)
+    aligned = (out - m_out) / s_out * s_ref + m_ref
+    return out * (1 - strength) + aligned * strength
+
+def _topk_mask(delta: torch.Tensor, k_frac: float) -> torch.Tensor:
+    if delta.numel() == 0:
+        return torch.zeros_like(delta, dtype=torch.float32)
+    k = max(int(delta.numel() * float(k_frac)), 1)
+    flat = delta.detach().float().abs().view(-1)
+    if k >= flat.numel():
+        mask = torch.ones_like(flat)
+    else:
+        thresh = torch.kthvalue(flat, flat.numel() - k + 1).values
+        mask = (flat >= thresh).float()
+    return mask.view_as(delta)
+
+def _clipxor_semi_hard_blend(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    hardness: float = 0.7,
+    use_cosine_gate: bool = True,
+    keep_stats: bool = True
+) -> torch.Tensor:
+    same_sign = torch.sign(A) == torch.sign(B)
+    overlap = torch.where(same_sign, torch.sign(A) * torch.minimum(A.abs(), B.abs()), torch.zeros_like(A))
+    U = A + B - overlap
+    delta = (U - A)
+
+    if delta.numel() == 0:
+        return A
+
+    k_frac = 0.10 + 0.45 * float(hardness)
+    alpha  = 0.12 + 0.38 * float(hardness)
+    tau    = 0.35 - 0.20 * float(hardness)
+    sharp  = 0.12 + 0.08 * (1.0 - float(hardness))
+    tr_budget = 0.12 + 0.38 * float(hardness)
+    stat_strength = 0.65 - 0.30 * float(hardness)
+
+    m = _topk_mask(delta, k_frac=k_frac)
+    delta_sel = (delta.detach().float() * m).to(A.dtype)
+
+    if use_cosine_gate:
+        cos = _tensor_cosine(A, U)
+        g = torch.sigmoid((cos - tau) / max(sharp, 1e-3)).to(A.dtype)
+    else:
+        g = A.new_tensor(1.0)
+
+    out = A + (alpha * g) * delta_sel
+
+    a_norm = A.detach().float().norm()
+    d_norm = (out - A).detach().float().norm().clamp_min(1e-12)
+    budget = tr_budget * a_norm
+    if d_norm > budget:
+        scale = (budget / d_norm).to(out.dtype)
+        out = A + (out - A) * scale
+
+    if keep_stats and stat_strength > 0.0:
+        out = _apply_stat_alignment(out, A, strength=float(stat_strength))
+
+    return out
+
+def _finetune_inplace(key, tens, fine):
+    if "first_stage_model" in key or not fine:
+        return tens
+
+    if isinstance(fine, dict):
+        mul = fine.get("mul", {}) or {}
+        m = 1.0
+
+        if any(s in key for s in ("double_block", "double_blocks", "db.")):
+            m *= float(mul.get("double_block", 1.0))
+        if any(s in key for s in (".img_in", "image_in", "image_proj")):
+            m *= float(mul.get("img_in", 1.0))
+        if any(s in key for s in (".txt_in", "context_in", "text_in", "clip_proj")):
+            m *= float(mul.get("txt_in", 1.0))
+        if any(s in key for s in ("time_in", "time_embed", "timestep", "vector_in")):
+            m *= float(mul.get("time", 1.0))
+        if any(s in key for s in (".out.", "final_layer", "vector_out")) or key.endswith(".out"):
+            m *= float(mul.get("out", 1.0))
+
+        if m != 1.0:
+            tens = tens * torch.as_tensor(m, device=tens.device, dtype=tens.dtype)
+
+        add = float(fine.get("add", 0.0) or 0.0)
+        if add and (key.endswith(".bias") or ".bias" in key):
+            tens = tens + torch.as_tensor(add, device=tens.device, dtype=tens.dtype)
+
+        return tens
+
+    if isinstance(fine, list):
+        idx = next((i for i, pat in enumerate(FINETUNES) if pat in key), -1)
+        if idx == -1:
+            return tens
+
+        if idx < 5:
+            return tens * torch.as_tensor(fine[idx], device=tens.device, dtype=tens.dtype)
+        else:
+            try:
+                add = torch.as_tensor(fine[5], device=tens.device, dtype=tens.dtype)
+                return tens + add
+            except Exception:
+                if isinstance(fine[5], (list, tuple)) and len(fine[5]) > 0:
+                    add = torch.as_tensor(fine[5][0], device=tens.device, dtype=tens.dtype)
+                    return tens + add
+                else:
+                    add = torch.as_tensor(float(fine[5]) if fine[5] is not None else 0.0,
+                                          device=tens.device, dtype=tens.dtype)
+                    return tens + add
+    return tens

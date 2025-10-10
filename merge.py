@@ -15,7 +15,11 @@ from Utils import wgt, rand_ratio, sha256, read_metadata_from_safetensors \
     , load_model, parse_ratio, qdtyper, maybe_to_qdtype, np_trim_percentiles \
     , diff_inplace, clone_dict_tensors, fineman, weighttoxl, BLOCKID, BLOCKIDFLUX \
     , BLOCKIDXLL, blockfromkey, checkpoint_dict_skip_on_merge, FINETUNES, elementals \
-    , to_half, to_half_k, prune_model, cache, merge_cache_json, detect_arch
+    , to_half, to_half_k, prune_model, cache, merge_cache_json, detect_arch \
+    , _swap_components_inplace, _normalize_components_list, _is_clip_key \
+    , _finetune_inplace, _clip_tier_for_xl, _clip_tier_for_flux \
+    , _clipxor_semi_hard_blend, _maybe_skip_small_norm_bias_for_clipxor \
+    , _collect_clipxor_targets, _collect_clip_pairs_by_suffix
 
 # Mode Functions
 
@@ -157,11 +161,14 @@ theta_funcs = {
     "GEO":  (None,           geometric,                  "Geometric"),
     "MAX":  (None,           weight_max,                 "Max"),
     "DARE": (None,           dare_merge,                 "DARE"),
+    "XDARE":(None,           dare_merge,                 "CLIP XOR DARE"),
     "ORTHO":(None,           ortho_merge,                "Orthogonalized Delta"),
     "SPRSE":(None,           sparse_topk,                "Sparse Top-k Delta"),
     "NORM": (None,           norm_dir_blend,             "Norm/Direction Split"),
     "CHAN": (None,           channel_cosine_gate,        "Channel-wise Cosine Gate"),
     "FREQ": (None,           freq_band_blend,            "Frequency-Band Blend"),
+    "SWAP": (None,           None,                       "Swap Components"),
+    "CLIPXOR": (None,        None,                       "CLIP XOR (union-minus-intersection)"),
 }
 modes_need_m2   = {"sAD", "AD", "TRS", "ST",  "TD", "SIM", "MD", "SPRSE", "HUB", "CHAN", "FREQ"}
 modes_need_beta = {"TRS", "ST", "TS",  "SIM", "MD", "DARE"}
@@ -213,9 +220,13 @@ if mode in modes_need_m2 and (args.model_2 is None):
     raise SystemExit(f"mode '{mode}' needs 3rd model")
 theta_func1, theta_func2, merge_name = theta_funcs[mode]
 
-args.alpha, deep_a, block_a = wgt(args.alpha, [])
-args.beta,  deep_b, block_b = wgt(args.beta, [])
-useblocks = block_a or block_b
+if mode not in ["SWAP", "CLIPXOR"]:
+    args.alpha, deep_a, block_a = wgt(args.alpha, [])
+    args.beta,  deep_b, block_b = wgt(args.beta, [])
+    useblocks = block_a or block_b
+else:
+    useblocks = False
+    deep_a = deep_b = []
 
 cos_flags = [args.cosine0, args.cosine1, args.cosine2]
 if sum(1 for f in cos_flags if f) > 1:
@@ -281,20 +292,111 @@ if mode != "NoIn":
     theta_1, model_1_sha256, model_1_hash, model_1_meta, cache_data = load_model(model_1_path, device, cache_data=cache_data)
     qd1 = qdtyper(theta_1)
     isxl, isflux = detect_arch(theta_1)
-
-    weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
-    if mode in modes_need_m2:
-        model_2_path = os.path.join(args.model_path, args.model_2)
-        model_2_name = args.m2_name or stem(model_2_path)
-        print(f"Loading {model_2_name}...")
-        theta_2, model_2_sha256, model_2_hash, model_2_meta, cache_data = load_model(model_2_path, device, cache_data=cache_data)
-        qd2 = qdtyper(theta_2)
-
-    usebeta = mode in modes_need_beta
-    if usebeta:
-        weights_b, beta, beta_info = parse_ratio(args.beta, beta_info, deep_b)
+    if args.fine:
+        fine = fineman([float(t) for t in args.fine.split(",")], isxl)
     else:
-        weights_b, beta = None, None
+        fine = ""
+        
+    if mode == "SWAP":
+        components = _normalize_components_list(str(args.alpha))
+        if not components:
+            components = {"unet", "vae", "clip-l", "clip-g", "clip", "transformer", "text", "text2"}
+
+        moved, created, skipped, theta_0 = _swap_components_inplace(theta_0, theta_1, components, isxl, isflux)
+        print(f"[SWAP] components={sorted(list(components))}  moved:{moved}  created:{created}  shape_skipped:{skipped}")
+        
+        mode = "NoIn"
+        theta_1 = None
+        usebeta = False
+        weights_a = weights_b = None
+        alpha = beta = None
+        
+    elif mode in ["CLIPXOR", "XDARE"]:
+        theta_res = clone_dict_tensors(theta_0)
+        
+        base_hardness = 0.70
+        hard_l = base_hardness
+        hard_g = base_hardness
+
+        hard_t5   = 0.60
+        hard_clip = base_hardness
+        
+        isxl_a, isflux_a = detect_arch(theta_0)
+        isxl_b, isflux_b = detect_arch(theta_1)
+
+        targets = _collect_clipxor_targets(theta_0, theta_1, isxl=isxl_a, isflux=isflux_a)
+        if not targets:
+            suffix_pairs = _collect_clip_pairs_by_suffix(theta_0, theta_1, isxl_a, isflux_a, isxl_b, isflux_b)
+            targets = [ka for (_, ka, _) in suffix_pairs]
+            
+        if not targets:
+            print("[CLIPXOR] No eligible CLIP keys to merge (even after suffix matching). \nArchitectures may be incompatible or shapes differ.")
+        else:
+            for key_a in tqdm(targets, desc="CLIPXOR: Collecting keys...", total=len(targets)):
+                A = theta_0[key_a]
+                if key_a in theta_1:
+                    key_b = key_a
+                else:
+                    if not suffix_pairs:
+                        continue
+                    pass
+        suffix_to_kb = {}
+        if suffix_pairs:
+            for suf, ka, kb in suffix_pairs:
+                suffix_to_kb[ka] = kb
+        
+        for key in tqdm(targets, desc="CLIPXOR merging...", total=len(targets)):
+            A = theta_0[key_a]
+            key_b = key_a if key_a in theta_1 else suffix_to_kb.get(key_a, None)
+            if key_b is None:
+                continue
+            B = theta_1[key_b]
+
+            if isxl_a or isxl_b:
+                tier = _clip_tier_for_xl(key_a)
+                hardness = hard_l if tier == "clip-l" else (hard_g if tier == "clip-g" else base_hardness)
+            elif isflux_a or isflux_b:
+                tier = _clip_tier_for_flux(key_a)
+                hardness = hard_t5 if tier == "t5" else (hard_clip if tier == "clip" else base_hardness)
+            else:
+                hardness = base_hardness
+
+            M_semi = _clipxor_semi_hard_blend(
+                A, B,
+                hardness=float(hardness),
+                use_cosine_gate=True,
+                keep_stats=True
+            )
+            if 'fine' in locals() and fine:
+                M_semi = _finetune_inplace(key_a, M_semi, fine)
+            theta_res[key_a] = M_semi
+
+        theta_0 = theta_res
+        if mode == "CLIPXOR":
+            mode = "NoIn"
+            theta_1 = None
+            usebeta = False
+            weights_a = weights_b = None
+            alpha = beta = None
+        elif mode == "XDARE":
+            mode = "DARE"
+            usebeta = True
+            weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
+            weights_b, beta, beta_info = parse_ratio(args.beta, beta_info, deep_b)
+    else:
+        weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
+        if mode in modes_need_m2:
+            model_2_path = os.path.join(args.model_path, args.model_2)
+            model_2_name = args.m2_name or stem(model_2_path)
+            print(f"Loading {model_2_name}...")
+            theta_2, model_2_sha256, model_2_hash, model_2_meta, cache_data = load_model(model_2_path, device, cache_data=cache_data)
+            qd2 = qdtyper(theta_2)
+
+        usebeta = mode in modes_need_beta
+        if usebeta:
+            weights_b, beta, beta_info = parse_ratio(args.beta, beta_info, deep_b)
+        else:
+            weights_b, beta = None, None
 else:
     usebeta = False
     weights_a = weights_b = None
@@ -309,27 +411,55 @@ if mode == "DARE":
     g = torch.Generator(device=device if device != "cpu" else "cpu")
     if args.seed is not None: g.manual_seed(args.seed)
 
-def cosine_minmax(base_dict, other_dict, desc, variant=0):
-    vals = []
+def _is_small_or_norm_or_bias(key, tens):
+    n = tens.numel()
+    if n < 128:
+        return True
+    k = key.lower()
+    if (k.endswith(".bias") or ".bias" in k or "norm" in k or "ln" in k or "bn" in k):
+        return True
+    if "emb" in k or "pos" in k:
+        return True
+    return False
+
+def cosine_minmax_grouped(base_dict, other_dict, desc, variant=0, lo=5.0, hi=95.0):
+    by_block = {}  # wi -> [values]
     for k in tqdm(base_dict.keys(), desc=desc):
         if "first_stage_model" in k or "model" not in k or k not in other_dict:
             continue
+        wi = _resolve_weight_index(k)
+        if wi < 0:
+            continue
         a = base_dict[k].detach().float().view(-1)
         b = other_dict[k].detach().float().view(-1)
-        if a.numel() == 0 or b.numel() == 0 or a.shape != b.shape:
+        if a.numel()==0 or b.numel()==0 or a.shape!=b.shape:
             continue
-        simab = F.cosine_similarity(a, b, dim=0).item()
+        if _is_small_or_norm_or_bias(k, base_dict[k]):
+            continue
         if variant == 0:
-            vals.append(simab)
+            val = F.cosine_similarity(a, b, dim=0).item()
         else:
             dot = torch.dot(a, b).item()
             denom = float(a.norm().item() * b.norm().item())
             mag = (dot / denom) if denom != 0.0 else 0.0
-            vals.append(0.5 * (simab + mag))
-    arr = np_trim_percentiles(np.asarray(vals, dtype=np.float64))
-    if arr.size == 0 or not np.isfinite(arr).any():
-        return 0.0, 1.0
-    return float(np.nanmin(arr)), float(np.nanmax(arr))
+            val = 0.5 * (float(F.cosine_similarity(a, b, dim=0).item()) + mag)
+        by_block.setdefault(wi, []).append(val)
+
+    stats = {}
+    for wi, vals in by_block.items():
+        arr = np.asarray(vals, dtype=np.float64)
+        if arr.size == 0 or not np.isfinite(arr).any():
+            stats[wi] = (0.0, 1.0)
+        else:
+            lo_v = float(np.nanpercentile(arr, lo))
+            hi_v = float(np.nanpercentile(arr, hi))
+            if not np.isfinite(lo_v): lo_v = 0.0
+            if not np.isfinite(hi_v): hi_v = 1.0
+            if hi_v - lo_v < 1e-6:
+                hi_v = lo_v + 1e-6
+            stats[wi] = (lo_v, hi_v)
+    default = (0.0, 1.0)
+    return stats, default
 
 if theta_func1:
     if isflux:
@@ -373,11 +503,6 @@ def resolve_cosine_triplet(theta_0, theta_1, theta_2, use_cos0, use_cos1, use_co
     return base, dA, dB, varA, varB
 
 if mode != "NoIn":
-    if args.fine:
-        fine = fineman([float(t) for t in args.fine.split(",")], isxl)
-    else:
-        fine = ""
-
     if isxl and useblocks:
         if len(weights_a) == 25:
             weights_a = weighttoxl(weights_a)
@@ -400,67 +525,21 @@ def _resolve_weight_index(key):
     if tag in BLOCKID:                return BLOCKID.index(tag)
     return -1
 
-def _apply_cosine_blend(a, b, kmin, kmax, cur_alpha, variant):
-    a_f = a.detach().float()
-    b_f = b.detach().float()
-    simab = F.cosine_similarity(a_f.view(-1), b_f.view(-1), dim=0)
+def _apply_cosine_blend(a, b, kmin, kmax, cur_alpha, variant, tau=0.20, floor=0.05):
+    a_f = a.detach().float().view(-1)
+    b_f = b.detach().float().view(-1)
+    sim = F.cosine_similarity(a_f, b_f, dim=0).clamp_(-0.999, 0.999)
     if variant == 1:
-        dot = torch.dot(a_f.view(-1), b_f.view(-1))
-        denom = (a_f.norm() * b_f.norm())
-        mag = dot / denom if denom != 0 else torch.tensor(0., device=a.device)
-        simab = 0.5 * (simab + mag)
-    k = ((simab - kmin) / max(kmax - kmin, 1e-6) - abs(float(cur_alpha))).clamp_(0, 1)
-    return b * (1 - k) + a * k
-
-def _finetune_inplace(key, tens, fine):
-    if "first_stage_model" in key or not fine:
-        return tens
-
-    if isinstance(fine, dict):
-        mul = fine.get("mul", {}) or {}
-        m = 1.0
-
-        if any(s in key for s in ("double_block", "double_blocks", "db.")):
-            m *= float(mul.get("double_block", 1.0))
-        if any(s in key for s in (".img_in", "image_in", "image_proj")):
-            m *= float(mul.get("img_in", 1.0))
-        if any(s in key for s in (".txt_in", "context_in", "text_in", "clip_proj")):
-            m *= float(mul.get("txt_in", 1.0))
-        if any(s in key for s in ("time_in", "time_embed", "timestep", "vector_in")):
-            m *= float(mul.get("time", 1.0))
-        if any(s in key for s in (".out.", "final_layer", "vector_out")) or key.endswith(".out"):
-            m *= float(mul.get("out", 1.0))
-
-        if m != 1.0:
-            tens = tens * torch.as_tensor(m, device=tens.device, dtype=tens.dtype)
-
-        add = float(fine.get("add", 0.0) or 0.0)
-        if add and (key.endswith(".bias") or ".bias" in key):
-            tens = tens + torch.as_tensor(add, device=tens.device, dtype=tens.dtype)
-
-        return tens
-
-    if isinstance(fine, list):
-        idx = next((i for i, pat in enumerate(FINETUNES) if pat in key), -1)
-        if idx == -1:
-            return tens
-
-        if idx < 5:
-            return tens * torch.as_tensor(fine[idx], device=tens.device, dtype=tens.dtype)
-        else:
-            try:
-                add = torch.as_tensor(fine[5], device=tens.device, dtype=tens.dtype)
-                return tens + add
-            except Exception:
-                if isinstance(fine[5], (list, tuple)) and len(fine[5]) > 0:
-                    add = torch.as_tensor(fine[5][0], device=tens.device, dtype=tens.dtype)
-                    return tens + add
-                else:
-                    add = torch.as_tensor(float(fine[5]) if fine[5] is not None else 0.0,
-                                          device=tens.device, dtype=tens.dtype)
-                    return tens + add
-    return tens
-
+        dot  = torch.dot(a_f, b_f)
+        denom= (a_f.norm() * b_f.norm()).clamp_min(1e-12)
+        mag  = (dot / denom).clamp_(-0.999, 0.999)
+        sim  = 0.5 * (sim + mag)
+    t = ((sim - kmin) / (kmax - kmin)).clamp_(0.0, 1.0)
+    mid = 0.5 + float(cur_alpha) * 0.5
+    w = torch.sigmoid((t - mid) / max(tau, 1e-3))               # 0..1
+    w = (1.0 - floor) * w + floor
+    out = torch.lerp(b, a, w).view_as(a).to(a.dtype)
+    return out
 
 use_cos0 = bool(args.cosine0)
 use_cos1 = bool(args.cosine1)
@@ -469,12 +548,12 @@ use_cos2 = bool(args.cosine2)
 if use_cos0 or use_cos1 or use_cos2:
     base, dA, dB, varA, varB = resolve_cosine_triplet(theta_0, theta_1, theta_2, use_cos0, use_cos1, use_cos2)
 
-    kminA, kmaxA = cosine_minmax(base, dA, "Cosine(base vs A)", variant=varA)
+    statsA, defaultA = cosine_minmax_grouped(base, dA, isxl, isflux, "Cosine(base vs A)", variant=varA)
     if dB is not None:
-        kminB, kmaxB = cosine_minmax(base, dB, "Cosine(base vs B)", variant=varB)
+        statsB, defaultB = cosine_minmax_grouped(base, dB, isxl, isflux, "Cosine(base vs B)", variant=varB)
     else:
-        kminB = kmaxB = None
-        
+        statsB = {}; defaultB = (0.0, 1.0)
+
     theta_res = clone_dict_tensors(base)
 
     for key in tqdm(base.keys(), desc="Cosine structure-based blending..."):
@@ -487,6 +566,19 @@ if use_cos0 or use_cos1 or use_cos2:
         if wi < 0:
             continue
 
+        if _is_small_or_norm_or_bias(key, base[key]):
+            cur_a = alpha
+            if weights_a is not None and wi > 0: cur_a = weights_a[wi - 1]
+            if deep_a: cur_a = elementals(key, wi, deep_a, cur_a)
+            out = weighted_sum(base[key], dA[key], cur_a)
+            if dB is not None and (key in dB) and (beta is not None):
+                cur_b = beta
+                if weights_b is not None and wi > 0: cur_b = weights_b[wi - 1]
+                if deep_b: cur_b = elementals(key, wi, deep_b, cur_b)
+                out = weighted_sum(out, dB[key], cur_b)
+            theta_res[key] = _finetune_inplace(key, out, fine)
+            continue
+
         cur_a, cur_b = alpha, beta
         if wi > 0:
             if weights_a is not None:            cur_a = weights_a[wi - 1]
@@ -494,16 +586,14 @@ if use_cos0 or use_cos1 or use_cos2:
         if deep_a: cur_a = elementals(key, wi, deep_a, cur_a)
         if deep_b and dB is not None: cur_b = elementals(key, wi, deep_b, cur_b)
 
-        a = base[key]
-        b = dA[key]
-
-        out = _apply_cosine_blend(a, b, kminA, kmaxA, cur_a, variant=varA)
+        ka = statsA.get(wi, defaultA); kminA, kmaxA = ka
+        out = _apply_cosine_blend(base[key], dA[key], kminA, kmaxA, cur_a, variant=varA, tau=0.20, floor=0.05)
 
         if dB is not None and (key in dB) and (cur_b is not None):
-            out = _apply_cosine_blend(out, dB[key], kminB, kmaxB, cur_b, variant=varB)
+            kb = statsB.get(wi, defaultB); kminB, kmaxB = kb
+            out = _apply_cosine_blend(out, dB[key], kminB, kmaxB, cur_b, variant=varB, tau=0.20, floor=0.05)
 
-        out = _finetune_inplace(key, out, fine)
-        theta_res[key] = out
+        theta_res[key] = _finetune_inplace(key, out, fine)
 
     theta_0 = theta_res
 
@@ -681,6 +771,12 @@ merge_recipe = {
     "bake_in_vae":          (vae_name if args.vae else False),
     "pruned":               args.prune,
 }
+
+if args.mode == "SWAP":
+    merge_recipe["swap_components_alpha_text"] = str(args.alpha)
+elif args.mode == "CLIPXOR":
+    merge_recipe["clipxor"] = {"intersection": "elemwise_minabs_same_sign", "base": False}
+    
 metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
 
 def add_model_metadata(s256, hashed, meta, model_name):

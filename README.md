@@ -50,6 +50,9 @@ Pick one `mode` (first positional arg). Some require a third model or `beta`.
 | `NORM` | Norm/Direction Split         |       ✗       |      ✗       | Blend magnitude & direction separately |
 | `CHAN` | Channel-wise Cosine Gate     |   ✓    |      ✗       | Gate per output channel (Conv/Linear) |
 | `FREQ` | Frequency-Band Blend         |   ✓    |      ✗       | Low/high-freq mix for Conv kernels |
+| `SWAP` | Swap Component         |   ✗    |      ✗       | Swap the component like CLIP |
+| `CLIPXOR` | CLIP XOR Blend         |   ✗    |      ✗       | Extending CLIPs using XOR Blend |
+| `XDARE` | XOR CLIP DARE         |   ✗    |      ✓       | DARE Merge + CLIPXOR |
 
 ---
 
