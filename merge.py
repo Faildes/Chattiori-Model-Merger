@@ -12,14 +12,13 @@ import safetensors
 from tqdm.auto import tqdm
 
 from Utils import wgt, rand_ratio, sha256, read_metadata_from_safetensors \
-    , load_model, parse_ratio, qdtyper, maybe_to_qdtype, np_trim_percentiles \
-    , diff_inplace, clone_dict_tensors, fineman, weighttoxl, BLOCKID, BLOCKIDFLUX \
-    , BLOCKIDXLL, blockfromkey, checkpoint_dict_skip_on_merge, FINETUNES, elementals \
+    , load_model, parse_ratio, qdtyper, maybe_to_qdtype, diff_inplace \
+    , clone_dict_tensors, fineman, weighttoxl, BLOCKID, BLOCKIDFLUX \
+    , BLOCKIDXLL, blockfromkey, checkpoint_dict_skip_on_merge, elementals \
     , to_half, to_half_k, prune_model, cache, merge_cache_json, detect_arch \
-    , _swap_components_inplace, _normalize_components_list, _is_clip_key \
-    , _finetune_inplace, _clip_tier_for_xl, _clip_tier_for_flux \
-    , _clipxor_semi_hard_blend, _maybe_skip_small_norm_bias_for_clipxor \
-    , _collect_clipxor_targets, _collect_clip_pairs_by_suffix
+    , _swap_components_inplace, _normalize_components_list, _finetune_inplace \
+    , _clip_tier_for_xl, _clip_tier_for_flux, _clipxor_semi_hard_blend \
+    , _collect_clipxor_targets, _collect_clip_pairs_by_suffix, prepare_merge_cache, trim_delta
 
 # Mode Functions
 
@@ -77,6 +76,39 @@ def dare_merge(theta0, theta1, alpha, beta):
     denom = max(1.0 - float(beta), 1e-6)
     delta_hat = (m * delta) / denom
     return theta0 + alpha * delta_hat.to(theta0.dtype)
+
+def feature_weighted_merge(a, b, alpha=0.3, eps=1e-6):
+    if a.shape != b.shape or alpha == 0.0:
+        return a
+    a32 = a.detach().float()
+    b32 = b.detach().float()
+    delta = trim_delta(b32 - a32, percentile=0.5)
+    if delta.dim() == 4 and min(delta.shape[-2], delta.shape[-1]) >= 3:
+        delta = F.avg_pool2d(delta, kernel_size=3, stride=1, padding=1)
+
+    stdA = a32.std()
+    stdB = b32.std()
+    stdDelta = delta.std()
+    
+    if min(stdA, stdB, stdDelta) < eps:
+        return ((1 - alpha) * a32 + alpha * b32).to(a.dtype)
+    
+    r = (stdB / (stdA + eps)).clamp(0.5, 2.0)
+    gamma = 1.0 - 0.5 * (r - 1.0)
+    scale = (stdA / (stdDelta + eps)).pow(gamma).clamp(0.5, 1.5)
+    tone_corr = (stdA / (stdB + eps)).sqrt().clamp(0.8, 1.1)
+    
+    merged = a32 + delta * float(alpha) * scale * tone_corr
+
+    meanA = a32.mean()
+    stdMerged = merged.std()
+    if stdMerged > eps:
+        meanMerged = merged.mean()
+        mean_mix = 0.5 * (meanMerged + meanA)
+        std_mix = 0.5 * (stdMerged + stdA)
+        merged = (merged - meanMerged) / stdMerged * std_mix + mean_mix
+        
+    return merged.to(a.dtype)
 
 def ortho_merge(a, b, alpha):
     a32 = a.detach().float().view(-1)
@@ -136,7 +168,6 @@ def freq_band_blend(a, b, alpha, beta):
     dist = torch.sqrt((yy-cy)**2 + (xx-cx)**2)
     low = (dist <= cut).to(A.dtype)
     high = 1 - low
-    M = low * ((1 - alpha) + alpha) + high * ((1 - alpha) + alpha)
     Aout = low * ((1 - alpha) * A + alpha * A) + high * ((1 - alpha) * A + alpha * B)
     Bout = low * ((1 - alpha) * B + alpha * A) + high * ((1 - alpha) * B + alpha * B)
     F = low * Aout + high * Bout
@@ -169,6 +200,7 @@ theta_funcs = {
     "FREQ": (None,           freq_band_blend,            "Frequency-Band Blend"),
     "SWAP": (None,           None,                       "Swap Components"),
     "CLIPXOR": (None,        None,                       "CLIP XOR (union-minus-intersection)"),
+    "FWM":  (None,           feature_weighted_merge,     "Feature Weighted Merge"),
 }
 modes_need_m2   = {"sAD", "AD", "TRS", "ST",  "TD", "SIM", "MD", "SPRSE", "HUB", "CHAN", "FREQ"}
 modes_need_beta = {"TRS", "ST", "TS",  "SIM", "MD", "DARE"}
@@ -245,15 +277,21 @@ output_path = os.path.join(args.model_path, output_file)
 merge_cache_json(args.model_path)
 cache_data = cache("hashes", None)
 
-i = 0
-while os.path.isfile(output_path):
+if os.path.isfile(output_path):
     if args.force:
-        os.remove(output_path); break
-    output_name = f"{args.output}_{i:02}"
-    output_file = f"{output_name}.{'safetensors' if args.save_safetensors else 'ckpt'}"
-    output_path = os.path.join(args.model_path, output_file)
-    i += 1
-    if not os.path.isfile(output_path): print(f"Assigned result checkpoint name as {output_file}\n")
+        print(f"[force] Overwriting existing file: {output_path}")
+        try:
+            os.remove(output_path)
+        except Exception as e:
+            print(f"[force] Failed to remove existing file: {e}")
+    else:
+        i = 0
+        while os.path.isfile(output_path):
+            output_name = f"{args.output}_{i:02}"
+            output_file = f"{output_name}.{'safetensors' if args.save_safetensors else 'ckpt'}"
+            output_path = os.path.join(args.model_path, output_file)
+            i += 1
+        print(f"Assigned result checkpoint name as {output_file}\n")
 
 stem = lambda p: os.path.splitext(os.path.basename(p))[0]
 
@@ -422,8 +460,8 @@ def _is_small_or_norm_or_bias(key, tens):
         return True
     return False
 
-def cosine_minmax_grouped(base_dict, other_dict, desc, variant=0, lo=5.0, hi=95.0):
-    by_block = {}  # wi -> [values]
+def cosine_minmax_grouped(base_dict, other_dict, desc, variant=0, lo=10.0, hi=90.0):
+    by_block = {}
     for k in tqdm(base_dict.keys(), desc=desc):
         if "first_stage_model" in k or "model" not in k or k not in other_dict:
             continue
@@ -432,34 +470,38 @@ def cosine_minmax_grouped(base_dict, other_dict, desc, variant=0, lo=5.0, hi=95.
             continue
         a = base_dict[k].detach().float().view(-1)
         b = other_dict[k].detach().float().view(-1)
-        if a.numel()==0 or b.numel()==0 or a.shape!=b.shape:
+        if a.numel() == 0 or b.numel() == 0 or a.shape != b.shape:
             continue
         if _is_small_or_norm_or_bias(k, base_dict[k]):
             continue
-        if variant == 0:
-            val = F.cosine_similarity(a, b, dim=0).item()
+
+        cos = F.cosine_similarity(a, b, dim=0)
+        cos = torch.nan_to_num(cos, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        if variant == 1:
+            dot = torch.dot(a, b)
+            denom = float(a.norm() * b.norm()) + 1e-12
+            mag = (dot / denom)
+            sim = 0.5 * (cos + mag)
         else:
-            dot = torch.dot(a, b).item()
-            denom = float(a.norm().item() * b.norm().item())
-            mag = (dot / denom) if denom != 0.0 else 0.0
-            val = 0.5 * (float(F.cosine_similarity(a, b, dim=0).item()) + mag)
-        by_block.setdefault(wi, []).append(val)
+            sim = cos
+
+        sim = float(torch.clamp(sim, -1.0, 1.0))
+        by_block.setdefault(wi, []).append(sim)
 
     stats = {}
     for wi, vals in by_block.items():
         arr = np.asarray(vals, dtype=np.float64)
-        if arr.size == 0 or not np.isfinite(arr).any():
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
             stats[wi] = (0.0, 1.0)
-        else:
-            lo_v = float(np.nanpercentile(arr, lo))
-            hi_v = float(np.nanpercentile(arr, hi))
-            if not np.isfinite(lo_v): lo_v = 0.0
-            if not np.isfinite(hi_v): hi_v = 1.0
-            if hi_v - lo_v < 1e-6:
-                hi_v = lo_v + 1e-6
-            stats[wi] = (lo_v, hi_v)
-    default = (0.0, 1.0)
-    return stats, default
+            continue
+        lo_v = float(np.percentile(arr, lo))
+        hi_v = float(np.percentile(arr, hi))
+        if hi_v - lo_v < 1e-6:
+            hi_v = lo_v + 1e-6
+        stats[wi] = (max(-1.0, lo_v), min(1.0, hi_v))
+    return stats, (0.0, 1.0)
 
 if theta_func1:
     if isflux:
@@ -509,7 +551,7 @@ if mode != "NoIn":
             print(f"alpha weight converted for XL{weights_a}")
         elif len(weights_a) == 19:
             weights_a += [0]
-        if mode != "DARE" and usebeta:
+        if mode in modes_need_m2 and usebeta:
             if len(weights_b) == 25:
                 weights_b = weighttoxl(weights_b)
                 print(f"beta weight converted for XL{weights_b}")
@@ -528,17 +570,28 @@ def _resolve_weight_index(key):
 def _apply_cosine_blend(a, b, kmin, kmax, cur_alpha, variant, tau=0.20, floor=0.05):
     a_f = a.detach().float().view(-1)
     b_f = b.detach().float().view(-1)
-    sim = F.cosine_similarity(a_f, b_f, dim=0).clamp_(-0.999, 0.999)
+
+    sim = F.cosine_similarity(a_f, b_f, dim=0)
+    sim = torch.nan_to_num(sim, nan=0.0, posinf=1.0, neginf=-1.0)
+
     if variant == 1:
-        dot  = torch.dot(a_f, b_f)
-        denom= (a_f.norm() * b_f.norm()).clamp_min(1e-12)
-        mag  = (dot / denom).clamp_(-0.999, 0.999)
-        sim  = 0.5 * (sim + mag)
+        dot = torch.dot(a_f, b_f)
+        denom = (a_f.norm() * b_f.norm()).clamp_min(1e-12)
+        mag = (dot / denom).clamp_(-1.0, 1.0)
+        sim = 0.5 * (sim + mag)
+
+    sim = sim.clamp_(-1.0, 1.0)
+    kmin = float(np.clip(kmin, -1.0, 1.0))
+    kmax = float(np.clip(kmax, -1.0, 1.0))
+    if abs(kmax - kmin) < 1e-6:
+        kmax = kmin + 1e-6
+        
     t = ((sim - kmin) / (kmax - kmin)).clamp_(0.0, 1.0)
     mid = 0.5 + float(cur_alpha) * 0.5
-    w = torch.sigmoid((t - mid) / max(tau, 1e-3))               # 0..1
-    w = (1.0 - floor) * w + floor
-    out = torch.lerp(b, a, w).view_as(a).to(a.dtype)
+    w = torch.sigmoid((t - mid) / max(tau, 1e-3))
+    w = w.clamp(floor, 1.0 - floor)
+    
+    out = torch.lerp(a, b, w).view_as(a).to(a.dtype)
     return out
 
 use_cos0 = bool(args.cosine0)
@@ -598,6 +651,8 @@ if use_cos0 or use_cos1 or use_cos2:
     theta_0 = theta_res
 
 if mode != "NoIn":
+    merge_cache = prepare_merge_cache(theta_0.keys(), isxl, isflux, deep_a, deep_b, weights_a, weights_b, alpha, beta)
+    
     for key in tqdm(theta_0.keys(), desc=f"{merge_name} Merging..."):
         if args.vae is None and "first_stage_model" in key:
             continue
@@ -607,20 +662,14 @@ if mode != "NoIn":
             continue
         if key in checkpoint_dict_skip_on_merge:
             continue
+        if key not in merge_cache: 
+            continue
 
         a, b = theta_0[key], theta_1[key]
         al, bl = list(a.shape), list(b.shape)
 
-        wi = _resolve_weight_index(key)
-        if wi < 0:
-            continue
-
-        cur_a, cur_b = alpha, beta
-        if wi > 0:
-            if weights_a is not None:       cur_a = weights_a[wi - 1]
-            if usebeta and weights_b is not None: cur_b = weights_b[wi - 1]
-        if deep_a: cur_a = elementals(key, wi, deep_a, cur_a)
-        if deep_b: cur_b = elementals(key, wi, deep_b, cur_b)
+        wi, cur_a, cur_b = merge_cache[key]
+        a, b = theta_0[key], theta_1[key]
 
         if mode == "sAD":
             bf = b.detach().float()
@@ -665,7 +714,7 @@ if mode != "NoIn":
         else:
             ad = a
 
-        if usebeta and mode != "DARE":
+        if usebeta and mode not in ["DARE", "XDARE"]:
             c = theta_2[key]
             theta_0[key] = theta_func2(ad, b, c, cur_a, cur_b)
         elif usebeta:
@@ -674,34 +723,41 @@ if mode != "NoIn":
             theta_0[key] = theta_func2(ad, b, cur_a)
 
         theta_0[key] = _finetune_inplace(key, theta_0[key], fine)
+        
+    merge_cache = prepare_merge_cache(
+        list(set(theta_1.keys()) | (set(theta_2.keys()) if 'theta_2' in locals() and theta_2 else set())),
+        isxl, isflux, deep_a, deep_b, weights_a, weights_b, alpha, beta
+    )
+    
+    def remerge_model(target_dict, source_dict, desc, mode, theta_2=None):
+        for key in tqdm(source_dict.keys(), desc=desc):
+            if isflux or key in checkpoint_dict_skip_on_merge or "model" not in key or key in target_dict:
+                continue
+
+            cache_entry = merge_cache.get(key)
+            if cache_entry is None:
+                target_dict[key] = source_dict[key]
+                continue
+
+            _,_,cur_b = cache_entry
+
+            if mode in {"TRS", "ST"} and theta_2 is not None and key in theta_2:
+                b, c = source_dict[key], theta_2[key]
+                try:
+                    target_dict[key] = weighted_sum(b, c, cur_b)
+                except Exception:
+                    target_dict[key] = b
+            else:
+                target_dict[key] = source_dict[key]
+
+        return target_dict
 
     if mode != "DARE":
-        for key in tqdm(theta_1.keys(), desc="Remerging..."):
-            if isflux or key in checkpoint_dict_skip_on_merge or "model" not in key or key in theta_0:
-                continue
-            try:
-                if mode in {"TRS", "ST"} and theta_2 is not None and key in theta_2:
-                    b, c = theta_1[key], theta_2[key]
-                    cur_b = beta
-                    wi = _resolve_weight_index(key)
-                    if wi >= 0 and weights_b is not None:
-                        cur_b = weights_b[wi]
-                    if deep_b:
-                        cur_b = elementals(key, wi, deep_b, cur_b)
-                    theta_0[key] = weighted_sum(b, c, cur_b)
-                else:
-                    theta_0[key] = theta_1[key]
-            except NameError:
-                theta_0[key] = theta_1[key]
-
+        theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode, theta_2=theta_2)
     del theta_1
     try:
         if theta_2:
-            for key in tqdm(theta_2.keys(), desc="Remerging..."):
-                if key in checkpoint_dict_skip_on_merge:
-                    continue
-                if "model" in key and key not in theta_0:
-                    theta_0[key] = theta_2[key]
+            theta_0 = remerge_model(theta_0, theta_2, desc="Remerging...", mode=mode)
             del theta_2
     except NameError:
         pass
@@ -795,25 +851,36 @@ if mode in modes_need_m2:
 
 metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
 
-print(f"Saving as {output_file}...")
-
+delete_targets = []
 if args.delete_source:
     for p, cond in [
-        (model_0_path, True),
-        (model_1_path, mode != "NoIn"),
-        (model_2_path, mode in modes_need_m2),
+        (os.path.join(args.model_path, args.model_0), True),
+        (os.path.join(args.model_path, args.model_1), mode != "NoIn"),
+        (os.path.join(args.model_path, args.model_2), mode in modes_need_m2),
     ]:
-        if cond:
-            os.remove(p)
+        if cond and os.path.isfile(p):
+            delete_targets.append(p)
 
-if args.save_safetensors:
-    with torch.no_grad():
-        safetensors.torch.save_file(
-            theta_0, output_path,
-            metadata=None if args.no_metadata else metadata
-        )
-else:
-    torch.save({"state_dict": theta_0}, output_path)
+merge_success = False
+try:
+    print(f"Saving as {output_file}...")
+    if args.save_safetensors:
+        with torch.no_grad():
+            safetensors.torch.save_file(
+                theta_0, output_path,
+                metadata=None if args.no_metadata else metadata
+            )
+    else:
+        torch.save({"state_dict": theta_0}, output_path)
 
-del theta_0
-print(f"Done! ({round(os.path.getsize(output_path)/1073741824, 2)}G)")
+    merge_success = True
+    print(f"Done! ({round(os.path.getsize(output_path)/1073741824, 2)}G)")
+
+finally:
+    if args.delete_source and merge_success:
+        for p in delete_targets:
+            try:
+                os.remove(p)
+                print(f"[delete_source] Removed source: {p}")
+            except Exception as e:
+                print(f"[delete_source] Failed to remove {p}: {e}")

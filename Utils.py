@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 import concurrent.futures as cf
 from typing import List, Tuple
 from pathlib import Path
+import torch.nn.functional as F
 
 FP_SET = {torch.float32, torch.float16, torch.float64, torch.bfloat16}
 
@@ -533,6 +534,32 @@ def elementals(key: str, weight_index: int, deep: list[str], current_alpha: floa
 
     return current_alpha
 
+def prepare_merge_cache(theta_keys, isxl, isflux, deep_a, deep_b, weights_a, weights_b, alpha, beta):
+    keymap = {}
+    for k in tqdm(theta_keys, desc="Building merge cache..."):
+        block, tag = blockfromkey(k, isxl, isflux)
+        if block == "Not Merge": 
+            continue
+        if isflux and tag in BLOCKIDFLUX:
+            wi = BLOCKIDFLUX.index(tag)
+        elif isxl and tag in BLOCKIDXLL:
+            wi = BLOCKIDXLL.index(tag)
+        elif tag in BLOCKID:
+            wi = BLOCKID.index(tag)
+        else:
+            wi = -1
+
+        cur_a = weights_a[wi - 1] if (weights_a is not None and wi > 0) else alpha
+        cur_b = weights_b[wi - 1] if (weights_b is not None and wi > 0) else beta
+
+        if deep_a:
+            cur_a = elementals(k, wi, deep_a, cur_a)
+        if deep_b:
+            cur_b = elementals(k, wi, deep_b, cur_b)
+
+        keymap[k] = (wi, cur_a, cur_b)
+    return keymap
+
 def diff_inplace(dst, src, func, desc):
     for k in tqdm(dst.keys(), desc=desc):
         if 'model' not in k: 
@@ -900,3 +927,9 @@ def _finetune_inplace(key, tens, fine):
                                           device=tens.device, dtype=tens.dtype)
                     return tens + add
     return tens
+
+def trim_delta(delta: torch.Tensor, percentile: float = 0.5) -> torch.Tensor:
+    if delta.dim() == 4 and min(delta.shape[-2:]) > 2:
+        blurred = F.avg_pool2d(delta, kernel_size=3, stride=1, padding=1)
+        delta = delta * (1 - percentile) + blurred * percentile
+    return delta

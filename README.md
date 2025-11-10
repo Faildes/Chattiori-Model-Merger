@@ -53,6 +53,7 @@ Pick one `mode` (first positional arg). Some require a third model or `beta`.
 | `SWAP` | Swap Component         |   ✗    |      ✗       | Swap the component like CLIP |
 | `CLIPXOR` | CLIP XOR Blend         |   ✗    |      ✗       | Extending CLIPs using XOR Blend |
 | `XDARE` | XOR CLIP DARE         |   ✗    |      ✓       | DARE Merge + CLIPXOR |
+| `FWM` | Feature Weighted Merge         |   ✗    |      ✗       | True merges between different base model, same architecture |
 
 ---
 
