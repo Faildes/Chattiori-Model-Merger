@@ -70,6 +70,13 @@ checkpoint_dict_replacements = {
 checkpoint_dict_skip_on_merge = ["cond_stage_model.transformer.text_model.embeddings.position_ids"]
 vae_ignore_keys = {"model_ema.decay", "model_ema.num_updates"}
 
+def normalize_path(path: str) -> str:
+    path = os.path.abspath(path)
+    if os.name == "nt":
+        if not path.startswith("\\\\?\\"):
+            path = "\\\\?\\" + path
+    return str(Path(path).expanduser().resolve())
+
 def tagdict(presets: str) -> dict:
     """Parse presets text into a dict if value part has exactly 26 items."""
     wdict = {}

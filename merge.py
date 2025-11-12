@@ -18,7 +18,7 @@ from Utils import wgt, rand_ratio, sha256, read_metadata_from_safetensors \
     , to_half, to_half_k, prune_model, cache, merge_cache_json, detect_arch \
     , _swap_components_inplace, _normalize_components_list, _finetune_inplace \
     , _clip_tier_for_xl, _clip_tier_for_flux, _clipxor_semi_hard_blend \
-    , _collect_clipxor_targets, _collect_clip_pairs_by_suffix, prepare_merge_cache, trim_delta
+    , _collect_clipxor_targets, _collect_clip_pairs_by_suffix, prepare_merge_cache, trim_delta, normalize_path
 
 # Mode Functions
 
@@ -273,7 +273,7 @@ else:
     cosine0 = cosine1 = False
 output_name = args.output
 output_file = f"{output_name}.{'safetensors' if args.save_safetensors else 'ckpt'}"
-output_path = os.path.join(args.model_path, output_file)
+output_path = normalize_path(os.path.join(args.model_path, output_file))
 merge_cache_json(args.model_path)
 cache_data = cache("hashes", None)
 
@@ -304,7 +304,7 @@ if args.rand_alpha is not None:
 if args.rand_beta is not None:
     args.beta, beta_seed,  deep_b,  beta_info  = rand_ratio(args.rand_beta)
 
-model_0_path = os.path.join(args.model_path, args.model_0)
+model_0_path = normalize_path(os.path.join(args.model_path, args.model_0))
 if mode == "RM":
     print(sha256(model_0_path, f"checkpoint/{stem(model_0_path)}"))
     meta = read_metadata_from_safetensors(model_0_path)
@@ -324,7 +324,7 @@ model_1_sha256 = model_2_sha256 = None
 
 if mode != "NoIn":
     interp_method = 0
-    model_1_path = os.path.join(args.model_path, args.model_1)
+    model_1_path = normalize_path(os.path.join(args.model_path, args.model_1))
     model_1_name = args.m1_name or stem(model_1_path)
     print(f"Loading {model_1_name}...")
     theta_1, model_1_sha256, model_1_hash, model_1_meta, cache_data = load_model(model_1_path, device, cache_data=cache_data)
@@ -424,7 +424,7 @@ if mode != "NoIn":
     else:
         weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
         if mode in modes_need_m2:
-            model_2_path = os.path.join(args.model_path, args.model_2)
+            model_2_path = normalize_path(os.path.join(args.model_path, args.model_2))
             model_2_name = args.m2_name or stem(model_2_path)
             print(f"Loading {model_2_name}...")
             theta_2, model_2_sha256, model_2_hash, model_2_meta, cache_data = load_model(model_2_path, device, cache_data=cache_data)
@@ -443,7 +443,7 @@ else:
 
 if args.vae:
     vae_name = stem(args.vae)
-    vae, *_ = load_model(args.vae, device, verify_hash=False)
+    vae, *_ = load_model(normalize_path(args.vae), device, verify_hash=False)
 
 if mode == "DARE":
     g = torch.Generator(device=device if device != "cpu" else "cpu")
