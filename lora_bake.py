@@ -15,7 +15,8 @@ from Utils import (
     LBLOCKS26,
     BLOCKID,
     cache,
-    dump_cache
+    dump_cache,
+    normalize_path
 )
 
 _re_digits = re.compile(r"\d+")
@@ -161,11 +162,12 @@ def _apply_lora_to_weight(W: torch.Tensor, up: torch.Tensor, down: torch.Tensor,
 
 def pluslora(lora_list, model, output, model_path, device="cpu"):
     cache_data = cache("hashes", None)
+    model_path = normalize_path(model_path)
     if not model:     return "ERROR: No model Selected"
     if not lora_list: return "ERROR: No LoRA Selected"
 
     print("Plus LoRA start")
-    mpath = os.path.join(model_path, model)
+    mpath = normalize_path(os.path.join(model_path, model))
     theta_0, *_ = load_model(mpath, device)
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
@@ -181,7 +183,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                   if isinstance(ratio_str, str) else [ratio_str] * len(BLOCKID))
         lr_strs.append("[" + ",".join(str(x) for x in ratios) + "]")
 
-        lpath = os.path.join(model_path, lora_model)
+        lpath = normalize_path(os.path.join(model_path, lora_model))
         lsd, meta, lisv2 = load_state_dict(lpath, torch.float)
         lhash, _, cache_data = sha256_from_cache(lpath, f"lora/{os.path.splitext(os.path.basename(lpath))[0]}", cache_data)
         lora_meta[lhash] = meta
@@ -247,11 +249,12 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
 
 def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     cache_data = cache("hashes", None)
+    model_path = normalize_path(model_path)
     if not model:     return "ERROR: No model Selected"
     if not lora_list: return "ERROR: No LoRA Selected"
 
     print("Plus LoRA DARE start")
-    mpath = os.path.join(model_path, model)
+    mpath = normalize_path(os.path.join(model_path, model))
     theta_0, *_ = load_model(mpath, device)
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
@@ -271,7 +274,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
                   if isinstance(ratio_str, str) else [ratio_str] * len(BLOCKID))
         lr_strs.append("[" + ",".join(str(x) for x in ratios) + "]")
 
-        lpath = os.path.join(model_path, lora_model)
+        lpath = normalize_path(os.path.join(model_path, lora_model))
         lsd, meta, lisv2 = load_state_dict(lpath, torch.float, depatch=False)
         lhash, _, cache_data = sha256_from_cache(lpath, f"lora/{os.path.splitext(os.path.basename(lpath))[0]}", cache_data)
         lora_meta[lhash] = meta
@@ -347,12 +350,13 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
     parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
     args = parser.parse_args()
+    args.model_path = normalize_path(args.model_path)
 
     ll  = get_loralist(args.loras)
-    out = os.path.join(args.model_path, f"{args.output}.{'safetensors' if args.save_safetensors else 'ckpt'}")
+    out = normalize_path(os.path.join(args.model_path, f"{args.output}.{'safetensors' if args.save_safetensors else 'ckpt'}"))
 
     if args.dare:
-        mainlora = os.path.join(args.model_path, ll[0][0])
+        mainlora = normalize_path(os.path.join(args.model_path, ll[0][0]))
         darelora(mainlora, ll, args.checkpoint, out, args.model_path, args.device)
     else:
         pluslora(ll, args.checkpoint, out, args.model_path, args.device)
