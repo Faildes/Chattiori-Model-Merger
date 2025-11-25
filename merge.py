@@ -601,9 +601,9 @@ use_cos2 = bool(args.cosine2)
 if use_cos0 or use_cos1 or use_cos2:
     base, dA, dB, varA, varB = resolve_cosine_triplet(theta_0, theta_1, theta_2, use_cos0, use_cos1, use_cos2)
 
-    statsA, defaultA = cosine_minmax_grouped(base, dA, isxl, isflux, "Cosine(base vs A)", variant=varA)
+    statsA, defaultA = cosine_minmax_grouped(base, dA, "Cosine(base vs A)", variant=varA)
     if dB is not None:
-        statsB, defaultB = cosine_minmax_grouped(base, dB, isxl, isflux, "Cosine(base vs B)", variant=varB)
+        statsB, defaultB = cosine_minmax_grouped(base, dB, "Cosine(base vs B)", variant=varB)
     else:
         statsB = {}; defaultB = (0.0, 1.0)
 
