@@ -17,7 +17,7 @@ Supports **`.ckpt`** and **`.safetensors`**. Runs on **CPU by default** (GPU opt
 
 ## Architectures & Formats
 
-- **Architectures:** SD 1.x / 2.x / XL and **Flux.1** (via `detect_arch`)
+- **Architectures:** SD 1.x / 2.x / XL / Flux.1 / Z-Image (via `detect_arch`)
 - **Checkpoints:** `.ckpt` (PyTorch) and `.safetensors`
 - **VAE:** Optional bake-in with `--vae`
 - **DTypes:** fp32 (default), **fp16** (`--save_half`), **fp8** (`--save_quarter`, experimental)
