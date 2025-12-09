@@ -10,9 +10,11 @@ import filelock
 import hashlib
 from tqdm.auto import tqdm
 import concurrent.futures as cf
-from typing import List, Tuple
+from typing import List, Tuple, NamedTuple
 from pathlib import Path
 import torch.nn.functional as F
+from collections import defaultdict
+from scipy.optimize import linear_sum_assignment
 
 FP_SET = {torch.float32, torch.float16, torch.float64, torch.bfloat16}
 
@@ -25,6 +27,8 @@ BLOCKID = ["BASE"] + [f"IN{i:02}" for i in range(12)] + ["M00"] + [f"OUT{i:02}" 
 BLOCKIDXLL = ["BASE"] + [f"IN{i:02}" for i in range(9)] + ["M00"] + [f"OUT{i:02}" for i in range(9)] + ["VAE"]
 BLOCKIDXL = ["BASE"] + [f"IN{i}" for i in range(9)] + ["M"] + [f"OUT{i}" for i in range(9)] + ["VAE"]
 BLOCKIDFLUX = ["CLIP", "T5", "IN"] + ["D{:002}".format(x) for x in range(19)] + ["S{:002}".format(x) for x in range(38)] + ["OUT"] # Len: 61
+BLOCKIDZI = ["BASE","CONT","NOISE"] + [f"L{i:02}" for i in range(30)] + ["VAE"]
+
 _re_inp = re.compile(r'\.input_blocks\.(\d+)\.')
 _re_mid = re.compile(r'\.middle_block\.(\d+)\.')
 _re_out = re.compile(r'\.output_blocks\.(\d+)\.')
@@ -88,9 +92,12 @@ def tagdict(presets: str) -> dict:
                 wdict[key.strip()] = w.strip()
     return wdict
 
-file_path = os.path.join(os.getcwd(), "mbwpresets.txt")
+def base_path(path: str) -> str:
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), path)
+
+file_path = base_path("mbwpresets.txt")
 if not os.path.isfile(file_path):
-    shutil.copyfile(os.path.join(os.getcwd(), "mbwpresets_master.txt"), file_path)
+    shutil.copyfile(base_path("mbwpresets_master.txt"), file_path)
 weights_presets_list = tagdict(open(file_path).read())
 
 _SPLIT = re.compile(r"[,\n]+")
@@ -356,12 +363,31 @@ def read_metadata_from_safetensors(filename):
         res[k] = v
     return res
 
-def prune_model(theta, name, args, isxl=False, isflux=False):
-    condname = 'clip.cond_stage_model.' if isflux else ('conditioner.' if isxl else 'cond_stage_model.')
+def prune_model(theta, name, args, isxl=False, isflux=False, iszi=False):
+    if not (isxl or isflux or iszi):
+        _, _, auto_iszi = detect_arch(theta)
+        iszi = iszi or auto_iszi
+
+    if isflux:
+        cond_prefixes = ['clip.cond_stage_model.']
+    elif isxl:
+        cond_prefixes = ['conditioner.']
+    elif iszi:
+        cond_prefixes = ['text_encoders.qwen3_4b.']
+    else:
+        cond_prefixes = ['cond_stage_model.']
+
+    roots = [
+        'model.diffusion_model.',
+        'depth_model.',
+        'first_stage_model.',
+        'vae.',
+    ] + cond_prefixes
+
     sd_pruned = {}
 
     for key in tqdm(theta.keys(), desc=f"Pruning {name}..."):
-        if not key.startswith(('model.diffusion_model.', 'depth_model.', 'first_stage_model.', condname)):
+        if not any(key.startswith(r) for r in roots):
             continue
 
         k_in = key
@@ -382,6 +408,7 @@ def prune_model(theta, name, args, isxl=False, isflux=False):
         sd_pruned[key] = v
 
     return sd_pruned
+
 
 def transform_checkpoint_dict_key(k: str):
     for src, rep in checkpoint_dict_replacements.items():
@@ -439,7 +466,8 @@ def maybe_to_qdtype(a, b, qa, qb, device, isflux):
 def detect_arch(theta):
     isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta
     isflux = any("double_block" in k for k in theta.keys())
-    return isxl, isflux
+    iszi = any("x_embedder." in k for k in theta.keys())
+    return isxl, isflux, iszi
 
 def q_dequantize(sd, qtype, device, dtype, setbnb=True):
     from bitsandbytes.functional import dequantize_4bit
@@ -475,7 +503,7 @@ def blocker(blocks: str, blockids: list[str]) -> str:
             out.append(w)
     return " ".join(out)
 
-def blockfromkey(key: str, isxl: bool = False, isflux: bool = False):
+def blockfromkey(key: str, isxl: bool = False, isflux: bool = False, iszi: bool = False) -> Tuple[str, str]:
     # SD1.5
     if not isxl and not isflux:
         if "time_embed" in key: idx = -2
@@ -500,20 +528,35 @@ def blockfromkey(key: str, isxl: bool = False, isflux: bool = False):
         return "Not Merge", "Not Merge"
 
     # SDXL
-    if not ("weight" in key or "bias" in key):     return "Not Merge", "Not Merge"
-    if "label_emb" in key or "time_embed" in key:  return "Not Merge", "Not Merge"
-    if "conditioner.embedders" in key:             return "BASE", "BASE"
-    if "first_stage_model" in key:                 return "VAE",  "BASE"
+    if isxl:
+        if not ("weight" in key or "bias" in key):     return "Not Merge", "Not Merge"
+        if "label_emb" in key or "time_embed" in key:  return "Not Merge", "Not Merge"
+        if "conditioner.embedders" in key:             return "BASE", "BASE"
+        if "first_stage_model" in key:                 return "VAE",  "BASE"
 
-    if "model.diffusion_model" in key:
-        if "model.diffusion_model.out." in key:    return "OUT8", "OUT08"
-        blk = (re.findall(r'input|mid|output', key) or [""])[0].upper().replace("PUT", "")
-        nums = re.sub(r"\D", "", key)
-        tag  = (nums[:1] + "0") if "MID" in blk else nums[:2]
-        add  = (re.findall(r"transformer_blocks\.(\d+)\.", key) or [""])[0]
-        left = blk + tag + add
-        right = ("M00" if "MID" in blk else f"{blk}0{tag[0]}")
-        return left, right
+        if "model.diffusion_model" in key:
+            if "model.diffusion_model.out." in key:    return "OUT8", "OUT08"
+            blk = (re.findall(r'input|mid|output', key) or [""])[0].upper().replace("PUT", "")
+            nums = re.sub(r"\D", "", key)
+            tag  = (nums[:1] + "0") if "MID" in blk else nums[:2]
+            add  = (re.findall(r"transformer_blocks\.(\d+)\.", key) or [""])[0]
+            left = blk + tag + add
+            right = ("M00" if "MID" in blk else f"{blk}0{tag[0]}")
+            return left, right
+        
+    #Z-IMAGE
+    if iszi:
+        if "qwen3_4b" in key:          return "BASE", "BASE"
+        if not ("weight" in key or "bias" in key):     return "Not Merge", "Not Merge"
+        if "t_embedder" in key or "x_embedder" in key or "cap_embedder" in key or "norm_final" in key:     return "Not Merge", "Not Merge"
+        if "vae" in key:                 return "VAE",  "BASE"
+        
+        if "model.diffusion_model" in key:
+            if "model.diffusion_model.final_layer" in key:    return "L29", "L29"
+            if "model.diffusion_model.context_refiner" in key:    return "CONT", "CONT"
+            if "model.diffusion_model.noise_refiner" in key:    return "NOISE", "NOISE"
+            m = re.search(r'model\.diffusion_model\.layers\.(\d+)\.', key)
+            return f"L{int(m.group(1)):02}", f"L{int(m.group(1)):02}" if m else "Not Merge", "Not Merge"
 
     return "Not Merge", "Not Merge"
 
@@ -541,16 +584,18 @@ def elementals(key: str, weight_index: int, deep: list[str], current_alpha: floa
 
     return current_alpha
 
-def prepare_merge_cache(theta_keys, isxl, isflux, deep_a, deep_b, weights_a, weights_b, alpha, beta):
+def prepare_merge_cache(theta_keys, isxl, isflux, iszi, deep_a, deep_b, weights_a, weights_b, alpha, beta):
     keymap = {}
     for k in tqdm(theta_keys, desc="Building merge cache..."):
-        block, tag = blockfromkey(k, isxl, isflux)
+        block, tag = blockfromkey(k, isxl, isflux, iszi)
         if block == "Not Merge": 
             continue
         if isflux and tag in BLOCKIDFLUX:
             wi = BLOCKIDFLUX.index(tag)
         elif isxl and tag in BLOCKIDXLL:
             wi = BLOCKIDXLL.index(tag)
+        elif iszi and tag in BLOCKIDZI:
+            wi = BLOCKIDZI.index(tag)
         elif tag in BLOCKID:
             wi = BLOCKID.index(tag)
         else:
@@ -604,7 +649,7 @@ def _normalize_components_list(alpha_text: str):
         return {"unet", "vae", "clip-l", "clip-g", "clip", "transformer", "text", "text2"}
     return set(mapped)
 
-def _component_prefix_map(isxl: bool, isflux: bool = False):
+def _component_prefix_map(isxl: bool, isflux: bool = False, iszi: bool = False):
     if isflux:
         return {
             "transformer": ["transformer."],
@@ -612,10 +657,11 @@ def _component_prefix_map(isxl: bool, isflux: bool = False):
             "text":        ["text_encoder.", "conditioner.embedders.", "clip.", "t5."],
             "text2":       ["text_encoder_2."],
             "unet":        ["transformer."],
-            "clip":        ["text_encoder.", "text_encoder_2.", "conditioner.embedders.", "clip."],
+            "clip":        ["text_encoder.", "text_encoder_2.", "conditioner.embedders.", "clip.", "t5."],
             "clip-l":      ["text_encoder."],
             "clip-g":      ["text_encoder_2."],
         }
+
     if isxl:
         return {
             "unet":   ["model.diffusion_model."],
@@ -634,13 +680,36 @@ def _component_prefix_map(isxl: bool, isflux: bool = False):
                 "conditioner.embedders.",
                 "text_encoders.", "clip_l.", "clip_g."
             ],
+            "text": [
+                "conditioner.embedders.",
+                "text_encoders."
+            ],
+            "text2": [],
+            "transformer": ["model.diffusion_model."],
         }
-    else:
+
+    if iszi:
         return {
-            "unet": ["model.diffusion_model."],
-            "vae":  ["first_stage_model."],
-            "clip": ["cond_stage_model.", "clip."],
+            "unet":        ["model.diffusion_model."],
+            "transformer": ["model.diffusion_model."],
+            "vae":         ["first_stage_model.", "vae."],
+            "text":        ["qwen3_4b.", "cap_embedder."],
+            "text2":       [],
+            "clip":        ["qwen3_4b.", "cap_embedder."],
+            "clip-l":      ["qwen3_4b."],
+            "clip-g":      ["cap_embedder."],
         }
+
+    # SD1.x / SD2.x (non-XL, non-Flux, non-ZI)
+    return {
+        "unet": ["model.diffusion_model."],
+        "vae":  ["first_stage_model."],
+        "clip": ["cond_stage_model.", "clip."],
+        "text": ["cond_stage_model.", "clip."],
+        "text2": [],
+        "transformer": ["model.diffusion_model."],
+    }
+
 
 def _key_belongs_to_component(key: str, prefixes: list[str]) -> bool:
     for p in prefixes:
@@ -650,16 +719,28 @@ def _key_belongs_to_component(key: str, prefixes: list[str]) -> bool:
             return True
     return False
 
-def _swap_components_inplace(theta_dst: dict, theta_src: dict, components: set[str], isxl: bool, isflux: bool):
-    pref = _component_prefix_map(isxl, isflux)
+def _swap_components_inplace(
+    theta_dst: dict,
+    theta_src: dict,
+    components: set[str],
+    isxl: bool,
+    isflux: bool,
+    iszi: bool = False,
+):
+    if not (isxl or isflux or iszi):
+        _, _, auto_iszi = detect_arch(theta_src)
+        iszi = iszi or auto_iszi
+
+    pref = _component_prefix_map(isxl, isflux, iszi)
     selected = set()
     for c in components:
         if c in pref:
             selected.add(c)
-        elif c in {"clip-l","clip-g"} and "clip" in pref:
+        elif c in {"clip-l", "clip_g"} and "clip" in pref:
             selected.add(c)
         elif c == "clip" and "clip" in pref:
             selected.add("clip")
+
     prefixes = [p for c in selected for p in pref.get(c, [])]
 
     moved, created, skipped_shape = 0, 0, 0
@@ -676,14 +757,18 @@ def _swap_components_inplace(theta_dst: dict, theta_src: dict, components: set[s
                 created += 1
     return moved, created, skipped_shape, theta_dst
 
-def _is_clip_key(key: str, isxl: bool, isflux: bool) -> bool:
+
+def _is_clip_key(key: str, isxl: bool, isflux: bool, iszi: bool = False) -> bool:
     if isflux:
         prefixes = ["text_encoder.", "text_encoder_2.", "conditioner.embedders.", "clip.", "t5."]
     elif isxl:
         prefixes = ["conditioner.embedders.", "text_encoders.", "clip_l.", "clip_g."]
+    elif iszi:
+        prefixes = ["qwen3_4b.", "cap_embedder."]
     else:
         prefixes = ["cond_stage_model.", "clip."]
     return any(key.startswith(p) for p in prefixes)
+
 
 def _elemwise_union_minus_intersection(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     same_sign = torch.sign(a) == torch.sign(b)
@@ -739,10 +824,11 @@ def _maybe_skip_small_norm_bias_for_clipxor(key: str, tens: torch.Tensor) -> boo
         return True
     return False
 
-def _collect_clipxor_targets(theta_base: dict, theta_other: dict, isxl: bool, isflux: bool):
+def _collect_clipxor_targets(theta_base: dict, theta_other: dict,
+                             isxl: bool, isflux: bool, iszi: bool = False):
     targets = []
     for k, A in theta_base.items():
-        if not _is_clip_key(k, isxl, isflux):
+        if not _is_clip_key(k, isxl, isflux, iszi):
             continue
         B = theta_other.get(k)
         if getattr(A, "shape", None) != getattr(B, "shape", None):
@@ -752,7 +838,7 @@ def _collect_clipxor_targets(theta_base: dict, theta_other: dict, isxl: bool, is
         targets.append(k)
     return targets
 
-def _clip_roots_for_arch(isxl: bool, isflux: bool):
+def _clip_roots_for_arch(isxl: bool, isflux: bool, iszi: bool = False):
     if isflux:
         # Flux: T5 / text encoders
         return [
@@ -765,11 +851,18 @@ def _clip_roots_for_arch(isxl: bool, isflux: bool):
             "text_encoders.encoder_l.", "text_encoders.encoder_g.",
             "clip_l.", "clip_g."
         ]
+    if iszi:
+        # Z-Image: Qwen + caption embedder
+        return [
+            "qwen3_4b.",
+            "cap_embedder.",
+        ]
     # SD1.x / SD2.x (non-XL)
     return ["cond_stage_model.", "clip."]
 
-def _iter_clip_items(sd: dict, isxl: bool, isflux: bool):
-    roots = _clip_roots_for_arch(isxl, isflux)
+
+def _iter_clip_items(sd: dict, isxl: bool, isflux: bool, iszi: bool = False):
+    roots = _clip_roots_for_arch(isxl, isflux, iszi)
     for k, v in sd.items():
         for r in roots:
             if k.startswith(r):
@@ -780,13 +873,14 @@ def _iter_clip_items(sd: dict, isxl: bool, isflux: bool):
 
 def _collect_clip_pairs_by_suffix(sd_a: dict, sd_b: dict,
                                   isxl_a: bool, isflux_a: bool,
-                                  isxl_b: bool, isflux_b: bool):
+                                  isxl_b: bool, isflux_b: bool,
+                                  iszi_a: bool = False, iszi_b: bool = False):
     # map suffix -> (orig_key, tensor) for A and B separately
     map_a = {}
-    for k, root, suf, v in _iter_clip_items(sd_a, isxl_a, isflux_a):
+    for k, root, suf, v in _iter_clip_items(sd_a, isxl_a, isflux_a, iszi_a):
         map_a[suf] = (k, v)
     map_b = {}
-    for k, root, suf, v in _iter_clip_items(sd_b, isxl_b, isflux_b):
+    for k, root, suf, v in _iter_clip_items(sd_b, isxl_b, isflux_b, iszi_b):
         map_b[suf] = (k, v)
 
     # intersect by suffix and by matching shape
@@ -814,6 +908,14 @@ def _clip_tier_for_flux(key: str) -> str:
         return "t5"
     if ("clip" in k) and ("text" in k or "emb" in k or "proj" in k):
         return "clip"
+    return "other"
+
+def _clip_tier_for_zi(key: str) -> str:
+    k = key.lower()
+    if ("qwen3_4b" in k):
+        return "qwen3_4b"
+    if ("cap_embedder" in k):
+        return "cap_embedder"
     return "other"
 
 def _norm_stats(t: torch.Tensor):
@@ -940,3 +1042,289 @@ def trim_delta(delta: torch.Tensor, percentile: float = 0.5) -> torch.Tensor:
         blurred = F.avg_pool2d(delta, kernel_size=3, stride=1, padding=1)
         delta = delta * (1 - percentile) + blurred * percentile
     return delta
+
+def prune_extras_vs_model1(theta_base, theta_ref):
+    to_delete = []
+    for k in theta_base.keys():
+        if "model" not in k:
+            continue
+        if k not in theta_ref:
+            to_delete.append(k)
+
+    for k in to_delete:
+        del theta_base[k]
+
+    if to_delete:
+        print(f"[TF] Pruned {len(to_delete)} keys that were not present in model_1")
+
+    return theta_base
+
+class PermutationSpec(NamedTuple):
+    perm_to_axes: dict   # {perm_name: [(weight_key, axis), ...]}
+    axes_to_perm: dict   # {weight_key: (perm_for_axis0, perm_for_axis1, ...)}
+
+
+def permutation_spec_from_axes_to_perm(axes_to_perm: dict) -> PermutationSpec:
+    perm_to_axes = defaultdict(list)
+    for wk, axis_perms in axes_to_perm.items():
+        for axis, perm in enumerate(axis_perms):
+            if perm is not None:
+                perm_to_axes[perm].append((wk, axis))
+    return PermutationSpec(perm_to_axes=dict(perm_to_axes), axes_to_perm=axes_to_perm)
+
+
+def unet_permutation_spec(isxl: bool) -> PermutationSpec:
+    def conv(name: str, p_in, p_out):
+        # weight: (out, in), bias: (out,)
+        return {
+            f"{name}.weight": (p_out, p_in),
+            f"{name}.bias":   (p_out,),
+        }
+
+    def norm(name: str, p):
+        # weight/bias: (p,)
+        return {
+            f"{name}.weight": (p,),
+            f"{name}.bias":   (p,),
+        }
+
+    def dense(name: str, p_in, p_out, bias: bool = True):
+        d = {f"{name}.weight": (p_out, p_in)}
+        if bias:
+            d[f"{name}.bias"] = (p_out,)
+        return d
+
+    def easyblock(name: str, p_in, p_out):
+        p_inner  = f"P_{name}_inner"
+        p_inner2 = f"P_{name}_inner2"
+        p_inner3 = f"P_{name}_inner3"
+        p_inner4 = f"P_{name}_inner4"
+        return {
+            **norm(f"{name}.in_layers.0", p_in),
+            **conv(f"{name}.in_layers.2", p_in, p_inner),
+            **dense(f"{name}.emb_layers.1", p_inner2, p_inner3, bias=True),
+            **norm(f"{name}.out_layers.0", p_inner4),
+            **conv(f"{name}.out_layers.3", p_inner4, p_out),
+        }
+
+    filename = "sdxl_perm.json" if isxl else "sd_perm.json"
+    with open(base_path(filename), "r", encoding="utf-8") as f:
+        spec = json.load(f)
+
+    axes_to_perm = {}
+    def bg(idx: int):
+        return None if idx < 0 else f"P_bg{idx}"
+
+    for key, value in spec.items():
+        if "skip" in value:
+            axes_to_perm[key] = (None, None, None, None)
+            continue
+
+        if "conv" in value:
+            i = int(value["conv"])
+            axes_to_perm.update(conv(key, bg(i), f"P_bg{i + 1}"))
+        elif "norm" in value:
+            i = int(value["norm"])
+            axes_to_perm.update(norm(key, bg(i)))
+        elif "dense" in value:
+            i = int(value["dense"])
+            axes_to_perm.update(
+                dense(key, bg(i), f"P_bg{i + 1}", bool(value.get("bias", True)))
+            )
+        elif "eb" in value:
+            i = int(value["eb"])
+            axes_to_perm.update(easyblock(key, bg(i), f"P_bg{i + 1}"))
+            
+    return permutation_spec_from_axes_to_perm(axes_to_perm)
+
+def get_permuted_param(ps: PermutationSpec, perm, k: str, params, except_axis=None):
+    w = params[k]
+
+    for axis, p in enumerate(ps.axes_to_perm.get(k, [])):
+        if axis == except_axis:
+            continue
+
+        if not p:
+            continue
+        
+        if p not in perm:
+            # 恒等 perm で進める
+            idx = torch.arange(w.shape[axis], device=w.device)
+            perm[p] = idx
+        else:
+            idx = perm[p].to(w.device).long()
+
+        axis_dim = w.shape[axis]
+
+        if (
+            idx.numel() != axis_dim
+            or idx.min().item() < 0
+            or idx.max().item() >= axis_dim
+        ):
+            idx = torch.arange(axis_dim, device=w.device)
+            perm[p] = idx
+
+        w = torch.index_select(w, axis, idx)
+
+    return w
+
+
+
+def apply_permutation(ps: PermutationSpec, perm: dict, params: dict) -> dict:
+    return {k: get_permuted_param(ps, perm, k, params) for k in params}
+
+
+def update_model_a(ps: PermutationSpec, perm: dict, model_a: dict, new_alpha: float):
+    for k in list(model_a.keys()):
+        if k not in ps.axes_to_perm:
+            continue
+        try:
+            perm_params = get_permuted_param(ps, perm, k, model_a)
+            model_a[k] = model_a[k] * (1.0 - new_alpha) + new_alpha * perm_params
+        except RuntimeError:
+            continue
+    return model_a
+
+def inner_matching(
+    n: int,
+    ps: PermutationSpec,
+    p: str,
+    params_a: dict,
+    params_b: dict,
+    usefp16: bool,
+    progress: bool,
+    number: int,
+    linear_sum: float,
+    perm: dict,
+    device,
+):
+    dtype = torch.float16 if usefp16 else torch.float32
+    A = torch.zeros((n, n), dtype=dtype, device=device)
+
+    for wk, axis in ps.perm_to_axes.get(p, []):
+        if wk not in params_a or wk not in params_b:
+            continue
+
+        w_a = params_a[wk]
+        w_b = get_permuted_param(ps, perm, wk, params_b, except_axis=axis)
+
+        w_a = torch.moveaxis(w_a, axis, 0).reshape(n, -1).to(device)
+        w_b = torch.moveaxis(w_b, axis, 0).reshape(n, -1).T.to(device)
+
+        if usefp16:
+            w_a = w_a.half()
+            w_b = w_b.half()
+
+        try:
+            A = A + (w_a @ w_b)
+        except RuntimeError:
+            A = A + (torch.dequantize(w_a) @ torch.dequantize(w_b))
+
+    # Hungarian
+    A_cpu = A.detach().cpu()
+    ri, ci = linear_sum_assignment(A_cpu.numpy(), maximize=True)
+    ri = torch.as_tensor(ri)
+    ci = torch.as_tensor(ci)
+
+    assert torch.equal(ri, torch.arange(len(ri))), "Unexpected row indices"
+
+    eye = torch.eye(n, device=device)
+    A_flat = A.flatten().float()
+
+    oldL = torch.vdot(A_flat, eye[perm[p].long()].flatten())
+    newL = torch.vdot(A_flat, eye[ci.long(), :].flatten())
+
+    if usefp16:
+        oldL = oldL.half()
+        newL = newL.half()
+
+    if (newL - oldL) != 0:
+        linear_sum += float(abs(newL - oldL))
+        number += 1
+
+    improved = bool(newL > oldL + 1e-12)
+    progress = progress or improved
+
+    perm[p] = ci.to(device).float()
+
+    return linear_sum, number, perm, progress
+
+def weight_matching(
+    ps: PermutationSpec,
+    params_a: dict,
+    params_b: dict,
+    max_iter: int = 1,
+    init_perm: dict | None = None,
+    usefp16: bool = False,
+    device: str | torch.device = "cpu",
+    groups: list[str] | None = None,
+):
+    perm_sizes = {
+        p: params_a[axes[0][0]].shape[axes[0][1]]
+        for p, axes in ps.perm_to_axes.items()
+        if axes and axes[0][0] in params_a
+    }
+
+    if init_perm is None:
+        perm = {p: torch.arange(n, device=device) for p, n in perm_sizes.items()}
+    else:
+        perm = {p: v.to(device).long() for p, v in init_perm.items()}
+    for p, axes in ps.perm_to_axes.items():
+        if not axes:
+            continue
+
+        size = None
+        for tensor_name, axis in axes:
+            t = params_a.get(tensor_name)
+            if t is None:
+                t = params_b.get(tensor_name)
+            if t is not None:
+                size = t.shape[axis]
+                break
+
+        if size is not None:
+            perm_sizes[p] = size
+
+    if init_perm is None:
+        perm = {
+            p: torch.arange(n, device=device).float()
+            for p, n in perm_sizes.items()
+        }
+    else:
+        perm = {p: v.to(device).float() for p, v in init_perm.items()}
+
+    special_layers = ["P_bg324"]
+    target_groups = groups if groups is not None else special_layers
+    target_groups = [g for g in target_groups if g in perm_sizes]
+
+    linear_sum: float = 0.0
+    number: int = 0
+
+    if not target_groups or max_iter <= 0:
+        return perm, 0.0
+
+    for _ in tqdm(range(max_iter), desc="Weight matching"):
+        random.shuffle(target_groups)
+        progress = False
+
+        for p in target_groups:
+            n = perm_sizes[p]
+            linear_sum, number, perm, progress = inner_matching(
+                n,
+                ps,
+                p,
+                params_a,
+                params_b,
+                usefp16,
+                progress,
+                number,
+                linear_sum,
+                perm,
+                device,
+            )
+
+        if not progress:
+            break
+
+    average = float(linear_sum) / float(number) if number > 0 else 0.0
+    return perm, average

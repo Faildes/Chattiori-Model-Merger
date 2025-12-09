@@ -2,7 +2,6 @@ from __future__ import annotations
 import os
 import numpy as np
 import json
-import copy
 import argparse
 import torch
 import torch.nn.functional as F
@@ -14,11 +13,12 @@ from tqdm.auto import tqdm
 from Utils import wgt, rand_ratio, sha256, read_metadata_from_safetensors \
     , load_model, parse_ratio, qdtyper, maybe_to_qdtype, diff_inplace \
     , clone_dict_tensors, fineman, weighttoxl, BLOCKID, BLOCKIDFLUX \
-    , BLOCKIDXLL, blockfromkey, checkpoint_dict_skip_on_merge, elementals \
+    , BLOCKIDXLL, BLOCKIDZI, blockfromkey, checkpoint_dict_skip_on_merge, elementals \
     , to_half, to_half_k, prune_model, cache, merge_cache_json, detect_arch \
     , _swap_components_inplace, _normalize_components_list, _finetune_inplace \
-    , _clip_tier_for_xl, _clip_tier_for_flux, _clipxor_semi_hard_blend \
-    , _collect_clipxor_targets, _collect_clip_pairs_by_suffix, prepare_merge_cache, trim_delta, normalize_path
+    , _clip_tier_for_xl, _clip_tier_for_flux, _clip_tier_for_zi, _clipxor_semi_hard_blend \
+    , _collect_clipxor_targets, _collect_clip_pairs_by_suffix, prepare_merge_cache\
+    , trim_delta, normalize_path, prune_extras_vs_model1, unet_permutation_spec, weight_matching, apply_permutation
 
 # Mode Functions
 
@@ -52,12 +52,28 @@ def multiply_difference(theta0, theta1, theta2, alpha, beta):
     sign = weighted_sum(theta0, theta1, beta) - theta2
     return theta2 + torch.copysign(diff, sign).to(theta2.dtype)
 
+def _match_mean_std_like_a(out, a, eps=1e-6):
+    a32 = a.detach().float()
+    o32 = out.detach().float()
+    stdA = a32.std()
+    stdO = o32.std()
+    if stdO < eps:
+        return out
+    meanA = a32.mean()
+    meanO = o32.mean()
+    mean_mix = 0.5 * (meanO + meanA)
+    std_mix = 0.5 * (stdO + stdA)
+    o32 = (o32 - meanO) / stdO * std_mix + mean_mix
+    return o32.to(out.dtype)
+
 def similarity_add_difference(a, b, c, alpha, beta):
     threshold = torch.maximum(a.abs(), b.abs())
     similarity = torch.nan_to_num(((a * b)/(threshold ** 2) + 1) * beta / 2, nan = beta)
     ab_diff = a + alpha * (b - c)
     ab_sum = a * (1 - alpha / 2) + b * (alpha / 2)
-    return torch.lerp(ab_diff, ab_sum, similarity)
+    out = torch.lerp(ab_diff, ab_sum, similarity)
+    out = _match_mean_std_like_a(out, a)
+    return out
 
 def dare_merge(theta0, theta1, alpha, beta):
     if theta0.dim() in (1, 2):
@@ -201,6 +217,7 @@ theta_funcs = {
     "SWAP": (None,           None,                       "Swap Components"),
     "CLIPXOR": (None,        None,                       "CLIP XOR (union-minus-intersection)"),
     "FWM":  (None,           feature_weighted_merge,     "Feature Weighted Merge"),
+    "TF":  (None,           None,               "Trim and Fill"),
 }
 modes_need_m2   = {"sAD", "AD", "TRS", "ST",  "TD", "SIM", "MD", "SPRSE", "HUB", "CHAN", "FREQ"}
 modes_need_beta = {"TRS", "ST", "TS",  "SIM", "MD", "DARE"}
@@ -239,6 +256,7 @@ for flag, helpmsg in {
     parser.add_argument(f"--{flag}", action="store_true", help=helpmsg, required=False)
 
 parser.add_argument("--seed",   type=int,   help="Random seed for stochastic modes (e.g., DARE)", default=None)
+parser.add_argument("--rebasin",   type=int,   help="ReBasin iterations", default=None)
 parser.add_argument("--vae",    type=str,   help="Path of VAE", default=None, required=False)
 parser.add_argument("--memo",   type=str,   help="Additional info bake in metadata", default=None)
 parser.add_argument("--fine",   type=str,   help="Finetune the given keys on model 0", default=None, required=False)
@@ -329,9 +347,9 @@ if mode != "NoIn":
     print(f"Loading {model_1_name}...")
     theta_1, model_1_sha256, model_1_hash, model_1_meta, cache_data = load_model(model_1_path, device, cache_data=cache_data)
     qd1 = qdtyper(theta_1)
-    isxl, isflux = detect_arch(theta_1)
-    if args.fine:
-        fine = fineman([float(t) for t in args.fine.split(",")], isxl)
+    isxl, isflux, iszi = detect_arch(theta_1)
+    if args.fine and not iszi:
+        fine = fineman([float(t) for t in args.fine.split(",")], isxl, isflux)
     else:
         fine = ""
         
@@ -340,7 +358,7 @@ if mode != "NoIn":
         if not components:
             components = {"unet", "vae", "clip-l", "clip-g", "clip", "transformer", "text", "text2"}
 
-        moved, created, skipped, theta_0 = _swap_components_inplace(theta_0, theta_1, components, isxl, isflux)
+        moved, created, skipped, theta_0 = _swap_components_inplace(theta_0, theta_1, components, isxl, isflux, iszi)
         print(f"[SWAP] components={sorted(list(components))}  moved:{moved}  created:{created}  shape_skipped:{skipped}")
         
         mode = "NoIn"
@@ -359,12 +377,12 @@ if mode != "NoIn":
         hard_t5   = 0.60
         hard_clip = base_hardness
         
-        isxl_a, isflux_a = detect_arch(theta_0)
-        isxl_b, isflux_b = detect_arch(theta_1)
+        isxl_a, isflux_a, iszi_a = detect_arch(theta_0)
+        isxl_b, isflux_b, iszi_b = detect_arch(theta_1)
 
-        targets = _collect_clipxor_targets(theta_0, theta_1, isxl=isxl_a, isflux=isflux_a)
+        targets = _collect_clipxor_targets(theta_0, theta_1, isxl=isxl_a, isflux=isflux_a, iszi=iszi_a)
         if not targets:
-            suffix_pairs = _collect_clip_pairs_by_suffix(theta_0, theta_1, isxl_a, isflux_a, isxl_b, isflux_b)
+            suffix_pairs = _collect_clip_pairs_by_suffix(theta_0, theta_1, isxl_a, isflux_a, iszi_a, isxl_b, isflux_b, iszi_b)
             targets = [ka for (_, ka, _) in suffix_pairs]
             
         if not targets:
@@ -396,6 +414,9 @@ if mode != "NoIn":
             elif isflux_a or isflux_b:
                 tier = _clip_tier_for_flux(key_a)
                 hardness = hard_t5 if tier == "t5" else (hard_clip if tier == "clip" else base_hardness)
+            elif iszi_a or iszi_b:
+                tier = _clip_tier_for_zi(key_a)
+                hardness = hard_t5 if tier == "qwen3_4b" else (hard_clip if tier == "cap_embedder" else base_hardness)
             else:
                 hardness = base_hardness
 
@@ -435,11 +456,40 @@ if mode != "NoIn":
             weights_b, beta, beta_info = parse_ratio(args.beta, beta_info, deep_b)
         else:
             weights_b, beta = None, None
+        if args.rebasin is not None:
+            if isflux or iszi:
+                print("[ReBasin] Unavailable architecture detected, skipping ReBasin (not supported).")
+            else:
+                print(f"[ReBasin] Running weight matching (Hungarian)... iter={args.rebasin}")
+                ps = unet_permutation_spec(isxl)
+                perm_01, gain_01 = weight_matching(
+                    ps,
+                    params_a=theta_0,
+                    params_b=theta_1,
+                    max_iter=args.rebasin,
+                    usefp16=True,
+                    device=device,
+                )
+                theta_1 = apply_permutation(ps, perm_01, theta_1)
+                print(f"[ReBasin] (0 <-> 1) average gain: {gain_01:.4f}")
+
+                if mode in modes_need_m2 and theta_2 is not None:
+                    perm_02, gain_02 = weight_matching(
+                        ps,
+                        params_a=theta_0,
+                        params_b=theta_2,
+                        max_iter=args.rebasin,
+                        usefp16=True,
+                        device=device,
+                    )
+                    theta_2 = apply_permutation(ps, perm_02, theta_2)
+                    print(f"[ReBasin] (0 <-> 2) average gain: {gain_02:.4f}")
+
 else:
     usebeta = False
     weights_a = weights_b = None
     alpha = beta = None
-    isxl, isflux = False, False
+    isxl, isflux, iszi = False, False, False
 
 if args.vae:
     vae_name = stem(args.vae)
@@ -514,23 +564,20 @@ if isflux:
     if 'theta_2' in locals() and theta_2 is not None:
         theta_0, theta_2 = maybe_to_qdtype(theta_0, theta_2, qd0, qd2, device)
 
-if mode == "TS":
-    theta_0 = clone_dict_tensors(theta_0)
+# if mode == "TS":
+#     theta_0 = clone_dict_tensors(theta_0)
     
 if args.use_dif_21:
-    theta_3 = copy.deepcopy(theta_1)
-    diff_inplace(theta_2, theta_3, get_difference, "Getting Difference of Model 1 and 2")
-    del theta_3
+    # theta_2 := model1 - model2
+    diff_inplace(theta_2, theta_1, get_difference, "Getting Difference of Model 1 and 2")
 
 if args.use_dif_10:
-    theta_3 = copy.deepcopy(theta_0)
-    diff_inplace(theta_1, theta_3, get_difference, "Getting Difference of Model 0 and 1")
-    del theta_3
+    # theta_1 := model1 - model0
+    diff_inplace(theta_1, theta_0, get_difference, "Getting Difference of Model 0 and 1")
 
 if args.use_dif_20:
-    theta_3 = copy.deepcopy(theta_0)
-    diff_inplace(theta_2, theta_3, get_difference, "Getting Difference of Model 0 and 2")
-    del theta_3
+    # theta_2 := model2 - model0
+    diff_inplace(theta_2, theta_0, get_difference, "Getting Difference of Model 0 and 2")
 
 def resolve_cosine_triplet(theta_0, theta_1, theta_2, use_cos0, use_cos1, use_cos2):
     if use_cos0:
@@ -544,7 +591,7 @@ def resolve_cosine_triplet(theta_0, theta_1, theta_2, use_cos0, use_cos1, use_co
         varA, varB = 0, 0
     return base, dA, dB, varA, varB
 
-if mode != "NoIn":
+if mode not in ["NoIn", "TF"]:
     if isxl and useblocks:
         if len(weights_a) == 25:
             weights_a = weighttoxl(weights_a)
@@ -557,13 +604,26 @@ if mode != "NoIn":
                 print(f"beta weight converted for XL{weights_b}")
             elif len(weights_b) == 19:
                 weights_b += [0]
+    elif iszi and useblocks:
+        if len(weights_a) > 34:
+            weights_a = weights_a[:34]
+            print(f"alpha weight converted for Zimage{weights_a}")
+        elif len(weights_a) < 34:
+            weights_a += [0] * (34 - len(weights_a))
+        if mode in modes_need_m2 and usebeta:
+            if len(weights_b) > 34:
+                weights_b = weights_b[:34]
+                print(f"beta weight converted for Zimage{weights_b}")
+            elif len(weights_b) < 34:
+                weights_b += [0] * (34 - len(weights_b))
         
 def _resolve_weight_index(key):
-    block, tag = blockfromkey(key, isxl, isflux)
+    block, tag = blockfromkey(key, isxl, isflux, iszi)
     if block == "Not Merge":
         return -1
     if isflux and tag in BLOCKIDFLUX: return BLOCKIDFLUX.index(tag)
     if isxl   and tag in BLOCKIDXLL:  return BLOCKIDXLL.index(tag)
+    if iszi   and tag in BLOCKIDZI:    return BLOCKIDZI.index(tag)
     if tag in BLOCKID:                return BLOCKID.index(tag)
     return -1
 
@@ -607,7 +667,7 @@ if use_cos0 or use_cos1 or use_cos2:
     else:
         statsB = {}; defaultB = (0.0, 1.0)
 
-    theta_res = clone_dict_tensors(base)
+    # theta_res = clone_dict_tensors(base)
 
     for key in tqdm(base.keys(), desc="Cosine structure-based blending..."):
         if "first_stage_model" in key or "model" not in key:
@@ -629,7 +689,7 @@ if use_cos0 or use_cos1 or use_cos2:
                 if weights_b is not None and wi > 0: cur_b = weights_b[wi - 1]
                 if deep_b: cur_b = elementals(key, wi, deep_b, cur_b)
                 out = weighted_sum(out, dB[key], cur_b)
-            theta_res[key] = _finetune_inplace(key, out, fine)
+            base[key] = _finetune_inplace(key, out, fine)
             continue
 
         cur_a, cur_b = alpha, beta
@@ -646,15 +706,39 @@ if use_cos0 or use_cos1 or use_cos2:
             kb = statsB.get(wi, defaultB); kminB, kmaxB = kb
             out = _apply_cosine_blend(out, dB[key], kminB, kmaxB, cur_b, variant=varB, tau=0.20, floor=0.05)
 
-        theta_res[key] = _finetune_inplace(key, out, fine)
+        base[key] = _finetune_inplace(key, out, fine)
 
-    theta_0 = theta_res
+    theta_0 = base
 
-if mode != "NoIn":
-    merge_cache = prepare_merge_cache(theta_0.keys(), isxl, isflux, deep_a, deep_b, weights_a, weights_b, alpha, beta)
+def remerge_model(target_dict, source_dict, desc, mode, theta_2=None):
+    for key in tqdm(source_dict.keys(), desc=desc):
+        if isflux or key in checkpoint_dict_skip_on_merge or "model" not in key or key in target_dict:
+            continue
+
+        cache_entry = merge_cache.get(key)
+        if cache_entry is None:
+            target_dict[key] = source_dict[key]
+            continue
+
+        _,_,cur_b = cache_entry
+
+        if mode in {"TRS", "ST"} and theta_2 is not None and key in theta_2:
+            b, c = source_dict[key], theta_2[key]
+            try:
+                target_dict[key] = weighted_sum(b, c, cur_b)
+            except Exception:
+                target_dict[key] = b
+        else:
+            target_dict[key] = source_dict[key]
+
+    return target_dict
+
+if mode not in ["NoIn", "TF"]:
+    merge_cache = prepare_merge_cache(theta_0.keys(), isxl, isflux, iszi, deep_a, deep_b, weights_a, weights_b, alpha, beta)
+    vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
     
     for key in tqdm(theta_0.keys(), desc=f"{merge_name} Merging..."):
-        if args.vae is None and "first_stage_model" in key:
+        if args.vae is None and vae_key in key:
             continue
         if not (theta_1 and "model" in key and key in theta_1):
             continue
@@ -726,34 +810,14 @@ if mode != "NoIn":
         
     merge_cache = prepare_merge_cache(
         list(set(theta_1.keys()) | (set(theta_2.keys()) if 'theta_2' in locals() and theta_2 else set())),
-        isxl, isflux, deep_a, deep_b, weights_a, weights_b, alpha, beta
+        isxl, isflux, iszi, deep_a, deep_b, weights_a, weights_b, alpha, beta
     )
-    
-    def remerge_model(target_dict, source_dict, desc, mode, theta_2=None):
-        for key in tqdm(source_dict.keys(), desc=desc):
-            if isflux or key in checkpoint_dict_skip_on_merge or "model" not in key or key in target_dict:
-                continue
-
-            cache_entry = merge_cache.get(key)
-            if cache_entry is None:
-                target_dict[key] = source_dict[key]
-                continue
-
-            _,_,cur_b = cache_entry
-
-            if mode in {"TRS", "ST"} and theta_2 is not None and key in theta_2:
-                b, c = source_dict[key], theta_2[key]
-                try:
-                    target_dict[key] = weighted_sum(b, c, cur_b)
-                except Exception:
-                    target_dict[key] = b
-            else:
-                target_dict[key] = source_dict[key]
-
-        return target_dict
 
     if mode != "DARE":
-        theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode, theta_2=theta_2)
+        if mode != "AD":
+            theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode, theta_2=theta_2)
+        else:
+            theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode)
     del theta_1
     try:
         if theta_2:
@@ -763,8 +827,11 @@ if mode != "NoIn":
         pass
 
 else:
-    isxl, isflux = detect_arch(theta_0)
-    if args.fine:
+    if args.mode == "TF":
+        theta_0 = prune_extras_vs_model1(theta_0, theta_1)
+        theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode, theta_2=theta_2)
+    isxl, isflux, iszi = detect_arch(theta_0)
+    if args.fine and not iszi:
         fine = fineman([float(t) for t in args.fine.split(",")], isxl, isflux)
         for key in tqdm(theta_0.keys(), desc="Fine Tuning ..."):
             if args.vae is None and "first_stage_model" in key:
@@ -780,17 +847,26 @@ if args.vae:
             theta_0[tk] = to_half(vae[k], args.save_half)
     del vae
 
-isxl, isflux = detect_arch(theta_0)
+isxl, isflux, iszi = detect_arch(theta_0)
 
 if isxl:
     for k in tqdm([k for k in theta_0.keys() if "cond_stage_model." in k], desc="Cond resolving..."):
         del theta_0[k]
 
 theta_0 = to_half_k(theta_0, args.save_half)
-if args.prune:
-    theta_0 = prune_model(theta_0, "Model", args, isxl, isflux)
+if args.save_half and args.vae:
+    for k, v in theta_0.items():
+        if (
+            isinstance(v, torch.Tensor)
+            and k.startswith(vae_key)
+            and v.dtype in (torch.float32, torch.float64)
+        ):
+            theta_0[k] = v.half()
 
-for k in tqdm(list(theta_0.keys()), desc="Check contiguous..."):
+if args.prune:
+    theta_0 = prune_model(theta_0, "Model", args, isxl, isflux, iszi)
+
+for k in tqdm(theta_0.keys(), desc="Check contiguous..."):
     theta_0[k] = theta_0[k].contiguous()
 
 metadata = {"format": "safetensors" if args.save_safetensors else "ckpt", "sd_merge_models": {}, "sd_merge_recipe": None}
@@ -832,6 +908,12 @@ if args.mode == "SWAP":
     merge_recipe["swap_components_alpha_text"] = str(args.alpha)
 elif args.mode == "CLIPXOR":
     merge_recipe["clipxor"] = {"intersection": "elemwise_minabs_same_sign", "base": False}
+elif args.rebasin is not None:
+    merge_recipe["rebasin"] = {
+        "iter": args.rebasin,
+        "min_channels": 64,
+        "max_channels": 4096,
+    }
     
 metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
 

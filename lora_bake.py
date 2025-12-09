@@ -16,7 +16,8 @@ from Utils import (
     BLOCKID,
     cache,
     dump_cache,
-    normalize_path
+    normalize_path,
+    detect_arch
 )
 
 _re_digits = re.compile(r"\d+")
@@ -60,6 +61,12 @@ def convert_diffusers_name_to_compvis(key: str, is_sd2: bool) -> str:
         return f"diffusion_model_input_blocks_{3 + g[0]*3}_0_op"
     if _m(r"lora_unet_up_blocks_(\d+)_upsamplers_0_conv", key, g):
         return f"diffusion_model_output_blocks_{2 + g[0]*3}_{2 if g[0]>0 else 1}_conv"
+    if _m(r"lora_unet_layers_(\d+)_(.+)", key, g):
+        return f"diffusion_model_layers_{g[0]}_{g[1]}"
+    if _m(r"lora_unet_context_refiner_layers_(\d+)_(.+)", key, g):
+        return f"diffusion_model_context_refiner_layers_{g[0]}_{g[1]}"
+    if _m(r"lora_unet_noise_refiner_layers_(\d+)_(.+)", key, g):
+        return f"diffusion_model_noise_refiner_layers_{g[0]}_{g[1]}"
     if _m(r"lora_te_text_model_encoder_layers_(\d+)_(.+)", key, g):
         if is_sd2:
             r = g[1].replace("mlp_fc1","mlp_c_fc").replace("mlp_fc2","mlp_c_proj").replace("self_attn","attn")
@@ -171,7 +178,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
     theta_0, *_ = load_model(mpath, device)
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
-    isxl  = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_0
+    isxl, isflux, iszi = detect_arch(theta_0)
 
     keymap   = _build_keymap(theta_0)
     lr_strs  = []
@@ -219,7 +226,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
         del lsd
 
     if args.prune:
-        theta_0 = prune_model(theta_0, "Model", args, isxl=isxl, isflux=False)
+        theta_0 = prune_model(theta_0, "Model", args, isxl=isxl, isflux=isflux, iszi=iszi)
 
     for k in tqdm(list(theta_0.keys()), desc="Check contiguous..."):
         theta_0[k] = theta_0[k].contiguous()
@@ -258,7 +265,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     theta_0, *_ = load_model(mpath, device)
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
-    isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta_0
+    isxl, isflux, iszi = detect_arch(theta_0)
     keymap = _build_keymap(theta_0)
 
     main_sd, _, mlv2 = load_state_dict(mainlora, torch.float, depatch=False)
@@ -304,7 +311,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
         del lsd
 
     if args.prune:
-        theta_0 = prune_model(theta_0, "Model", args, isxl=isxl, isflux=False)
+        theta_0 = prune_model(theta_0, "Model", args, isxl=isxl, isflux=isflux, iszi=iszi)
 
     for k in tqdm(list(theta_0.keys()), desc="Check contiguous..."):
         theta_0[k] = theta_0[k].contiguous()
