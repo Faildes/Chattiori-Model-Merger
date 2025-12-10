@@ -16,6 +16,14 @@ import torch.nn.functional as F
 from collections import defaultdict
 from scipy.optimize import linear_sum_assignment
 
+try:
+    FP8_E4M3 = getattr(torch, "float8_e4m3fn", None)
+    FP8_E5M2 = getattr(torch, "float8_e5m2", None)
+    FP8_DTYPES = tuple(d for d in (FP8_E4M3, FP8_E5M2) if d is not None)
+except Exception:
+    FP8_E4M3 = FP8_E5M2 = None
+    FP8_DTYPES = ()
+
 FP_SET = {torch.float32, torch.float16, torch.float64, torch.bfloat16}
 
 NUM_INPUT_BLOCKS = 12
@@ -241,13 +249,47 @@ DTYPES = {torch.float32, torch.float64, torch.bfloat16}
 def to_half(tensor, enable):
     return tensor.half() if enable and getattr(tensor, "dtype", None) in DTYPES else tensor
 
-def to_half_k(sd, enable):
+def to_half_k(sd, enable, vae=None):
     if enable:
         for d in tqdm(list(sd.items()), desc="Half tensoring..."):
             k, v = d
-            if "model" in k and getattr(v, "dtype", None) in DTYPES:
+            if ("model" in k or (vae and k.startswith(vae))) and getattr(v, "dtype", None) in DTYPES:
                 sd[k] = v.half()
     return sd
+
+
+def upcast_fp8_state_dict(theta: dict, target_dtype: torch.dtype = torch.float16):
+    if not FP8_DTYPES:
+        return theta
+
+    for k, v in theta.items():
+        if isinstance(v, torch.Tensor) and v.dtype in FP8_DTYPES:
+            theta[k] = v.to(target_dtype)
+    return theta
+
+
+def to_quarter_k(theta: dict, enable: bool, prefer: str = "e4m3", vae=None):
+    if not enable:
+        return theta
+
+    target_dtype = None
+    if prefer == "e5m2" and FP8_E5M2 is not None:
+        target_dtype = FP8_E5M2
+    elif prefer == "e4m3" and FP8_E4M3 is not None:
+        target_dtype = FP8_E4M3
+    elif FP8_E4M3 is not None:
+        target_dtype = FP8_E4M3
+    elif FP8_E5M2 is not None:
+        target_dtype = FP8_E5M2
+
+    if target_dtype is None:
+        print("[fp8] This PyTorch build has no float8 support; falling back to fp16/fp32.")
+        return theta
+
+    for k, v in theta.items():
+        if ("model" in k or (vae and k.startswith(vae))) and isinstance(v, torch.Tensor) and v.is_floating_point():
+            theta[k] = v.to(target_dtype)
+    return theta
 
 cache_filename = os.path.join(os.getcwd(), "cache.json")
 

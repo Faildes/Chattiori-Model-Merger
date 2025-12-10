@@ -17,7 +17,10 @@ from Utils import (
     cache,
     dump_cache,
     normalize_path,
-    detect_arch
+    detect_arch,
+    to_quarter_k,
+    to_half_k,
+    upcast_fp8_state_dict,
 )
 
 _re_digits = re.compile(r"\d+")
@@ -176,9 +179,11 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
     print("Plus LoRA start")
     mpath = normalize_path(os.path.join(model_path, model))
     theta_0, *_ = load_model(mpath, device)
+    theta_0 = upcast_fp8_state_dict(theta_0)
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
     isxl, isflux, iszi = detect_arch(theta_0)
+    vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
 
     keymap   = _build_keymap(theta_0)
     lr_strs  = []
@@ -224,9 +229,13 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
             theta_0[keymap[msd]] = torch.nn.Parameter(_apply_lora_to_weight(W, up, down, sc, ratio))
 
         del lsd
+        
+    theta_0 = to_half_k(theta_0, args.save_half, vae=vae_key if args.vae else None)
 
     if args.prune:
         theta_0 = prune_model(theta_0, "Model", args, isxl=isxl, isflux=isflux, iszi=iszi)
+
+    theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key if args.vae else None)
 
     for k in tqdm(list(theta_0.keys()), desc="Check contiguous..."):
         theta_0[k] = theta_0[k].contiguous()
@@ -263,9 +272,11 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     print("Plus LoRA DARE start")
     mpath = normalize_path(os.path.join(model_path, model))
     theta_0, *_ = load_model(mpath, device)
+    theta_0 = upcast_fp8_state_dict(theta_0)
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
     isxl, isflux, iszi = detect_arch(theta_0)
+    vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
     keymap = _build_keymap(theta_0)
 
     main_sd, _, mlv2 = load_state_dict(mainlora, torch.float, depatch=False)
@@ -309,9 +320,13 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
             theta_0[keymap[msd]] = torch.nn.Parameter(_apply_lora_to_weight(W, up, down, sc, ratio=1.0))
 
         del lsd
+        
+    theta_0 = to_half_k(theta_0, args.save_half, vae=vae_key if args.vae else None)
 
     if args.prune:
         theta_0 = prune_model(theta_0, "Model", args, isxl=isxl, isflux=isflux, iszi=iszi)
+        
+    theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key if args.vae else None)
 
     for k in tqdm(list(theta_0.keys()), desc="Check contiguous..."):
         theta_0[k] = theta_0[k].contiguous()

@@ -18,7 +18,8 @@ from Utils import wgt, rand_ratio, sha256, read_metadata_from_safetensors \
     , _swap_components_inplace, _normalize_components_list, _finetune_inplace \
     , _clip_tier_for_xl, _clip_tier_for_flux, _clip_tier_for_zi, _clipxor_semi_hard_blend \
     , _collect_clipxor_targets, _collect_clip_pairs_by_suffix, prepare_merge_cache\
-    , trim_delta, normalize_path, prune_extras_vs_model1, unet_permutation_spec, weight_matching, apply_permutation
+    , trim_delta, normalize_path, prune_extras_vs_model1, unet_permutation_spec \
+    , weight_matching, apply_permutation, upcast_fp8_state_dict, to_quarter_k
 
 # Mode Functions
 
@@ -264,6 +265,11 @@ parser.add_argument("--output",             help="Output file name without exten
 parser.add_argument("--device", type=str,   help="Device to use, defaults to cpu", default="cpu", required=False)
 
 args = parser.parse_args()
+
+if args.save_quarter and args.save_half:
+    print("[warn] --save_half and --save_quarter are both set; prioritizing --save_quarter (fp8).")
+    args.save_half = False
+
 device = args.device
 mode = args.mode
 if mode in modes_need_m2 and (args.model_2 is None):
@@ -336,6 +342,7 @@ model_0_name = args.m0_name or stem(model_0_path)
 print(f"Loading {model_0_name}...")
 theta_0, model_0_sha256, model_0_hash, model_0_meta, cache_data = load_model(model_0_path, device, cache_data=cache_data)
 qd0 = qdtyper(theta_0)
+theta_0 = upcast_fp8_state_dict(theta_0)
 
 theta_1 = theta_2 = None
 model_1_sha256 = model_2_sha256 = None
@@ -347,6 +354,7 @@ if mode != "NoIn":
     print(f"Loading {model_1_name}...")
     theta_1, model_1_sha256, model_1_hash, model_1_meta, cache_data = load_model(model_1_path, device, cache_data=cache_data)
     qd1 = qdtyper(theta_1)
+    theta_1 = upcast_fp8_state_dict(theta_1)
     isxl, isflux, iszi = detect_arch(theta_1)
     if args.fine and not iszi:
         fine = fineman([float(t) for t in args.fine.split(",")], isxl, isflux)
@@ -450,6 +458,7 @@ if mode != "NoIn":
             print(f"Loading {model_2_name}...")
             theta_2, model_2_sha256, model_2_hash, model_2_meta, cache_data = load_model(model_2_path, device, cache_data=cache_data)
             qd2 = qdtyper(theta_2)
+            theta_2 = upcast_fp8_state_dict(theta_2)
 
         usebeta = mode in modes_need_beta
         if usebeta:
@@ -853,18 +862,12 @@ if isxl:
     for k in tqdm([k for k in theta_0.keys() if "cond_stage_model." in k], desc="Cond resolving..."):
         del theta_0[k]
 
-theta_0 = to_half_k(theta_0, args.save_half)
-if args.save_half and args.vae:
-    for k, v in theta_0.items():
-        if (
-            isinstance(v, torch.Tensor)
-            and k.startswith(vae_key)
-            and v.dtype in (torch.float32, torch.float64)
-        ):
-            theta_0[k] = v.half()
+theta_0 = to_half_k(theta_0, args.save_half, vae=vae_key if args.vae else None)
 
 if args.prune:
     theta_0 = prune_model(theta_0, "Model", args, isxl, isflux, iszi)
+
+theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key if args.vae else None)
 
 for k in tqdm(theta_0.keys(), desc="Check contiguous..."):
     theta_0[k] = theta_0[k].contiguous()
