@@ -249,12 +249,15 @@ DTYPES = {torch.float32, torch.float64, torch.bfloat16}
 def to_half(tensor, enable):
     return tensor.half() if enable and getattr(tensor, "dtype", None) in DTYPES else tensor
 
-def to_half_k(sd, enable, vae=None):
-    if enable:
+def to_half_k(sd, enable, benable, vae=None):
+    if (enable or benable):
         for d in tqdm(list(sd.items()), desc="Half tensoring..."):
             k, v = d
-            if ("model" in k or (vae and k.startswith(vae))) and getattr(v, "dtype", None) in DTYPES:
-                sd[k] = v.half()
+            if ("model" in k or  "text_encoders" in k) and getattr(v, "dtype", None) in DTYPES:
+                if vae:
+                    if k.startswith(vae):
+                        continue
+                sd[k] = v.bfloat16() if benable else v.half()
     return sd
 
 
@@ -262,9 +265,18 @@ def upcast_fp8_state_dict(theta: dict, target_dtype: torch.dtype = torch.float16
     if not FP8_DTYPES:
         return theta
 
-    for k, v in theta.items():
-        if isinstance(v, torch.Tensor) and v.dtype in FP8_DTYPES:
-            theta[k] = v.to(target_dtype)
+    items = list(theta.items())
+
+    fp8_items = [(k, v) for k, v in items
+                 if isinstance(v, torch.Tensor) and v.dtype in FP8_DTYPES]
+    if not fp8_items:
+        return theta
+
+    for k, v in tqdm(fp8_items,
+                     total=len(fp8_items),
+                     desc=f"Upcasting {len(fp8_items)} fp8 tensors..."):
+        theta[k] = v.to(target_dtype)
+
     return theta
 
 
@@ -287,7 +299,10 @@ def to_quarter_k(theta: dict, enable: bool, prefer: str = "e4m3", vae=None):
         return theta
 
     for k, v in theta.items():
-        if ("model" in k or (vae and k.startswith(vae))) and isinstance(v, torch.Tensor) and v.is_floating_point():
+        if ("model" in k or "text_encoders" in k) and isinstance(v, torch.Tensor) and v.is_floating_point():
+            if vae:
+                if k.startswith(vae):
+                    continue
             theta[k] = v.to(target_dtype)
     return theta
 
@@ -407,7 +422,7 @@ def read_metadata_from_safetensors(filename):
 
 def prune_model(theta, name, args, isxl=False, isflux=False, iszi=False):
     if not (isxl or isflux or iszi):
-        _, _, auto_iszi = detect_arch(theta)
+        _, _, auto_iszi, theta = detect_arch(theta)
         iszi = iszi or auto_iszi
 
     if isflux:
@@ -439,13 +454,15 @@ def prune_model(theta, name, args, isxl=False, isflux=False, iszi=False):
                 k_in = k_ema
 
         v = theta[k_in]
-        if isinstance(v, torch.Tensor):
+        if isinstance(v, torch.Tensor) and not (key.startswith("first_stage_model") or key.startswith("vae")):
             dt = v.dtype
             if getattr(args, "save_quarter", False) and dt in FP_SET:
                 v = v.to(torch.float8_e4m3fn)
-            elif getattr(args, "save_half", False) and dt in {torch.float32, torch.float64, torch.bfloat16}:
+            elif getattr(args, "save_half", False) and dt in {torch.float32, torch.float64, torch.bfloat16, torch.float8_e4m3fn}:
                 v = v.to(torch.float16)
-            elif not getattr(args, "save_half", False) and dt in {torch.float16, torch.float64, torch.bfloat16}:
+            elif getattr(args, "save_bhalf", False) and dt in {torch.float32, torch.float64, torch.float16, torch.float8_e4m3fn}:
+                v = v.to(torch.bfloat16)
+            elif not getattr(args, "save_half", False) and not getattr(args, "save_bhalf", False) and dt in {torch.float16, torch.float64, torch.bfloat16, torch.float8_e4m3fn}:
                 v = v.to(torch.float32)
         sd_pruned[key] = v
 
@@ -464,7 +481,7 @@ def get_state_dict_from_checkpoint(pl_sd: dict) -> dict:
     out = {}
     for k, v in d.items():
         nk = transform_checkpoint_dict_key(k)
-        if nk is not None:
+        if nk is not None and "model_sampling.sigmas" not in nk:
             out[nk] = v
     return out
 
@@ -508,8 +525,16 @@ def maybe_to_qdtype(a, b, qa, qb, device, isflux):
 def detect_arch(theta):
     isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta
     isflux = any("double_block" in k for k in theta.keys())
-    iszi = any("x_embedder." in k for k in theta.keys())
-    return isxl, isflux, iszi
+    if "model.diffusion_model.cap_embedder.0.weight" in theta:
+        iszi = True
+    elif "cap_embedder.0.weight" in theta:
+        new_key = {}
+        for k in tqdm(theta.keys(), desc="Renaming Z-IMAGE keys..."):
+            new_key["model.diffusion_model." + k.replace("model.diffusion_model.", "") if not (k.startswith("vae.") or k.startswith("text_encoders.")) else k] = theta[k]
+        iszi = True
+        theta = new_key
+        del new_key
+    return isxl, isflux, iszi, theta
 
 def q_dequantize(sd, qtype, device, dtype, setbnb=True):
     from bitsandbytes.functional import dequantize_4bit
@@ -597,8 +622,8 @@ def blockfromkey(key: str, isxl: bool = False, isflux: bool = False, iszi: bool 
             if "model.diffusion_model.final_layer" in key:    return "L29", "L29"
             if "model.diffusion_model.context_refiner" in key:    return "CONT", "CONT"
             if "model.diffusion_model.noise_refiner" in key:    return "NOISE", "NOISE"
-            m = re.search(r'model\.diffusion_model\.layers\.(\d+)\.', key)
-            return f"L{int(m.group(1)):02}", f"L{int(m.group(1)):02}" if m else "Not Merge", "Not Merge"
+            m = (re.findall(r'layers\.(\d+)\.', key) or [""])[0]
+            return (f"L{int(m):02}", f"L{int(m):02}") if m else ("Not Merge", "Not Merge")
 
     return "Not Merge", "Not Merge"
 
@@ -1088,7 +1113,7 @@ def trim_delta(delta: torch.Tensor, percentile: float = 0.5) -> torch.Tensor:
 def prune_extras_vs_model1(theta_base, theta_ref):
     to_delete = []
     for k in theta_base.keys():
-        if "model" not in k:
+        if "model" not in k and "text_encoder" not in k:
             continue
         if k not in theta_ref:
             to_delete.append(k)

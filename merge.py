@@ -247,6 +247,7 @@ for flag, helpmsg in {
     "cosine2":          "Favor model 2's structure with details from the others (three models only)",
     "save_half":        "Save as float16",
     "save_quarter":     "Save as float8",
+    "save_bhalf":       "Save as bfloat16",
     "save_safetensors": "Save as .safetensors",
     "keep_ema":         "Keep ema",
     "delete_source":    "Delete the source checkpoint file",
@@ -342,6 +343,7 @@ model_0_name = args.m0_name or stem(model_0_path)
 print(f"Loading {model_0_name}...")
 theta_0, model_0_sha256, model_0_hash, model_0_meta, cache_data = load_model(model_0_path, device, cache_data=cache_data)
 qd0 = qdtyper(theta_0)
+isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
 theta_0 = upcast_fp8_state_dict(theta_0)
 
 theta_1 = theta_2 = None
@@ -355,7 +357,7 @@ if mode != "NoIn":
     theta_1, model_1_sha256, model_1_hash, model_1_meta, cache_data = load_model(model_1_path, device, cache_data=cache_data)
     qd1 = qdtyper(theta_1)
     theta_1 = upcast_fp8_state_dict(theta_1)
-    isxl, isflux, iszi = detect_arch(theta_1)
+    isxl, isflux, iszi, theta_1 = detect_arch(theta_1)
     if args.fine and not iszi:
         fine = fineman([float(t) for t in args.fine.split(",")], isxl, isflux)
     else:
@@ -385,8 +387,8 @@ if mode != "NoIn":
         hard_t5   = 0.60
         hard_clip = base_hardness
         
-        isxl_a, isflux_a, iszi_a = detect_arch(theta_0)
-        isxl_b, isflux_b, iszi_b = detect_arch(theta_1)
+        isxl_a, isflux_a, iszi_a, theta_0 = detect_arch(theta_0)
+        isxl_b, isflux_b, iszi_b, theta_1 = detect_arch(theta_1)
 
         targets = _collect_clipxor_targets(theta_0, theta_1, isxl=isxl_a, isflux=isflux_a, iszi=iszi_a)
         if not targets:
@@ -458,6 +460,7 @@ if mode != "NoIn":
             print(f"Loading {model_2_name}...")
             theta_2, model_2_sha256, model_2_hash, model_2_meta, cache_data = load_model(model_2_path, device, cache_data=cache_data)
             qd2 = qdtyper(theta_2)
+            isxl, isflux, iszi, theta_2 = detect_arch(theta_2)
             theta_2 = upcast_fp8_state_dict(theta_2)
 
         usebeta = mode in modes_need_beta
@@ -522,7 +525,7 @@ def _is_small_or_norm_or_bias(key, tens):
 def cosine_minmax_grouped(base_dict, other_dict, desc, variant=0, lo=10.0, hi=90.0):
     by_block = {}
     for k in tqdm(base_dict.keys(), desc=desc):
-        if "first_stage_model" in k or "model" not in k or k not in other_dict:
+        if "first_stage_model" in k or ("model" not in k and "text_encoders" not in k) or k not in other_dict:
             continue
         wi = _resolve_weight_index(k)
         if wi < 0:
@@ -602,6 +605,7 @@ def resolve_cosine_triplet(theta_0, theta_1, theta_2, use_cos0, use_cos1, use_co
 
 if mode not in ["NoIn", "TF"]:
     if isxl and useblocks:
+        print("Detected XL architecture.")
         if len(weights_a) == 25:
             weights_a = weighttoxl(weights_a)
             print(f"alpha weight converted for XL{weights_a}")
@@ -614,6 +618,7 @@ if mode not in ["NoIn", "TF"]:
             elif len(weights_b) == 19:
                 weights_b += [0]
     elif iszi and useblocks:
+        print("Detected Zimage architecture.")
         if len(weights_a) > 34:
             weights_a = weights_a[:34]
             print(f"alpha weight converted for Zimage{weights_a}")
@@ -679,7 +684,7 @@ if use_cos0 or use_cos1 or use_cos2:
     # theta_res = clone_dict_tensors(base)
 
     for key in tqdm(base.keys(), desc="Cosine structure-based blending..."):
-        if "first_stage_model" in key or "model" not in key:
+        if "first_stage_model" in key or ("model" not in key and "text_encoders" not in key):
             continue
         if key not in dA:
             continue
@@ -721,7 +726,7 @@ if use_cos0 or use_cos1 or use_cos2:
 
 def remerge_model(target_dict, source_dict, desc, mode, theta_2=None):
     for key in tqdm(source_dict.keys(), desc=desc):
-        if isflux or key in checkpoint_dict_skip_on_merge or "model" not in key or key in target_dict:
+        if isflux or key in checkpoint_dict_skip_on_merge or ("model" not in key and "text_encoders" not in key) or key in target_dict:
             continue
 
         cache_entry = merge_cache.get(key)
@@ -749,7 +754,7 @@ if mode not in ["NoIn", "TF"]:
     for key in tqdm(theta_0.keys(), desc=f"{merge_name} Merging..."):
         if args.vae is None and vae_key in key:
             continue
-        if not (theta_1 and "model" in key and key in theta_1):
+        if not (theta_1 and ("model" in key or "text_encoders" in key) and key in theta_1):
             continue
         if mode != "DARE" and (usebeta or mode == "TD") and (theta_2 is not None) and key not in theta_2:
             continue
@@ -839,11 +844,12 @@ else:
     if args.mode == "TF":
         theta_0 = prune_extras_vs_model1(theta_0, theta_1)
         theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode, theta_2=theta_2)
-    isxl, isflux, iszi = detect_arch(theta_0)
+    isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
+    vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
     if args.fine and not iszi:
         fine = fineman([float(t) for t in args.fine.split(",")], isxl, isflux)
         for key in tqdm(theta_0.keys(), desc="Fine Tuning ..."):
-            if args.vae is None and "first_stage_model" in key:
+            if args.vae is None and vae_key in key:
                 continue
             theta_0[key] = _finetune_inplace(key, theta_0[key], fine)
     else:
@@ -851,23 +857,22 @@ else:
         
 if args.vae:
     for k in tqdm(vae.keys(), desc=f"Baking in VAE[{vae_name}] ..."):
-        tk = 'first_stage_model.' + k
-        if tk in theta_0:
-            theta_0[tk] = to_half(vae[k], args.save_half)
+        tk = vae_key + "." + k
+        theta_0[tk] = to_half(vae[k], args.save_half)
     del vae
 
-isxl, isflux, iszi = detect_arch(theta_0)
+isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
 
 if isxl:
     for k in tqdm([k for k in theta_0.keys() if "cond_stage_model." in k], desc="Cond resolving..."):
         del theta_0[k]
 
-theta_0 = to_half_k(theta_0, args.save_half, vae=vae_key if args.vae else None)
+theta_0 = to_half_k(theta_0, args.save_half, args.save_bhalf, vae=vae_key)
 
 if args.prune:
     theta_0 = prune_model(theta_0, "Model", args, isxl, isflux, iszi)
 
-theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key if args.vae else None)
+theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key)
 
 for k in tqdm(theta_0.keys(), desc="Check contiguous..."):
     theta_0[k] = theta_0[k].contiguous()

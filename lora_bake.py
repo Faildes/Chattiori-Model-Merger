@@ -182,7 +182,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
     theta_0 = upcast_fp8_state_dict(theta_0)
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
-    isxl, isflux, iszi = detect_arch(theta_0)
+    isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
     vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
 
     keymap   = _build_keymap(theta_0)
@@ -230,12 +230,12 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
 
         del lsd
         
-    theta_0 = to_half_k(theta_0, args.save_half, vae=vae_key if args.vae else None)
+    theta_0 = to_half_k(theta_0, args.save_half, args.save_bhalf, vae=vae_key)
 
     if args.prune:
         theta_0 = prune_model(theta_0, "Model", args, isxl=isxl, isflux=isflux, iszi=iszi)
 
-    theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key if args.vae else None)
+    theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key)
 
     for k in tqdm(list(theta_0.keys()), desc="Check contiguous..."):
         theta_0[k] = theta_0[k].contiguous()
@@ -275,7 +275,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     theta_0 = upcast_fp8_state_dict(theta_0)
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
-    isxl, isflux, iszi = detect_arch(theta_0)
+    isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
     vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
     keymap = _build_keymap(theta_0)
 
@@ -321,12 +321,12 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
 
         del lsd
         
-    theta_0 = to_half_k(theta_0, args.save_half, vae=vae_key if args.vae else None)
+    theta_0 = to_half_k(theta_0, args.save_half, args.save_bhalf, vae=vae_key)
 
     if args.prune:
         theta_0 = prune_model(theta_0, "Model", args, isxl=isxl, isflux=isflux, iszi=iszi)
         
-    theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key if args.vae else None)
+    theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key)
 
     for k in tqdm(list(theta_0.keys()), desc="Check contiguous..."):
         theta_0[k] = theta_0[k].contiguous()
@@ -362,6 +362,7 @@ if __name__ == "__main__":
     parser.add_argument("checkpoint", type=str, help="Name of the checkpoint")
     parser.add_argument("loras", type=str, help="Path and alpha of LoRAs eg.)\"Path:alpha,Path:alpha, ...\"")
     parser.add_argument("--save_half", action="store_true", help="Save as float16", required=False)
+    parser.add_argument("--save_bhalf", action="store_true", help="Save as bfloat16", required=False)
     parser.add_argument("--prune", action="store_true", help="Prune Model", required=False)
     parser.add_argument("--save_quarter", action="store_true", help="Save as float8", required=False)
     parser.add_argument("--keep_ema", action="store_true", help="Keep ema", required=False)
