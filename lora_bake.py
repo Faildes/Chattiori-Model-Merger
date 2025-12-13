@@ -13,7 +13,13 @@ from Utils import (
     prune_model,
     sha256_from_cache,
     LBLOCKS26,
+    LBLOCKS_FLUX,
+    LBLOCKS_ZI,
+    LBLOCKS_SDXL,
     BLOCKID,
+    BLOCKIDFLUX,
+    BLOCKIDZI,
+    BLOCKIDXLL,
     cache,
     dump_cache,
     normalize_path,
@@ -66,6 +72,10 @@ def convert_diffusers_name_to_compvis(key: str, is_sd2: bool) -> str:
         return f"diffusion_model_output_blocks_{2 + g[0]*3}_{2 if g[0]>0 else 1}_conv"
     if _m(r"lora_unet_layers_(\d+)_(.+)", key, g):
         return f"diffusion_model_layers_{g[0]}_{g[1]}"
+    if _m(r"lora_diffusion_model_layers_(\d+)_(.+)", key, g):
+        return f"diffusion_model_layers_{g[0]}_{g[1]}"
+    if _m(r"diffusion_model_layers_(\d+)_(.+)", key, g):
+        return f"diffusion_model_layers_{g[0]}_{g[1]}"
     if _m(r"lora_unet_context_refiner_layers_(\d+)_(.+)", key, g):
         return f"diffusion_model_context_refiner_layers_{g[0]}_{g[1]}"
     if _m(r"lora_unet_noise_refiner_layers_(\d+)_(.+)", key, g):
@@ -79,6 +89,78 @@ def convert_diffusers_name_to_compvis(key: str, is_sd2: bool) -> str:
         r = g[1].replace("mlp_fc1","mlp_c_fc").replace("mlp_fc2","mlp_c_proj").replace("self_attn","attn")
         return f"1_model_transformer_resblocks_{g[0]}_{r}"
     return key
+
+_ZI_LAYER_RE = re.compile(r"^diffusion_model\.layers\.(\d+)\.(.+)\.lora_(A|down)\.weight$")
+
+def zimage_resolve_target(down_k: str):
+    """
+    return (target_weight_key_in_theta0, part) where part in {None,'q','k','v'}
+    """
+    m = _ZI_LAYER_RE.match(down_k)
+    if not m:
+        return None, None
+
+    layer = int(m.group(1))
+    tail  = m.group(2)  # e.g. "attention.to_q" / "feed_forward.w1" / "adaLN_modulation.0" etc
+
+    part = None
+
+    # attention mapping
+    if tail.startswith("attention.to_out.0"):
+        # to_out.0 -> out
+        tgt_tail = tail.replace("attention.to_out.0", "attention.out")
+    elif tail.startswith("attention.to_q"):
+        tgt_tail = tail.replace("attention.to_q", "attention.qkv")
+        part = "q"
+    elif tail.startswith("attention.to_k"):
+        tgt_tail = tail.replace("attention.to_k", "attention.qkv")
+        part = "k"
+    elif tail.startswith("attention.to_v"):
+        tgt_tail = tail.replace("attention.to_v", "attention.qkv")
+        part = "v"
+    else:
+        tgt_tail = tail
+
+    target = f"model.diffusion_model.layers.{layer}.{tgt_tail}.weight"
+    return target, part
+
+def apply_zimage_lora(theta_0: dict, target_key: str, part: str | None,
+                      up: torch.Tensor, down: torch.Tensor,
+                      alpha, ratio: float):
+    if target_key not in theta_0:
+        return False
+
+    W = theta_0[target_key]
+    orig_dtype = W.dtype
+
+    W32 = W.to(torch.float32)
+    up32 = up.to(torch.float32)
+    down32 = down.to(torch.float32)
+
+    rank = down.size(0)
+    a = alpha
+    if isinstance(a, torch.Tensor):
+        a = a.item()
+    if a is None:
+        a = rank
+    sc = float(a) / float(rank)
+
+    if W32.ndim != 2:
+        Wnew = _apply_lora_to_weight(W32, up32, down32, sc, ratio)
+        theta_0[target_key] = Wnew.to(orig_dtype)
+        return True
+
+    delta = (up32 @ down32) * (sc * ratio)
+
+    if part is None:
+        W32 = W32 + delta
+    else:
+        d = delta.shape[0]                 # = hidden_dim
+        off = {"q": 0, "k": d, "v": 2*d}[part]
+        W32[off:off+d, :] += delta
+
+    theta_0[target_key] = W32.to(orig_dtype)
+    return True
 
 def load_state_dict(path: str, dtype=torch.float, device="cpu", depatch=True):
     if path.endswith(".safetensors"):
@@ -126,7 +208,7 @@ def apply_spectral_norm(lora_sd: dict, scale: float):
             lora_sd[k] = t * fac
     return lora_sd
 
-def merge_weights(lora: dict, isv2: bool, isxl: bool, p: float, lam: float, scale: float, strengths: list[float]):
+def merge_weights(lora: dict, isv2: bool, isxl: bool, blocks: list[str], p: float, lam: float, scale: float, strengths: list[float]):
     out = {}
     for k, v in lora.items():
         full = convert_diffusers_name_to_compvis(k, isv2)
@@ -134,8 +216,8 @@ def merge_weights(lora: dict, isv2: bool, isxl: bool, p: float, lam: float, scal
         if isxl:
             msd = msd.replace("lora_unet", "diffusion_model").replace("lora_te1_text_model", "0_transformer_text_model")
         strength = strengths[0]
-        for i, b in enumerate(LBLOCKS26):
-            if b in full or b in msd:
+        for i, b in enumerate(blocks):
+            if any(b[k] in full or b[k] in msd for k in range(len(b))):
                 strength = strengths[i] if i < len(strengths) else strengths[0]
                 break
         out[k] = strength * lam * apply_dare(v, p)
@@ -170,6 +252,21 @@ def _apply_lora_to_weight(W: torch.Tensor, up: torch.Tensor, down: torch.Tensor,
     conved = F.conv2d(down.permute(1, 0, 2, 3), up).permute(1, 0, 2, 3)
     return W + ratio * conved * scale
 
+def parse_lora_key(k: str):
+    if "lora_A" in k:
+        down = k
+        up   = k.replace("lora_A", "lora_B")
+        alpha = k.replace("lora_A", "alpha")
+        return down, up, alpha
+
+    if "lora_down" in k:
+        down = k
+        up   = k.replace("lora_down", "lora_up")
+        alpha = k.replace("lora_down", "alpha")
+        return down, up, alpha
+
+    return None, None, None
+
 def pluslora(lora_list, model, output, model_path, device="cpu"):
     cache_data = cache("hashes", None)
     model_path = normalize_path(model_path)
@@ -183,6 +280,8 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
     isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
+    blocks = LBLOCKS_ZI if iszi else (LBLOCKS_FLUX if isflux else (LBLOCKS_SDXL if isxl else LBLOCKS26))
+    blocknum = BLOCKIDZI if iszi else (BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else BLOCKID))
     vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
 
     keymap   = _build_keymap(theta_0)
@@ -192,7 +291,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
     for lora_model, ratio_str in lora_list:
         print(f"loading: {lora_model}")
         ratios = ([float(x) for x in ratio_str.replace(" ", "").split(",")] 
-                  if isinstance(ratio_str, str) else [ratio_str] * len(BLOCKID))
+                  if isinstance(ratio_str, str) else [ratio_str] * len(blocknum))
         lr_strs.append("[" + ",".join(str(x) for x in ratios) + "]")
 
         lpath = normalize_path(os.path.join(model_path, lora_model))
@@ -201,32 +300,53 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
         lora_meta[lhash] = meta
 
         for k in tqdm(list(lsd.keys()), desc=f"Merging {lora_model}..."):
-            if "lora_down" not in k: 
+            down_k, up_k, alpha_k = parse_lora_key(k)
+            if down_k is None:
                 continue
-            up_k    = k.replace("lora_down", "lora_up")
-            alpha_k = k[:k.index("lora_down")] + "alpha"
+
+            if down_k not in lsd or up_k not in lsd:
+                continue
 
             full = convert_diffusers_name_to_compvis(k, lisv2)
             msd  = full.split(".", 1)[0]
+            
             if isxl:
                 msd = msd.replace("lora_unet","diffusion_model").replace("lora_te1_text_model","0_transformer_text_model")
-            if msd not in keymap: 
-                continue
-
+            
             ratio = ratios[0]
-            for i, b in enumerate(LBLOCKS26):
-                if b in full or b in msd:
+            for i, b in enumerate(blocks):
+                if any(b[k] in full or b[k] in msd for k in range(len(b))):
                     ratio = ratios[i] if i < len(ratios) else ratios[0]
                     break
+                
+            if iszi:
+                target_key, part = zimage_resolve_target(down_k)
+                if target_key is not None:
+                    rank = lsd[down_k].size(0)
+                    alpha = lsd.get(alpha_k, None)
+                    if alpha is None and isinstance(alpha_k, str) and alpha_k.endswith(".weight"):
+                        alpha = lsd.get(alpha_k[:-len(".weight")], None)
 
-            W     = theta_0[keymap[msd]].to("cpu")
-            down  = lsd[k].to("cpu")
-            up    = lsd[up_k].to("cpu")
+                    ok = apply_zimage_lora(theta_0, target_key, part,
+                                        up=lsd[up_k], down=lsd[down_k],
+                                        alpha=(alpha if alpha is not None else rank),
+                                        ratio=ratio)
+                    if ok:
+                        continue
+            if msd not in keymap: 
+                continue
+                
+            down = lsd[down_k].to("cpu")
+            up   = lsd[up_k].to("cpu")
+
             dim   = down.size(0)
             alpha = lsd.get(alpha_k, dim)
             sc    = (alpha / dim)
 
-            theta_0[keymap[msd]] = torch.nn.Parameter(_apply_lora_to_weight(W, up, down, sc, ratio))
+            W = theta_0[keymap[msd]].to("cpu")
+            theta_0[keymap[msd]] = torch.nn.Parameter(
+                _apply_lora_to_weight(W, up, down, sc, ratio)
+            )
 
         del lsd
         
@@ -276,6 +396,8 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
     isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
+    blocks = LBLOCKS_ZI if iszi else (LBLOCKS_FLUX if isflux else (LBLOCKS_SDXL if isxl else LBLOCKS26))
+    blocknum = BLOCKIDZI if iszi else (BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else BLOCKID))
     vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
     keymap = _build_keymap(theta_0)
 
@@ -289,7 +411,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     for lora_model, ratio_str in lora_list:
         print(f"loading: {lora_model}")
         ratios = ([float(x) for x in ratio_str.replace(" ", "").split(",")] 
-                  if isinstance(ratio_str, str) else [ratio_str] * len(BLOCKID))
+                  if isinstance(ratio_str, str) else [ratio_str] * len(blocknum))
         lr_strs.append("[" + ",".join(str(x) for x in ratios) + "]")
 
         lpath = normalize_path(os.path.join(model_path, lora_model))
@@ -297,27 +419,32 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
         lhash, _, cache_data = sha256_from_cache(lpath, f"lora/{os.path.splitext(os.path.basename(lpath))[0]}", cache_data)
         lora_meta[lhash] = meta
 
-        lw = merge_weights(lsd, lisv2, isxl, p, lam, scale, ratios)
+        lw = merge_weights(lsd, lisv2, isxl, blocks, p, lam, scale, ratios)
 
         for k in tqdm(list(main_sd.keys()), desc=f"Merging {lora_model}..."):
-            if "lora_down" not in k or k not in lw: 
+            down_k, up_k, alpha_k = parse_lora_key(k)
+            if down_k is None:
                 continue
-            full = convert_diffusers_name_to_compvis(k, mlv2)
+            if down_k not in lw or up_k not in lw:
+                continue
+            
+            full = convert_diffusers_name_to_compvis(down_k, mlv2)
             msd  = full.split(".", 1)[0]
             if isxl:
                 msd = msd.replace("lora_unet","diffusion_model").replace("lora_te1_text_model","0_transformer_text_model")
             if msd not in keymap:
                 continue
 
-            up_k   = k.replace("lora_down", "lora_up")
-            alpha_k = k[:k.index("lora_down")] + "alpha"
-
-            down, up = lw[k].to("cpu"), lw[up_k].to("cpu")
-            dim = down.size(0)
-            sc  = lw.get(alpha_k, dim) / dim
+            down = lw[down_k].to("cpu")
+            up   = lw[up_k].to("cpu")
+            dim  = down.size(0)
+            alpha = lw.get(alpha_k, dim)
+            sc    = alpha / dim
 
             W = theta_0[keymap[msd]].to("cpu")
-            theta_0[keymap[msd]] = torch.nn.Parameter(_apply_lora_to_weight(W, up, down, sc, ratio=1.0))
+            theta_0[keymap[msd]] = torch.nn.Parameter(
+                _apply_lora_to_weight(W, up, down, sc, ratio=1.0)
+            )
 
         del lsd
         

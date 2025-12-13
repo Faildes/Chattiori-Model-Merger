@@ -411,7 +411,7 @@ if mode != "NoIn":
             for suf, ka, kb in suffix_pairs:
                 suffix_to_kb[ka] = kb
         
-        for key in tqdm(targets, desc="CLIPXOR merging...", total=len(targets)):
+        for key_a in tqdm(targets, desc="CLIPXOR merging...", total=len(targets)):
             A = theta_0[key_a]
             key_b = key_a if key_a in theta_1 else suffix_to_kb.get(key_a, None)
             if key_b is None:
@@ -603,6 +603,22 @@ def resolve_cosine_triplet(theta_0, theta_1, theta_2, use_cos0, use_cos1, use_co
         varA, varB = 0, 0
     return base, dA, dB, varA, varB
 
+ZI_WLEN = len(BLOCKIDZI) - 1  # 33
+
+def _fit_weights_for_zi(w):
+    if w is None:
+        return None
+    w = list(w)
+    if len(w) == 25:
+        x0 = np.arange(25)
+        x1 = np.linspace(0, 24, ZI_WLEN)
+        w = np.interp(x1, x0, np.asarray(w, dtype=np.float64)).tolist()
+    if len(w) > ZI_WLEN:
+        w = w[:ZI_WLEN]
+    elif len(w) < ZI_WLEN:
+        w += [w[-1]] * (ZI_WLEN - len(w))
+    return w
+
 if mode not in ["NoIn", "TF"]:
     if isxl and useblocks:
         print("Detected XL architecture.")
@@ -619,17 +635,8 @@ if mode not in ["NoIn", "TF"]:
                 weights_b += [0]
     elif iszi and useblocks:
         print("Detected Zimage architecture.")
-        if len(weights_a) > 34:
-            weights_a = weights_a[:34]
-            print(f"alpha weight converted for Zimage{weights_a}")
-        elif len(weights_a) < 34:
-            weights_a += [0] * (34 - len(weights_a))
-        if mode in modes_need_m2 and usebeta:
-            if len(weights_b) > 34:
-                weights_b = weights_b[:34]
-                print(f"beta weight converted for Zimage{weights_b}")
-            elif len(weights_b) < 34:
-                weights_b += [0] * (34 - len(weights_b))
+        weights_a = _fit_weights_for_zi(weights_a)
+        weights_b = _fit_weights_for_zi(weights_b) if weights_b is not None else None
         
 def _resolve_weight_index(key):
     block, tag = blockfromkey(key, isxl, isflux, iszi)
@@ -671,6 +678,7 @@ def _apply_cosine_blend(a, b, kmin, kmax, cur_alpha, variant, tau=0.20, floor=0.
 use_cos0 = bool(args.cosine0)
 use_cos1 = bool(args.cosine1)
 use_cos2 = bool(args.cosine2)
+blockids = BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else (BLOCKIDZI if iszi else BLOCKID))
 
 if use_cos0 or use_cos1 or use_cos2:
     base, dA, dB, varA, varB = resolve_cosine_triplet(theta_0, theta_1, theta_2, use_cos0, use_cos1, use_cos2)
@@ -696,12 +704,12 @@ if use_cos0 or use_cos1 or use_cos2:
         if _is_small_or_norm_or_bias(key, base[key]):
             cur_a = alpha
             if weights_a is not None and wi > 0: cur_a = weights_a[wi - 1]
-            if deep_a: cur_a = elementals(key, wi, deep_a, cur_a)
+            if deep_a: cur_a = elementals(key, wi, deep_a, cur_a, blockids)
             out = weighted_sum(base[key], dA[key], cur_a)
             if dB is not None and (key in dB) and (beta is not None):
                 cur_b = beta
                 if weights_b is not None and wi > 0: cur_b = weights_b[wi - 1]
-                if deep_b: cur_b = elementals(key, wi, deep_b, cur_b)
+                if deep_b: cur_b = elementals(key, wi, deep_b, cur_b, blockids)
                 out = weighted_sum(out, dB[key], cur_b)
             base[key] = _finetune_inplace(key, out, fine)
             continue
@@ -710,8 +718,8 @@ if use_cos0 or use_cos1 or use_cos2:
         if wi > 0:
             if weights_a is not None:            cur_a = weights_a[wi - 1]
             if (weights_b is not None) and dB is not None: cur_b = weights_b[wi - 1]
-        if deep_a: cur_a = elementals(key, wi, deep_a, cur_a)
-        if deep_b and dB is not None: cur_b = elementals(key, wi, deep_b, cur_b)
+        if deep_a: cur_a = elementals(key, wi, deep_a, cur_a, blockids)
+        if deep_b and dB is not None: cur_b = elementals(key, wi, deep_b, cur_b, blockids)
 
         ka = statsA.get(wi, defaultA); kminA, kmaxA = ka
         out = _apply_cosine_blend(base[key], dA[key], kminA, kmaxA, cur_a, variant=varA, tau=0.20, floor=0.05)
@@ -855,9 +863,15 @@ else:
     else:
         fine = ""
         
+def _strip_vae_root(k: str):
+    for r in ("vae.", "first_stage_model.", "model.vae.", "model.first_stage_model."):
+        if k.startswith(r):
+            return k[len(r):]
+    return k
+
 if args.vae:
     for k in tqdm(vae.keys(), desc=f"Baking in VAE[{vae_name}] ..."):
-        tk = vae_key + "." + k
+        tk = vae_key + "." + _strip_vae_root(k)
         theta_0[tk] = to_half(vae[k], args.save_half)
     del vae
 
@@ -965,7 +979,8 @@ try:
 
     merge_success = True
     print(f"Done! ({round(os.path.getsize(output_path)/1073741824, 2)}G)")
-
+except Exception as e:
+    print("ERROR while saving:", repr(e))
 finally:
     if args.delete_source and merge_success:
         for p in delete_targets:

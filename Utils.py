@@ -59,6 +59,142 @@ FINETUNES = [
     "model.diffusion_model.out.2.bias",
 ]
 
+# ---------------------------------------------------------------------
+# LBLOCKS (per-arch)
+#  - each entry corresponds 1:1 with that arch's BLOCKID* order
+#  - each entry is a list of substrings (aliases) to match against "full" or "msd"
+# ---------------------------------------------------------------------
+
+def make_lblocks_sdxl():
+    """
+    Order aligns with BLOCKIDXLL:
+      BASE, IN00..IN08, M00, OUT00..OUT08, VAE
+    """
+    lblocks = []
+
+    # BASE (text/conditioner)
+    lblocks.append([
+        "conditioner.embedders.",     # SDXL conditioner
+        "text_encoders.",             # diffusers packs
+        "clip_l.", "clip_g.",         # alt roots
+        "0_transformer_text_model_",  # your convert() output for te1
+        "1_model_transformer_resblocks_",  # your convert() output for te2
+    ])
+
+    # IN00..IN08
+    for i in range(9):
+        lblocks.append([
+            f"diffusion_model_input_blocks_{i}_",          # your convert() output
+            f"model.diffusion_model.input_blocks.{i}.",    # raw checkpoint
+        ])
+
+    # M00
+    lblocks.append([
+        "diffusion_model_middle_block_",
+        "model.diffusion_model.middle_block.",
+    ])
+
+    # OUT00..OUT08
+    for i in range(9):
+        lblocks.append([
+            f"diffusion_model_output_blocks_{i}_",
+            f"model.diffusion_model.output_blocks.{i}.",
+        ])
+
+    # SDXL has extra ".out." heads; fold them into OUT08 bucket
+    lblocks[-1].extend([
+        "diffusion_model_out_",
+        "model.diffusion_model.out.",
+    ])
+
+    # VAE
+    lblocks.append([
+        "first_stage_model.",
+        "vae.",
+    ])
+
+    return lblocks
+
+
+def make_lblocks_flux():
+    """
+    Order aligns with BLOCKIDFLUX:
+      CLIP, T5, IN, D00..D18, S00..S37, OUT
+    """
+    lblocks = []
+
+    # CLIP
+    lblocks.append([
+        "text_encoders.clip", "clip.", "clip_l.", "clip_g.",
+        "text_encoder.", "conditioner.embedders.",
+    ])
+
+    # T5
+    lblocks.append([
+        "t5xxl", "t5.", "text_encoders.t5", "text_encoder_2.",
+    ])
+
+    # IN (input projections / embeddings)
+    lblocks.append([
+        "img_in", "txt_in", "time_in", "vector_in",
+        "x_embedder", "t_embedder",
+    ])
+
+    # D00..D18 (double blocks)
+    for i in range(19):
+        lblocks.append([f"double_blocks.{i}.", f"double_block.{i}."])
+
+    # S00..S37 (single blocks)
+    for i in range(38):
+        lblocks.append([f"single_blocks.{i}.", f"single_block.{i}."])
+
+    # OUT (final layer / heads)
+    lblocks.append([
+        "final_layer", "out.", "vector_out",
+    ])
+
+    return lblocks
+
+
+def make_lblocks_zi():
+    """
+    Order aligns with BLOCKIDZI:
+      BASE, CONT, NOISE, L00..L29, VAE
+    """
+    lblocks = []
+
+    # BASE (text enc / caption embedder)
+    lblocks.append([
+        "text_encoders.qwen3_4b.", "qwen3_4b.",
+        "model.diffusion_model.cap_embedder.", "cap_embedder.",
+    ])
+
+    # CONT / NOISE
+    lblocks.append(["context_refiner", "diffusion_model.context_refiner"])
+    lblocks.append(["noise_refiner",   "diffusion_model.noise_refiner"])
+
+    # L00..L29
+    for i in range(30):
+        lblocks.append([
+            f"diffusion_model.layers.{i}.",         # LoRA example (no 'model.' prefix)
+            f"model.diffusion_model.layers.{i}.",   # model keys
+            f"diffusion_model_layers_{i}_",         # if you ever convert to underscore form
+        ])
+
+    # VAE
+    lblocks.append([
+        "vae.",
+        "first_stage_model.",
+    ])
+
+    return lblocks
+
+
+# Convenient ready-to-use constants
+LBLOCKS_SDXL = make_lblocks_sdxl()
+LBLOCKS_FLUX = make_lblocks_flux()
+LBLOCKS_ZI   = make_lblocks_zi()
+
 LBLOCKS26 = [
     "encoder",
     "diffusion_model_input_blocks_0_","diffusion_model_input_blocks_1_","diffusion_model_input_blocks_2_",
@@ -627,8 +763,8 @@ def blockfromkey(key: str, isxl: bool = False, isflux: bool = False, iszi: bool 
 
     return "Not Merge", "Not Merge"
 
-def elementals(key: str, weight_index: int, deep: list[str], current_alpha: float):
-    skey = key + BLOCKID[weight_index + 1]
+def elementals(key: str, weight_index: int, deep: list[str], current_alpha: float, blockids=BLOCKID) -> float:
+    skey = key + blockids[weight_index]
 
     def _neg(tokens: list[str]):
         return (True, tokens[1:]) if tokens and tokens[0] == "NOT" else (False, tokens)
@@ -638,7 +774,7 @@ def elementals(key: str, weight_index: int, deep: list[str], current_alpha: floa
             continue
         dbs_s, dws_s, dr_s = d.split(":", 2)
 
-        dbs = blocker(dbs_s, BLOCKID).split()
+        dbs = blocker(dbs_s, blockids).split()
         dws = dws_s.split()
         dbn, dbs = _neg(dbs)
         dwn, dws = _neg(dws)
@@ -795,7 +931,7 @@ def _swap_components_inplace(
     iszi: bool = False,
 ):
     if not (isxl or isflux or iszi):
-        _, _, auto_iszi = detect_arch(theta_src)
+        _, _, auto_iszi, theta_src = detect_arch(theta_src)
         iszi = iszi or auto_iszi
 
     pref = _component_prefix_map(isxl, isflux, iszi)
@@ -1215,7 +1351,6 @@ def get_permuted_param(ps: PermutationSpec, perm, k: str, params, except_axis=No
             continue
         
         if p not in perm:
-            # 恒等 perm で進める
             idx = torch.arange(w.shape[axis], device=w.device)
             perm[p] = idx
         else:
