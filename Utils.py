@@ -749,10 +749,11 @@ def blockfromkey(key: str, isxl: bool = False, isflux: bool = False, iszi: bool 
         
     #Z-IMAGE
     if iszi:
-        if "qwen3_4b" in key:          return "BASE", "BASE"
+        if "qwen3_4b" in key or "cap_embedder" in key:          return "BASE", "BASE"
         if not ("weight" in key or "bias" in key):     return "Not Merge", "Not Merge"
-        if "t_embedder" in key or "x_embedder" in key or "cap_embedder" in key or "norm_final" in key:     return "Not Merge", "Not Merge"
-        if "vae" in key:                 return "VAE",  "BASE"
+        if "t_embedder" in key or "x_embedder" in key:     return "Not Merge", "Not Merge"
+        if "vae" in key:                 return "VAE",  "VAE"
+        if "norm_final" in key:          return "L29", "L29"
         
         if "model.diffusion_model" in key:
             if "model.diffusion_model.final_layer" in key:    return "L29", "L29"
@@ -803,21 +804,23 @@ def prepare_merge_cache(theta_keys, isxl, isflux, iszi, deep_a, deep_b, weights_
             wi = BLOCKID.index(tag)
         else:
             wi = -1
+            
+        blockids = BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else (BLOCKIDZI if iszi else BLOCKID))
 
         cur_a = weights_a[wi - 1] if (weights_a is not None and wi > 0) else alpha
         cur_b = weights_b[wi - 1] if (weights_b is not None and wi > 0) else beta
 
         if deep_a:
-            cur_a = elementals(k, wi, deep_a, cur_a)
+            cur_a = elementals(k, wi, deep_a, cur_a, blockids)
         if deep_b:
-            cur_b = elementals(k, wi, deep_b, cur_b)
+            cur_b = elementals(k, wi, deep_b, cur_b, blockids)
 
         keymap[k] = (wi, cur_a, cur_b)
     return keymap
 
 def diff_inplace(dst, src, func, desc):
     for k in tqdm(dst.keys(), desc=desc):
-        if 'model' not in k: 
+        if ("model" not in k) and ("text_encoders" not in k): 
             continue
         t2 = src.get(k, torch.zeros_like(dst[k])) if k in src else None
         dst[k] = func(dst[k], t2) if t2 is not None else torch.zeros_like(dst[k])
@@ -896,11 +899,11 @@ def _component_prefix_map(isxl: bool, isflux: bool = False, iszi: bool = False):
             "unet":        ["model.diffusion_model."],
             "transformer": ["model.diffusion_model."],
             "vae":         ["first_stage_model.", "vae."],
-            "text":        ["qwen3_4b.", "cap_embedder."],
+            "text":        ["qwen3_4b.", "cap_embedder.", "text_encoders.qwen3_4b."],
             "text2":       [],
-            "clip":        ["qwen3_4b.", "cap_embedder."],
-            "clip-l":      ["qwen3_4b."],
-            "clip-g":      ["cap_embedder."],
+            "clip":        ["qwen3_4b.", "cap_embedder.", "model.diffusion_model.cap_embedder.", "text_encoders.qwen3_4b."],
+            "clip-l":      ["qwen3_4b.", "text_encoders.qwen3_4b."],
+            "clip-g":      ["cap_embedder.", "model.diffusion_model.cap_embedder."],
         }
 
     # SD1.x / SD2.x (non-XL, non-Flux, non-ZI)
@@ -967,7 +970,7 @@ def _is_clip_key(key: str, isxl: bool, isflux: bool, iszi: bool = False) -> bool
     elif isxl:
         prefixes = ["conditioner.embedders.", "text_encoders.", "clip_l.", "clip_g."]
     elif iszi:
-        prefixes = ["qwen3_4b.", "cap_embedder."]
+        prefixes = ["qwen3_4b.", "cap_embedder.","text_encoders.qwen3_4b.","model.diffusion_model.cap_embedder."]
     else:
         prefixes = ["cond_stage_model.", "clip."]
     return any(key.startswith(p) for p in prefixes)

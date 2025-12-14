@@ -90,8 +90,9 @@ def convert_diffusers_name_to_compvis(key: str, is_sd2: bool) -> str:
         return f"1_model_transformer_resblocks_{g[0]}_{r}"
     return key
 
-_ZI_LAYER_RE = re.compile(r"^diffusion_model\.layers\.(\d+)\.(.+)\.lora_(A|down)\.weight$")
-
+_ZI_LAYER_RE = re.compile(
+    r"^(?:model\.)?diffusion_model\.layers\.(\d+)\.(.+)\.lora_(A|down)\.weight$"
+)
 def zimage_resolve_target(down_k: str):
     """
     return (target_weight_key_in_theta0, part) where part in {None,'q','k','v'}
@@ -211,6 +212,9 @@ def apply_spectral_norm(lora_sd: dict, scale: float):
 def merge_weights(lora: dict, isv2: bool, isxl: bool, blocks: list[str], p: float, lam: float, scale: float, strengths: list[float]):
     out = {}
     for k, v in lora.items():
+        if "alpha" in k:
+            out[k] = v
+            continue
         full = convert_diffusers_name_to_compvis(k, isv2)
         msd  = full.split(".", 1)[0]
         if isxl:
@@ -229,7 +233,7 @@ def get_loralist(arg: str):
 def _build_keymap(sd: dict):
     km = {}
     for k in sd.keys():
-        if "model" not in k: 
+        if ("model" not in k) and ("text_encoders" not in k) and ("vae" not in k) and ("first_stage_model" not in k): 
             continue
         sk = k.replace(".", "_").replace("_weight", "")
         if "conditioner_embedders_" in sk:
@@ -293,11 +297,11 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
         ratios = ([float(x) for x in ratio_str.replace(" ", "").split(",")] 
                   if isinstance(ratio_str, str) else [ratio_str] * len(blocknum))
         lr_strs.append("[" + ",".join(str(x) for x in ratios) + "]")
-
         lpath = normalize_path(os.path.join(model_path, lora_model))
         lsd, meta, lisv2 = load_state_dict(lpath, torch.float)
         lhash, _, cache_data = sha256_from_cache(lpath, f"lora/{os.path.splitext(os.path.basename(lpath))[0]}", cache_data)
         lora_meta[lhash] = meta
+        
 
         for k in tqdm(list(lsd.keys()), desc=f"Merging {lora_model}..."):
             down_k, up_k, alpha_k = parse_lora_key(k)
@@ -336,18 +340,17 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
             if msd not in keymap: 
                 continue
                 
-            down = lsd[down_k].to("cpu")
-            up   = lsd[up_k].to("cpu")
+            down = lsd[down_k].to(device)
+            up   = lsd[up_k].to(device)
 
             dim   = down.size(0)
             alpha = lsd.get(alpha_k, dim)
             sc    = (alpha / dim)
 
-            W = theta_0[keymap[msd]].to("cpu")
+            W = theta_0[keymap[msd]].to(device)
             theta_0[keymap[msd]] = torch.nn.Parameter(
                 _apply_lora_to_weight(W, up, down, sc, ratio)
             )
-
         del lsd
         
     theta_0 = to_half_k(theta_0, args.save_half, args.save_bhalf, vae=vae_key)
@@ -358,7 +361,8 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
     theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key)
 
     for k in tqdm(list(theta_0.keys()), desc="Check contiguous..."):
-        theta_0[k] = theta_0[k].contiguous()
+        if isinstance(theta_0[k], torch.Tensor):
+            theta_0[k] = theta_0[k].detach().cpu().contiguous()
 
     out_name = os.path.splitext(os.path.basename(output))[0]
     meta_new = {
@@ -435,13 +439,13 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
             if msd not in keymap:
                 continue
 
-            down = lw[down_k].to("cpu")
-            up   = lw[up_k].to("cpu")
+            down = lw[down_k].to(device)
+            up   = lw[up_k].to(device)
             dim  = down.size(0)
             alpha = lw.get(alpha_k, dim)
             sc    = alpha / dim
 
-            W = theta_0[keymap[msd]].to("cpu")
+            W = theta_0[keymap[msd]].to(device)
             theta_0[keymap[msd]] = torch.nn.Parameter(
                 _apply_lora_to_weight(W, up, down, sc, ratio=1.0)
             )
@@ -456,7 +460,8 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key)
 
     for k in tqdm(list(theta_0.keys()), desc="Check contiguous..."):
-        theta_0[k] = theta_0[k].contiguous()
+        if isinstance(theta_0[k], torch.Tensor):
+            theta_0[k] = theta_0[k].detach().cpu().contiguous()
 
     out_name = os.path.splitext(os.path.basename(output))[0]
     meta_new = {

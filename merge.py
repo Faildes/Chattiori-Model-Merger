@@ -220,8 +220,8 @@ theta_funcs = {
     "FWM":  (None,           feature_weighted_merge,     "Feature Weighted Merge"),
     "TF":  (None,           None,               "Trim and Fill"),
 }
-modes_need_m2   = {"sAD", "AD", "TRS", "ST",  "TD", "SIM", "MD", "SPRSE", "HUB", "CHAN", "FREQ"}
-modes_need_beta = {"TRS", "ST", "TS",  "SIM", "MD", "DARE"}
+modes_need_m2   = {"sAD", "AD", "TRS", "ST",  "TD", "SIM", "MD", "HUB"}
+modes_need_beta = {"TRS", "ST", "TS",  "SIM", "MD", "DARE", "CHAN", "FREQ", "SPRSE"}
 
 parser = argparse.ArgumentParser(description="Merge two or three models")
 
@@ -969,11 +969,10 @@ merge_success = False
 try:
     print(f"Saving as {output_file}...")
     if args.save_safetensors:
-        with torch.no_grad():
-            safetensors.torch.save_file(
-                theta_0, output_path,
-                metadata=None if args.no_metadata else metadata
-            )
+        safetensors.torch.save_file(
+            theta_0, output_path,
+            metadata=None if args.no_metadata else metadata
+        )
     else:
         torch.save({"state_dict": theta_0}, output_path)
 
