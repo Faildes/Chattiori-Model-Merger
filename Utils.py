@@ -576,11 +576,12 @@ def prune_model(theta, name, args, isxl=False, isflux=False, iszi=False):
         'first_stage_model.',
         'vae.',
     ] + cond_prefixes
+    
+    theta_keys = list(theta.keys())
 
-    sd_pruned = {}
-
-    for key in tqdm(theta.keys(), desc=f"Pruning {name}..."):
+    for key in tqdm(theta_keys, desc=f"Pruning {name}..."):
         if not any(key.startswith(r) for r in roots):
+            del theta[key]
             continue
 
         k_in = key
@@ -600,9 +601,9 @@ def prune_model(theta, name, args, isxl=False, isflux=False, iszi=False):
                 v = v.to(torch.bfloat16)
             elif not getattr(args, "save_half", False) and not getattr(args, "save_bhalf", False) and dt in {torch.float16, torch.float64, torch.bfloat16, torch.float8_e4m3fn}:
                 v = v.to(torch.float32)
-        sd_pruned[key] = v
+        theta[key] = v
 
-    return sd_pruned
+    return theta
 
 
 def transform_checkpoint_dict_key(k: str):
@@ -672,6 +673,14 @@ def detect_arch(theta):
         del new_key
     return isxl, isflux, iszi, theta
 
+
+def _common_dtype(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
+    dt = torch.promote_types(torch.promote_types(a.dtype, b.dtype), c.dtype)
+    if dt in FP8_DTYPES:
+        dt = torch.float16
+    return dt
+
+
 def q_dequantize(sd, qtype, device, dtype, setbnb=True):
     from bitsandbytes.functional import dequantize_4bit
     dels = []
@@ -708,7 +717,7 @@ def blocker(blocks: str, blockids: list[str]) -> str:
 
 def blockfromkey(key: str, isxl: bool = False, isflux: bool = False, iszi: bool = False) -> Tuple[str, str]:
     # SD1.5
-    if not isxl and not isflux:
+    if not isxl and not isflux and not iszi:
         if "time_embed" in key: idx = -2
         elif ".out." in key:   idx = NUM_TOTAL_BLOCKS - 1
         elif (m := _re_inp.search(key)): idx = int(m.group(1))
@@ -936,6 +945,7 @@ def _swap_components_inplace(
     if not (isxl or isflux or iszi):
         _, _, auto_iszi, theta_src = detect_arch(theta_src)
         iszi = iszi or auto_iszi
+    if iszi: print("Z-IMAGE architecture detected for component swapping.")
 
     pref = _component_prefix_map(isxl, isflux, iszi)
     selected = set()
@@ -948,6 +958,7 @@ def _swap_components_inplace(
             selected.add("clip")
 
     prefixes = [p for c in selected for p in pref.get(c, [])]
+    # print(prefixes)
 
     moved, created, skipped_shape = 0, 0, 0
     for k, v in theta_src.items():
@@ -1195,7 +1206,7 @@ def _clipxor_semi_hard_blend(
     return out
 
 def _finetune_inplace(key, tens, fine):
-    if "first_stage_model" in key or not fine:
+    if ("first_stage_model" in key or "vae" in key) or fine == "":
         return tens
 
     if isinstance(fine, dict):
@@ -1252,7 +1263,7 @@ def trim_delta(delta: torch.Tensor, percentile: float = 0.5) -> torch.Tensor:
 def prune_extras_vs_model1(theta_base, theta_ref):
     to_delete = []
     for k in theta_base.keys():
-        if "model" not in k and "text_encoder" not in k:
+        if ("model" not in k) and ("text_encoders" not in k):
             continue
         if k not in theta_ref:
             to_delete.append(k)

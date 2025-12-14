@@ -19,7 +19,7 @@ from Utils import wgt, rand_ratio, sha256, read_metadata_from_safetensors \
     , _clip_tier_for_xl, _clip_tier_for_flux, _clip_tier_for_zi, _clipxor_semi_hard_blend \
     , _collect_clipxor_targets, _collect_clip_pairs_by_suffix, prepare_merge_cache\
     , trim_delta, normalize_path, prune_extras_vs_model1, unet_permutation_spec \
-    , weight_matching, apply_permutation, upcast_fp8_state_dict, to_quarter_k
+    , weight_matching, apply_permutation, upcast_fp8_state_dict, to_quarter_k, _common_dtype
 
 # Mode Functions
 
@@ -67,14 +67,53 @@ def _match_mean_std_like_a(out, a, eps=1e-6):
     o32 = (o32 - meanO) / stdO * std_mix + mean_mix
     return o32.to(out.dtype)
 
+@torch.inference_mode()
 def similarity_add_difference(a, b, c, alpha, beta):
-    threshold = torch.maximum(a.abs(), b.abs())
-    similarity = torch.nan_to_num(((a * b)/(threshold ** 2) + 1) * beta / 2, nan = beta)
-    ab_diff = a + alpha * (b - c)
-    ab_sum = a * (1 - alpha / 2) + b * (alpha / 2)
-    out = torch.lerp(ab_diff, ab_sum, similarity)
+    a_orig_dtype = a.dtype
+    dev = a.device
+    if b.device != dev: b = b.to(dev)
+    if c.device != dev: c = c.to(dev)
+
+    dt = _common_dtype(a, b, c)
+    if a.dtype != dt: a = a.to(dt)
+    if b.dtype != dt: b = b.to(dt)
+    if c.dtype != dt: c = c.to(dt)
+    
+    a2 = alpha * 0.5
+    b2 = beta  * 0.5
+
+    # --- similarity = nan_to_num(((a*b)/(max(|a|,|b|)^2) + 1) * beta/2, nan=beta)
+    thr = torch.empty_like(a)
+    sim = torch.empty_like(a)
+
+    torch.abs(a, out=thr)
+    torch.abs(b, out=sim)
+    torch.maximum(thr, sim, out=thr)
+    thr.mul_(thr)  # thr = threshold^2
+
+    torch.mul(a, b, out=sim)   # sim = a*b
+    sim.div_(thr)              # sim = (a*b)/thr
+    sim.add_(1.0).mul_(b2)     # sim = ((a*b)/thr + 1) * beta/2
+
+    try:
+        torch.nan_to_num_(sim, nan=beta)
+    except AttributeError:
+        torch.nan_to_num(sim, nan=beta, out=sim)
+
+    # --- ab_diff = a + alpha * (b - c)
+    out = torch.empty_like(a)
+    torch.sub(b, c, out=out)
+    out.mul_(alpha).add_(a)
+
+    # --- ab_sum = a*(1 - alpha/2) + b*(alpha/2)
+    torch.mul(a, (1.0 - a2), out=thr)
+    thr.add_(b, alpha=a2)
+
+    # --- out = lerp(ab_diff, ab_sum, similarity)
+    torch.lerp(out, thr, sim, out=out)
+
     out = _match_mean_std_like_a(out, a)
-    return out
+    return out.to(dtype=a_orig_dtype)
 
 def dare_merge(theta0, theta1, alpha, beta):
     if theta0.dim() in (1, 2):
@@ -343,7 +382,7 @@ model_0_name = args.m0_name or stem(model_0_path)
 print(f"Loading {model_0_name}...")
 theta_0, model_0_sha256, model_0_hash, model_0_meta, cache_data = load_model(model_0_path, device, cache_data=cache_data)
 qd0 = qdtyper(theta_0)
-isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
+_,_,_, theta_0 = detect_arch(theta_0)
 theta_0 = upcast_fp8_state_dict(theta_0)
 
 theta_1 = theta_2 = None
@@ -460,7 +499,7 @@ if mode != "NoIn":
             print(f"Loading {model_2_name}...")
             theta_2, model_2_sha256, model_2_hash, model_2_meta, cache_data = load_model(model_2_path, device, cache_data=cache_data)
             qd2 = qdtyper(theta_2)
-            isxl, isflux, iszi, theta_2 = detect_arch(theta_2)
+            _,_,_, theta_2 = detect_arch(theta_2)
             theta_2 = upcast_fp8_state_dict(theta_2)
 
         usebeta = mode in modes_need_beta
@@ -508,7 +547,7 @@ if args.vae:
     vae, *_ = load_model(normalize_path(args.vae), device, verify_hash=False)
 
 if mode == "DARE":
-    g = torch.Generator(device=device if device != "cpu" else "cpu")
+    g = torch.Generator(device=device)
     if args.seed is not None: g.manual_seed(args.seed)
 
 def _is_small_or_norm_or_bias(key, tens):
@@ -637,6 +676,8 @@ if mode not in ["NoIn", "TF"]:
         print("Detected Zimage architecture.")
         weights_a = _fit_weights_for_zi(weights_a)
         weights_b = _fit_weights_for_zi(weights_b) if weights_b is not None else None
+        # print(f"alpha weights for ZI: {weights_a}")
+        # print(f"beta weights for ZI: {weights_b}")
         
 def _resolve_weight_index(key):
     block, tag = blockfromkey(key, isxl, isflux, iszi)
@@ -692,7 +733,7 @@ if use_cos0 or use_cos1 or use_cos2:
     # theta_res = clone_dict_tensors(base)
 
     for key in tqdm(base.keys(), desc="Cosine structure-based blending..."):
-        if "first_stage_model" in key or ("model" not in key and "text_encoders" not in key):
+        if ("first_stage_model" in key or "vae" in key) or ("model" not in key and "text_encoders" not in key):
             continue
         if key not in dA:
             continue
@@ -755,8 +796,12 @@ def remerge_model(target_dict, source_dict, desc, mode, theta_2=None):
 
     return target_dict
 
+# common = len(set(theta_0.keys()) & set(theta_1.keys()))
+# print("[dbg] keys0, keys1, common =", len(theta_0), len(theta_1), common)
 if mode not in ["NoIn", "TF"]:
     merge_cache = prepare_merge_cache(theta_0.keys(), isxl, isflux, iszi, deep_a, deep_b, weights_a, weights_b, alpha, beta)
+    # print("[dbg] merge_cache keys =", len(merge_cache))
+    # print("[dbg] merge_cache in common =", sum(1 for k in merge_cache if k in theta_1))
     vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
     
     for key in tqdm(theta_0.keys(), desc=f"{merge_name} Merging..."):
@@ -765,6 +810,7 @@ if mode not in ["NoIn", "TF"]:
         if not (theta_1 and ("model" in key or "text_encoders" in key) and key in theta_1):
             continue
         if mode != "DARE" and (usebeta or mode == "TD") and (theta_2 is not None) and key not in theta_2:
+            # print(f"[warn] key '{key}' missing in model 2; skipping.")
             continue
         if key in checkpoint_dict_skip_on_merge:
             continue
@@ -815,6 +861,7 @@ if mode not in ["NoIn", "TF"]:
             continue
 
         if al != bl and len(al) == 4 and len(bl) == 4 and al[0]==bl[0] and al[2:]==bl[2:]:
+            # print(f"[warn] shape mismatch on key '{key}': {al} vs {bl}, attempting to align channels by cropping...")
             use = min(al[1], bl[1], 4)
             ad = a[:, :use, ...]
         else:
@@ -889,7 +936,7 @@ if args.prune:
 theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key)
 
 for k in tqdm(theta_0.keys(), desc="Check contiguous..."):
-    theta_0[k] = theta_0[k].contiguous()
+    theta_0[k] = theta_0[k].detach().cpu().contiguous()
 
 metadata = {"format": "safetensors" if args.save_safetensors else "ckpt", "sd_merge_models": {}, "sd_merge_recipe": None}
 if args.memo is not None:
