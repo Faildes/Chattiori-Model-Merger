@@ -19,7 +19,8 @@ from Utils import wgt, rand_ratio, sha256, read_metadata_from_safetensors \
     , _clip_tier_for_xl, _clip_tier_for_flux, _clip_tier_for_zi, _clipxor_semi_hard_blend \
     , _collect_clipxor_targets, _collect_clip_pairs_by_suffix, prepare_merge_cache\
     , trim_delta, normalize_path, prune_extras_vs_model1, unet_permutation_spec \
-    , weight_matching, apply_permutation, upcast_fp8_state_dict, to_quarter_k, _common_dtype
+    , weight_matching, apply_permutation, upcast_fp8_state_dict, to_quarter_k \
+    , _common_dtype, _component_prefix_map, _key_belongs_to_component, _filter_state_dict_by_components
 
 # Mode Functions
 
@@ -255,6 +256,7 @@ theta_funcs = {
     "CHAN": (None,           channel_cosine_gate,        "Channel-wise Cosine Gate"),
     "FREQ": (None,           freq_band_blend,            "Frequency-Band Blend"),
     "SWAP": (None,           None,                       "Swap Components"),
+    "COMP": (None,           None,                       "Save Components (model0 only)"),
     "CLIPXOR": (None,        None,                       "CLIP XOR (union-minus-intersection)"),
     "FWM":  (None,           feature_weighted_merge,     "Feature Weighted Merge"),
     "TF":  (None,           None,               "Trim and Fill"),
@@ -267,7 +269,7 @@ parser = argparse.ArgumentParser(description="Merge two or three models")
 parser.add_argument("mode",         choices=list(theta_funcs.keys()),   help="Merging mode")
 parser.add_argument("model_path",   type=str,                           help="Path to models")
 parser.add_argument("model_0",      type=str,                           help="Name of model 0")
-parser.add_argument("model_1",      type=str,                           help="Optional, Name of model 1", default=None)
+parser.add_argument("model_1",      type=str,                nargs="?", help="Optional, Name of model 1", default=None)
 parser.add_argument(f"--model_2",   type=str,                           help="Optional, Name of model 2", default=None, required=False)
 
 for i in range(3):
@@ -305,6 +307,8 @@ parser.add_argument("--output",             help="Output file name without exten
 parser.add_argument("--device", type=str,   help="Device to use, defaults to cpu", default="cpu", required=False)
 
 args = parser.parse_args()
+if args.mode not in {"NoIn", "RM", "SWAP", "CLIPXOR", "COMP"} and args.model_1 is None:
+    raise SystemExit(f"mode '{args.mode}' needs model_1")
 
 if args.save_quarter and args.save_half:
     print("[warn] --save_half and --save_quarter are both set; prioritizing --save_quarter (fp8).")
@@ -316,7 +320,7 @@ if mode in modes_need_m2 and (args.model_2 is None):
     raise SystemExit(f"mode '{mode}' needs 3rd model")
 theta_func1, theta_func2, merge_name = theta_funcs[mode]
 
-if mode not in ["SWAP", "CLIPXOR"]:
+if mode not in ["SWAP", "CLIPXOR", "COMP"]:
     args.alpha, deep_a, block_a = wgt(args.alpha, [])
     args.beta,  deep_b, block_b = wgt(args.beta, [])
     useblocks = block_a or block_b
@@ -358,6 +362,7 @@ if os.path.isfile(output_path):
         print(f"Assigned result checkpoint name as {output_file}\n")
 
 stem = lambda p: os.path.splitext(os.path.basename(p))[0]
+comp_components = None
 
 torch.set_grad_enabled(False)
 
@@ -382,13 +387,14 @@ model_0_name = args.m0_name or stem(model_0_path)
 print(f"Loading {model_0_name}...")
 theta_0, model_0_sha256, model_0_hash, model_0_meta, cache_data = load_model(model_0_path, device, cache_data=cache_data)
 qd0 = qdtyper(theta_0)
-_,_,_, theta_0 = detect_arch(theta_0)
+
+isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
 theta_0 = upcast_fp8_state_dict(theta_0)
 
 theta_1 = theta_2 = None
 model_1_sha256 = model_2_sha256 = None
 
-if mode != "NoIn":
+if mode not in ["NoIn", "COMP"]:
     interp_method = 0
     model_1_path = normalize_path(os.path.join(args.model_path, args.model_1))
     model_1_name = args.m1_name or stem(model_1_path)
@@ -537,14 +543,33 @@ if mode != "NoIn":
                     print(f"[ReBasin] (0 <-> 2) average gain: {gain_02:.4f}")
 
 else:
+    if args.mode == "COMP":
+        atext = str(args.alpha).strip()
+        if atext in {"", "0", "0.0", "none", "None"}:
+            atext = "all"
+        comp_components = _normalize_components_list(atext)
+
+        if not comp_components:
+            comp_components = {"unet", "vae", "clip-l", "clip-g", "clip", "transformer", "text", "text2"}
+
+        before = len(theta_0)
+        theta_0, kept, total = _filter_state_dict_by_components(theta_0, comp_components, isxl, isflux, iszi)
+        print(f"[COMP] components={sorted(list(comp_components))}  kept:{kept} / {before}")
+
+        mode = "NoIn"
+        theta_1 = None
+        deep_a = deep_b = []
     usebeta = False
     weights_a = weights_b = None
     alpha = beta = None
     isxl, isflux, iszi = False, False, False
 
 if args.vae:
-    vae_name = stem(args.vae)
-    vae, *_ = load_model(normalize_path(args.vae), device, verify_hash=False)
+    if args.mode == "COMP" and comp_components is not None and ("vae" not in comp_components):
+        print("[COMP] --vae was provided but 'vae' is not selected; skipping VAE bake.")
+    else:
+        vae_name = stem(args.vae)
+        vae, *_ = load_model(normalize_path(args.vae), device, verify_hash=False)
 
 if mode == "DARE":
     g = torch.Generator(device=device)
@@ -773,6 +798,7 @@ if use_cos0 or use_cos1 or use_cos2:
 
     theta_0 = base
 
+
 def remerge_model(target_dict, source_dict, desc, mode, theta_2=None):
     for key in tqdm(source_dict.keys(), desc=desc):
         if isflux or key in checkpoint_dict_skip_on_merge or ("model" not in key and "text_encoders" not in key) or key in target_dict:
@@ -977,6 +1003,8 @@ if args.mode == "SWAP":
     merge_recipe["swap_components_alpha_text"] = str(args.alpha)
 elif args.mode == "CLIPXOR":
     merge_recipe["clipxor"] = {"intersection": "elemwise_minabs_same_sign", "base": False}
+elif args.mode == "COMP":
+    merge_recipe["comp_components_alpha_text"] = str(args.alpha)
 elif args.rebasin is not None:
     merge_recipe["rebasin"] = {
         "iter": args.rebasin,

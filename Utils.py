@@ -1544,3 +1544,18 @@ def weight_matching(
 
     average = float(linear_sum) / float(number) if number > 0 else 0.0
     return perm, average
+
+
+def _filter_state_dict_by_components(theta: dict, components: set[str], isxl: bool, isflux: bool, iszi: bool):
+    pref = _component_prefix_map(isxl, isflux, iszi)
+
+    # components -> prefixes
+    prefixes = [p for c in components for p in pref.get(c, [])]
+    if not prefixes:
+        return theta, 0, 0
+
+    kept = {}
+    for k, v in theta.items():
+        if _key_belongs_to_component(k, prefixes):
+            kept[k] = v
+    return kept, len(kept), len(theta)
