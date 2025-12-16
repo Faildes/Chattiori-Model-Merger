@@ -951,7 +951,43 @@ def _normalize_components_list(alpha_text: str):
     # "UNet, CLIP-L, VAE" -> {'unet','clip-l','vae'}
     if not alpha_text:
         return set()
+
     tokens = [t.strip().lower() for t in alpha_text.replace(";", ",").split(",") if t.strip()]
+    syn = {
+        "u": "unet", "unet": "unet",
+        "v": "vae", "vae": "vae",
+        "clip": "clip", "text": "clip", "te": "clip",
+        "clip-l": "clip-l", "clipl": "clip-l", "clip_l": "clip-l", "l": "clip-l", "text-l": "clip-l",
+        "clip-g": "clip-g", "clipg": "clip-g", "clip_g": "clip-g", "g": "clip-g", "text-g": "clip-g",
+        "denoiser": "transformer", "denoise": "transformer", "transformer": "transformer", "mmdit": "transformer",
+        "t5": "text", "t5-xxl": "text", "text1": "text", "text2": "text2",
+        "all": "all",
+    }
+
+    mapped = []
+    for t in tokens:
+        tt = syn.get(t, None)
+        if tt is None:
+            try:
+                float(t)
+                continue
+            except Exception:
+                continue
+        mapped.append(tt)
+
+    if (not mapped) or ("all" in mapped):
+        return {"unet", "vae", "clip-l", "clip-g", "clip", "transformer", "text", "text2"}
+
+    return set(mapped)
+
+_SPLIT = re.compile(r"[,\n]+")
+
+def _parse_components_with_only(alpha_text: str):
+    if not alpha_text:
+        return set(), set()
+
+    tokens = [t.strip().lower() for t in alpha_text.replace(";", ",").split(",") if t.strip()]
+
     syn = {
         "u": "unet", "unet": "unet",
         "v": "vae", "vae": "vae",
@@ -962,10 +998,37 @@ def _normalize_components_list(alpha_text: str):
         "t5":"text", "t5-xxl":"text", "text1":"text", "text2":"text2",
         "all": "all",
     }
-    mapped = [syn.get(t, t) for t in tokens]
-    if "all" in mapped or not mapped:
-        return {"unet", "vae", "clip-l", "clip-g", "clip", "transformer", "text", "text2"}
-    return set(mapped)
+
+    all_set = {"unet", "vae", "clip-l", "clip-g", "clip", "transformer", "text", "text2"}
+
+    comps = set()
+    only  = set()
+
+    for t in tokens:
+        is_only = False
+        if t.endswith("_only"):
+            is_only = True
+            t = t[:-5]
+
+        try:
+            float(t)
+            continue
+        except Exception:
+            pass
+
+        t = syn.get(t, None)
+        if t is None:
+            continue
+
+        if t == "all":
+            return set(all_set), set()
+
+        if t in all_set:
+            comps.add(t)
+            if is_only:
+                only.add(t)
+
+    return comps, only
 
 def _component_prefix_map(isxl: bool, isflux: bool = False, iszi: bool = False):
     if isflux:
@@ -1011,9 +1074,9 @@ def _component_prefix_map(isxl: bool, isflux: bool = False, iszi: bool = False):
             "unet":        ["model.diffusion_model."],
             "transformer": ["model.diffusion_model."],
             "vae":         ["first_stage_model.", "vae."],
-            "text":        ["qwen3_4b.", "cap_embedder.", "text_encoders.qwen3_4b."],
+            "text":        ["text_encoders.qwen3_4b.transformer.", "qwen3_4b.", "cap_embedder.", "text_encoders.qwen3_4b."],
             "text2":       [],
-            "clip":        ["qwen3_4b.", "cap_embedder.", "model.diffusion_model.cap_embedder.", "text_encoders.qwen3_4b."],
+            "clip":        ["text_encoders.qwen3_4b.transformer.", "qwen3_4b.", "cap_embedder.", "model.diffusion_model.cap_embedder.", "text_encoders.qwen3_4b."],
             "clip-l":      ["qwen3_4b.", "text_encoders.qwen3_4b."],
             "clip-g":      ["cap_embedder.", "model.diffusion_model.cap_embedder."],
         }
@@ -1037,6 +1100,32 @@ def _key_belongs_to_component(key: str, prefixes: list[str]) -> bool:
             return True
     return False
 
+def _best_prefix_match(k: str, prefixes: list[str]) -> str | None:
+    best = None
+    best_len = -1
+    for p in prefixes:
+        if k.startswith(p) and len(p) > best_len:
+            best = p
+            best_len = len(p)
+    return best
+
+def _suffix_candidates(k: str):
+    cands = [k]
+    if k.startswith("transformer."):
+        cands.append(k[len("transformer."):])
+    if k.startswith("transformer.model."):
+        cands.append(k[len("transformer."):])
+    if not k.startswith("model."):
+        cands.append("model." + k)
+    seen = set()
+    out = []
+    for x in cands:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+@torch.inference_mode()
 def _swap_components_inplace(
     theta_dst: dict,
     theta_src: dict,
@@ -1044,37 +1133,76 @@ def _swap_components_inplace(
     isxl: bool,
     isflux: bool,
     iszi: bool = False,
+    *,
+    src_only: set[str] | None = None,
 ):
     if not (isxl or isflux or iszi):
         _, _, auto_iszi, theta_src = detect_arch(theta_src)
         iszi = iszi or auto_iszi
-    if iszi: print("Z-IMAGE architecture detected for component swapping.")
 
     pref = _component_prefix_map(isxl, isflux, iszi)
-    selected = set()
-    for c in components:
-        if c in pref:
-            selected.add(c)
-        elif c in {"clip-l", "clip_g"} and "clip" in pref:
-            selected.add(c)
-        elif c == "clip" and "clip" in pref:
-            selected.add("clip")
 
+    selected = {c for c in (components or set()) if c in pref and pref.get(c)}
     prefixes = [p for c in selected for p in pref.get(c, [])]
-    # print(prefixes)
+
+    if not prefixes:
+        return 0, 0, 0, theta_dst
+
+    only = set(src_only or set())
+    do_only = bool(only & selected)
+
+    suffix_map = None
+    if do_only:
+        p_sorted = sorted(prefixes, key=len, reverse=True)
+        suffix_map = {}
+        for kd in theta_dst.keys():
+            mp = _best_prefix_match(kd, p_sorted)
+            if mp is None:
+                continue
+            suf = kd[len(mp):]
+            if suf and (suf not in suffix_map):
+                suffix_map[suf] = kd
 
     moved, created, skipped_shape = 0, 0, 0
-    for k, v in theta_src.items():
-        if not prefixes or _key_belongs_to_component(k, prefixes):
-            if k in theta_dst and tuple(theta_dst[k].shape) != tuple(v.shape):
+
+    for k, v in tqdm(theta_src.items(), desc="Swapping components...", unit="param"):
+        if not do_only:
+            if not _key_belongs_to_component(k, prefixes):
+                continue
+            k_use = k
+        else:
+            k_use = None
+            if k in theta_dst:
+                k_use = k
+            else:
+                for cand in _suffix_candidates(k):
+                    kk = suffix_map.get(cand) if suffix_map is not None else None
+                    if kk is not None:
+                        k_use = kk
+                        break
+                    
+                if k_use is None:
+                    k_use = prefixes[0] + k
+
+        if k_use in theta_dst:
+            dv = theta_dst[k_use]
+            if hasattr(dv, "shape") and hasattr(v, "shape") and tuple(dv.shape) != tuple(v.shape):
                 skipped_shape += 1
                 continue
-            if k in theta_dst:
-                theta_dst[k] = v.to(dtype=theta_dst[k].dtype, device=theta_dst[k].device)
-                moved += 1
+
+            if isinstance(dv, torch.Tensor) and isinstance(v, torch.Tensor):
+                vv = v
+                if vv.dtype != dv.dtype or vv.device != dv.device:
+                    vv = vv.to(device=dv.device, dtype=dv.dtype)
+                dv.copy_(vv)
+                theta_dst[k_use] = dv
             else:
-                theta_dst[k] = v
-                created += 1
+                theta_dst[k_use] = v
+            moved += 1
+        else:
+            theta_dst[k_use] = v
+            created += 1
+
     return moved, created, skipped_shape, theta_dst
 
 
@@ -1620,17 +1748,14 @@ def weight_matching(
 
 def _filter_state_dict_by_components(theta: dict, components: set[str], isxl: bool, isflux: bool, iszi: bool):
     pref = _component_prefix_map(isxl, isflux, iszi)
+    prefixes = [p for c in components for p in pref.get(c, []) if p]
 
-    # components -> prefixes
-    prefixes = [p for c in components for p in pref.get(c, [])]
+    total = len(theta)
     if not prefixes:
-        return theta, 0, 0
+        return {}, 0, total
 
-    kept = {}
-    for k, v in theta.items():
-        if _key_belongs_to_component(k, prefixes):
-            kept[k] = v
-    return kept, len(kept), len(theta)
+    kept = {k: v for k, v in theta.items() if _key_belongs_to_component(k, prefixes)}
+    return kept, len(kept), total
 
 def finalize_and_pack_for_save(theta, *, save_half, save_bhalf, save_quarter, vae_key, make_cpu=True, prefer_fp8="e4m3"):
     want_fp8 = bool(save_quarter)

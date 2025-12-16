@@ -20,7 +20,7 @@ from Utils import wgt, rand_ratio, sha256, read_metadata_from_safetensors \
     , _clip_tier_for_xl, _clip_tier_for_flux, _clip_tier_for_zi, _clipxor_semi_hard_blend \
     , _collect_clipxor_targets, _collect_clip_pairs_by_suffix \
     , trim_delta, normalize_path, prune_extras_vs_model1, unet_permutation_spec \
-    , weight_matching, apply_permutation, upcast_fp8_state_dict \
+    , weight_matching, apply_permutation, upcast_fp8_state_dict, _parse_components_with_only \
     , _common_dtype, _filter_state_dict_by_components, prepare_state_dict_for_save
 
 # Mode Functions
@@ -461,20 +461,26 @@ if mode not in ["NoIn", "COMP"]:
     theta_1, model_1_sha256, model_1_hash, model_1_meta, cache_data = load_model(model_1_path, device, cache_data=cache_data)
     qd1 = qdtyper(theta_1)
     theta_1 = upcast_fp8_state_dict(theta_1)
-    isxl, isflux, iszi, theta_1 = detect_arch(theta_1)
+    _, _, _, theta_1 = detect_arch(theta_1)
     if args.fine and not iszi:
         fine = fineman([float(t) for t in args.fine.split(",")], isxl, isflux)
     else:
         fine = ""
         
     if mode == "SWAP":
-        components = _normalize_components_list(str(args.alpha))
+        components, only = _parse_components_with_only(str(args.alpha))
+        
         if not components:
             components = {"unet", "vae", "clip-l", "clip-g", "clip", "transformer", "text", "text2"}
 
-        moved, created, skipped, theta_0 = _swap_components_inplace(theta_0, theta_1, components, isxl, isflux, iszi)
-        print(f"[SWAP] components={sorted(list(components))}  moved:{moved}  created:{created}  shape_skipped:{skipped}")
-        
+        moved, created, skipped, theta_0 = _swap_components_inplace(
+            theta_0, theta_1,
+            components,
+            isxl=isxl, isflux=isflux, iszi=iszi,
+            src_only=only,
+        )
+        print(f"[SWAP] components={sorted(list(components))} only={sorted(list(only))}  moved:{moved}  created:{created}  shape_skipped:{skipped}")
+
         mode = "NoIn"
         theta_1 = None
         usebeta = False
@@ -1181,7 +1187,7 @@ try:
             metadata=None if args.no_metadata else metadata
         )
     else:
-        torch.save({"state_dict": theta_0}, output_path)
+        torch.save({"state_dict": theta_0}, output_path, _use_new_zipfile_serialization=False)
 
     merge_success = True
     print(f"Done! ({round(os.path.getsize(output_path)/1073741824, 2)}G)")
