@@ -9,12 +9,12 @@ import safetensors
 import filelock
 import hashlib
 from tqdm.auto import tqdm
-import concurrent.futures as cf
 from typing import List, Tuple, NamedTuple
 from pathlib import Path
 import torch.nn.functional as F
 from collections import defaultdict
 from scipy.optimize import linear_sum_assignment
+from functools import lru_cache
 
 try:
     FP8_E4M3 = getattr(torch, "float8_e4m3fn", None)
@@ -40,6 +40,9 @@ BLOCKIDZI = ["BASE","CONT","NOISE"] + [f"L{i:02}" for i in range(30)] + ["VAE"]
 _re_inp = re.compile(r'\.input_blocks\.(\d+)\.')
 _re_mid = re.compile(r'\.middle_block\.(\d+)\.')
 _re_out = re.compile(r'\.output_blocks\.(\d+)\.')
+
+_re_flux_any_num = re.compile(r'\.(\d+)\.')
+_re_xl_tf = re.compile(r'transformer_blocks\.(\d+)\.')
 
 FINETUNEX = ["IN", "OUT", "OUT2", "CONT", "BRI", "COL1", "COL2", "COL3"]
 COLS = [[-1, 1/3, 2/3], [1, 1, 0], [0, -1, -1], [1, 0, 1]]
@@ -215,7 +218,7 @@ checkpoint_dict_replacements = {
     'cond_stage_model.transformer.final_layer_norm.': 'cond_stage_model.transformer.text_model.final_layer_norm.',
 }
 
-checkpoint_dict_skip_on_merge = ["cond_stage_model.transformer.text_model.embeddings.position_ids"]
+checkpoint_dict_skip_on_merge = set(["cond_stage_model.transformer.text_model.embeddings.position_ids"])
 vae_ignore_keys = {"model_ema.decay", "model_ema.num_updates"}
 
 def normalize_path(path: str) -> str:
@@ -236,7 +239,9 @@ def tagdict(presets: str) -> dict:
                 wdict[key.strip()] = w.strip()
     return wdict
 
-def base_path(path: str) -> str:
+def base_path(path: str=None) -> str:
+    if path is None:
+        return os.path.dirname(os.path.realpath(__file__))
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), path)
 
 file_path = base_path("mbwpresets.txt")
@@ -385,62 +390,117 @@ DTYPES = {torch.float32, torch.float64, torch.bfloat16}
 def to_half(tensor, enable):
     return tensor.half() if enable and getattr(tensor, "dtype", None) in DTYPES else tensor
 
-def to_half_k(sd, enable, benable, vae=None):
-    if (enable or benable):
-        for d in tqdm(list(sd.items()), desc="Half tensoring..."):
-            k, v = d
-            if ("model" in k or  "text_encoders" in k) and getattr(v, "dtype", None) in DTYPES:
-                if vae:
-                    if k.startswith(vae):
-                        continue
-                sd[k] = v.bfloat16() if benable else v.half()
-    return sd
-
 
 def upcast_fp8_state_dict(theta: dict, target_dtype: torch.dtype = torch.float16):
     if not FP8_DTYPES:
         return theta
 
-    items = list(theta.items())
-
-    fp8_items = [(k, v) for k, v in items
-                 if isinstance(v, torch.Tensor) and v.dtype in FP8_DTYPES]
-    if not fp8_items:
-        return theta
-
-    for k, v in tqdm(fp8_items,
-                     total=len(fp8_items),
-                     desc=f"Upcasting {len(fp8_items)} fp8 tensors..."):
-        theta[k] = v.to(target_dtype)
-
-    return theta
-
-
-def to_quarter_k(theta: dict, enable: bool, prefer: str = "e4m3", vae=None):
-    if not enable:
-        return theta
-
-    target_dtype = None
-    if prefer == "e5m2" and FP8_E5M2 is not None:
-        target_dtype = FP8_E5M2
-    elif prefer == "e4m3" and FP8_E4M3 is not None:
-        target_dtype = FP8_E4M3
-    elif FP8_E4M3 is not None:
-        target_dtype = FP8_E4M3
-    elif FP8_E5M2 is not None:
-        target_dtype = FP8_E5M2
-
-    if target_dtype is None:
-        print("[fp8] This PyTorch build has no float8 support; falling back to fp16/fp32.")
-        return theta
-
+    fp8_keys = []
     for k, v in theta.items():
-        if ("model" in k or "text_encoders" in k) and isinstance(v, torch.Tensor) and v.is_floating_point():
-            if vae:
-                if k.startswith(vae):
-                    continue
-            theta[k] = v.to(target_dtype)
+        if isinstance(v, torch.Tensor) and v.dtype in FP8_DTYPES:
+            fp8_keys.append(k)
+
+    if not fp8_keys:
+        return theta
+
+    for k in tqdm(fp8_keys, total=len(fp8_keys), desc=f"Upcasting {len(fp8_keys)} fp8 tensors..."):
+        theta[k] = theta[k].to(target_dtype)
+
     return theta
+
+
+@torch.inference_mode()
+def prepare_state_dict_for_save(
+    theta: dict,
+    args,
+    *,
+    isxl: bool,
+    isflux: bool,
+    iszi: bool,
+    vae_prefix: str | None,
+    prune: bool = True,
+    make_cpu: bool = True,
+    make_contiguous: bool = True,
+):
+    # roots
+    if isflux:
+        cond_prefixes = ("clip.cond_stage_model.",)
+    elif isxl:
+        cond_prefixes = ("conditioner.",)
+    elif iszi:
+        cond_prefixes = ("text_encoders.qwen3_4b.",)
+    else:
+        cond_prefixes = ("cond_stage_model.",)
+
+    roots = (
+        "model.diffusion_model.",
+        "depth_model.",
+        "first_stage_model.",
+        "vae.",
+        *cond_prefixes,
+    )
+
+    want_fp8  = bool(getattr(args, "save_quarter", False)) and bool(FP8_DTYPES)
+    want_fp16 = bool(getattr(args, "save_half", False)) and not want_fp8
+    want_bf16 = bool(getattr(args, "save_bhalf", False)) and not want_fp8
+
+    fp8_dtype = FP8_E4M3 if FP8_E4M3 is not None else (FP8_E5M2 if FP8_E5M2 is not None else None)
+    if want_fp8 and fp8_dtype is None:
+        want_fp8 = False
+
+    cpu = torch.device("cpu")
+    
+    key_list = list(theta.keys())
+
+    for k in tqdm(key_list, desc="Preparing merged model for save...", unit="param"):
+        v = theta.get(k, None)
+
+        # prune
+        if prune and not any(k.startswith(r) for r in roots):
+            theta.pop(k, None)
+            continue
+
+        if not isinstance(v, torch.Tensor):
+            continue
+
+        # keep_ema
+        if getattr(args, "keep_ema", False):
+            k_ema = "model_ema." + k[6:].replace(".", "")
+            v_ema = theta.get(k_ema, None)
+            if isinstance(v_ema, torch.Tensor):
+                v = v_ema
+
+        # dtype
+        is_vae = bool(vae_prefix) and k.startswith(vae_prefix)
+        if (not is_vae) and v.is_floating_point():
+            dt = v.dtype
+            if want_fp8:
+                if dt in FP_SET:
+                    v = v.to(fp8_dtype)
+            elif want_fp16:
+                if dt in {torch.float32, torch.float64, torch.bfloat16, *FP8_DTYPES}:
+                    v = v.to(torch.float16)
+            elif want_bf16:
+                if dt in {torch.float32, torch.float64, torch.float16, *FP8_DTYPES}:
+                    v = v.to(torch.bfloat16)
+            else:
+                if dt in {torch.float16, torch.float64, torch.bfloat16, *FP8_DTYPES}:
+                    v = v.to(torch.float32)
+
+        v = v.detach()
+
+        if make_cpu and v.device.type != "cpu":
+            v = v.to(cpu, non_blocking=False)
+        if make_contiguous and not v.is_contiguous():
+            v = v.contiguous()
+
+        theta[k] = v
+
+    return theta
+
+def set_cache_filename(path: str):
+    global cache_filename
+    cache_filename = normalize_path(path)
 
 cache_filename = os.path.join(os.getcwd(), "cache.json")
 
@@ -497,21 +557,11 @@ def sha256_from_cache(filename: str, title: str, cache_data):
         return None, None, cache_data
     return h.get("sha256"), h.get("model_hash"), cache_data
 
-def calculate_sha256(filename: str, chunk_size: int = 4 * 1024 * 1024, max_workers: int = os.cpu_count() or 4) -> str:
-    size = os.path.getsize(filename)
-    n_chunks = (size + chunk_size - 1) // chunk_size
+def calculate_sha256(filename: str, chunk_size: int = 8 * 1024 * 1024) -> str:
     hasher = hashlib.sha256()
-
-    def _read(i):
-        off = i * chunk_size
-        with open(filename, "rb") as f:
-            f.seek(off)
-            return f.read(min(chunk_size, size - off))
-
-    with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_read, i) for i in range(n_chunks)]
-        for i in range(n_chunks):
-            hasher.update(futures[i].result())
+    with open(filename, "rb") as f:
+        for chunk in tqdm(iter(lambda: f.read(chunk_size), b""), desc="Hashing", unit="MB", unit_scale=chunk_size / (1024 * 1024)):
+            hasher.update(chunk)
     return hasher.hexdigest()
 
 def sha256(filename: str, title: str, cache_data=None) -> str:
@@ -555,55 +605,6 @@ def read_metadata_from_safetensors(filename):
             except: pass
         res[k] = v
     return res
-
-def prune_model(theta, name, args, isxl=False, isflux=False, iszi=False):
-    if not (isxl or isflux or iszi):
-        _, _, auto_iszi, theta = detect_arch(theta)
-        iszi = iszi or auto_iszi
-
-    if isflux:
-        cond_prefixes = ['clip.cond_stage_model.']
-    elif isxl:
-        cond_prefixes = ['conditioner.']
-    elif iszi:
-        cond_prefixes = ['text_encoders.qwen3_4b.']
-    else:
-        cond_prefixes = ['cond_stage_model.']
-
-    roots = [
-        'model.diffusion_model.',
-        'depth_model.',
-        'first_stage_model.',
-        'vae.',
-    ] + cond_prefixes
-    
-    theta_keys = list(theta.keys())
-
-    for key in tqdm(theta_keys, desc=f"Pruning {name}..."):
-        if not any(key.startswith(r) for r in roots):
-            del theta[key]
-            continue
-
-        k_in = key
-        if getattr(args, "keep_ema", False):
-            k_ema = 'model_ema.' + key[6:].replace('.', '')
-            if k_ema in theta:
-                k_in = k_ema
-
-        v = theta[k_in]
-        if isinstance(v, torch.Tensor) and not (key.startswith("first_stage_model") or key.startswith("vae")):
-            dt = v.dtype
-            if getattr(args, "save_quarter", False) and dt in FP_SET:
-                v = v.to(torch.float8_e4m3fn)
-            elif getattr(args, "save_half", False) and dt in {torch.float32, torch.float64, torch.bfloat16, torch.float8_e4m3fn}:
-                v = v.to(torch.float16)
-            elif getattr(args, "save_bhalf", False) and dt in {torch.float32, torch.float64, torch.float16, torch.float8_e4m3fn}:
-                v = v.to(torch.bfloat16)
-            elif not getattr(args, "save_half", False) and not getattr(args, "save_bhalf", False) and dt in {torch.float16, torch.float64, torch.bfloat16, torch.float8_e4m3fn}:
-                v = v.to(torch.float32)
-        theta[key] = v
-
-    return theta
 
 
 def transform_checkpoint_dict_key(k: str):
@@ -662,16 +663,24 @@ def maybe_to_qdtype(a, b, qa, qb, device, isflux):
 def detect_arch(theta):
     isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta
     isflux = any("double_block" in k for k in theta.keys())
+
     if "model.diffusion_model.cap_embedder.0.weight" in theta:
         iszi = True
-    elif "cap_embedder.0.weight" in theta:
-        new_key = {}
-        for k in tqdm(theta.keys(), desc="Renaming Z-IMAGE keys..."):
-            new_key["model.diffusion_model." + k.replace("model.diffusion_model.", "") if not (k.startswith("vae.") or k.startswith("text_encoders.")) else k] = theta[k]
+        return isxl, isflux, iszi, theta
+
+    if "cap_embedder.0.weight" in theta:
+        def _zi_key(k: str) -> str:
+            if k.startswith(("vae.", "text_encoders.")):
+                return k
+            if k.startswith("model.diffusion_model."):
+                return k
+            return "model.diffusion_model." + k
+
+        theta = {_zi_key(k): v for k, v in theta.items()}
         iszi = True
-        theta = new_key
-        del new_key
-    return isxl, isflux, iszi, theta
+        return isxl, isflux, iszi, theta
+
+    return isxl, isflux, False, theta
 
 
 def _common_dtype(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
@@ -703,75 +712,197 @@ def q_dequantize(sd, qtype, device, dtype, setbnb=True):
 def q_tensor_to_dict(t):
     return json.loads(bytes(t.tolist()).decode("utf-8"))
 
+_blocker_cache = {}
+
 def blocker(blocks: str, blockids: list[str]) -> str:
+    ck = (id(blockids), blocks)
+    hit = _blocker_cache.get(ck)
+    if hit is not None:
+        return hit
+
     out = []
+    idx = {b:i for i,b in enumerate(blockids)}
     for w in blocks.split():
         if "-" in w:
             a, b = (t.strip() for t in w.split("-", 1))
-            i, j = blockids.index(a), blockids.index(b)
+            i, j = idx[a], idx[b]
             lo, hi = (i, j) if i <= j else (j, i)
             out.extend(blockids[lo:hi + 1])
         else:
             out.append(w)
-    return " ".join(out)
 
-def blockfromkey(key: str, isxl: bool = False, isflux: bool = False, iszi: bool = False) -> Tuple[str, str]:
-    # SD1.5
+    res = " ".join(out)
+    _blocker_cache[ck] = res
+    return res
+
+def _parse_int_after(s: str, marker: str):
+    i = s.find(marker)
+    if i < 0:
+        return None
+    j = i + len(marker)
+    k = j
+    while k < len(s) and s[k].isdigit():
+        k += 1
+    if k == j:
+        return None
+    try:
+        return int(s[j:k])
+    except ValueError:
+        return None
+
+def _digits_concat(s: str) -> str:
+    return "".join(ch for ch in s if ch.isdigit())
+
+@lru_cache(maxsize=250_000)
+def _blockfromkey_cached(key: str, isxl: bool, isflux: bool, iszi: bool):
+    # -------------------------
+    # SD1.5 / SD2.x (non-XL/non-Flux/non-ZI)
+    # -------------------------
     if not isxl and not isflux and not iszi:
-        if "time_embed" in key: idx = -2
-        elif ".out." in key:   idx = NUM_TOTAL_BLOCKS - 1
-        elif (m := _re_inp.search(key)): idx = int(m.group(1))
-        elif _re_mid.search(key):        idx = NUM_INPUT_BLOCKS
-        elif (m := _re_out.search(key)): idx = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + int(m.group(1))
-        else:                            return "Not Merge", "Not Merge"
+        if "time_embed" in key:
+            idx = -2
+        elif ".out." in key:
+            idx = NUM_TOTAL_BLOCKS - 1
+        else:
+            m = _re_inp.search(key)
+            if m:
+                idx = int(m.group(1))
+            else:
+                if _re_mid.search(key):
+                    idx = NUM_INPUT_BLOCKS
+                else:
+                    m2 = _re_out.search(key)
+                    if m2:
+                        idx = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + int(m2.group(1))
+                    else:
+                        return "Not Merge", "Not Merge"
+
         b = BLOCKID[idx + 1]
         return b, b
 
+    # -------------------------
     # Flux
+    # -------------------------
     if isflux:
-        if "vae" in key:                 return "VAE",  "Not Merge"
-        if "t5xxl" in key:               return "T5",   "T5"
-        if "text_encoders.clip" in key:  return "CLIP", "CLIP"
-        m = re.search(r'\.(\d+)\.', key)
-        if "double_blocks" in key and m: return f"D{m.group(1).zfill(2)}", f"D{m.group(1).zfill(2)}"
-        if "single_blocks" in key and m: return f"S{m.group(1).zfill(2)}", f"S{m.group(1).zfill(2)}"
-        if "_in" in key:                 return "IN",   "IN"
-        if "final_layer" in key:         return "OUT",  "OUT"
+        if "vae" in key:
+            return "VAE", "Not Merge"
+        if "t5xxl" in key:
+            return "T5", "T5"
+        if "text_encoders.clip" in key:
+            return "CLIP", "CLIP"
+
+        di = _parse_int_after(key, "double_blocks.")
+        if di is None:
+            di = _parse_int_after(key, "double_block.")
+        if di is not None:
+            tag = f"D{di:02d}"
+            return tag, tag
+
+        si = _parse_int_after(key, "single_blocks.")
+        if si is None:
+            si = _parse_int_after(key, "single_block.")
+        if si is not None:
+            tag = f"S{si:02d}"
+            return tag, tag
+
+        if "_in" in key:
+            return "IN", "IN"
+        if "final_layer" in key:
+            return "OUT", "OUT"
+
+        m = _re_flux_any_num.search(key)
+        if m and "double_blocks" in key:
+            tag = f"D{int(m.group(1)):02d}"
+            return tag, tag
+        if m and "single_blocks" in key:
+            tag = f"S{int(m.group(1)):02d}"
+            return tag, tag
+
         return "Not Merge", "Not Merge"
 
+    # -------------------------
     # SDXL
+    # -------------------------
     if isxl:
-        if not ("weight" in key or "bias" in key):     return "Not Merge", "Not Merge"
-        if "label_emb" in key or "time_embed" in key:  return "Not Merge", "Not Merge"
-        if "conditioner.embedders" in key:             return "BASE", "BASE"
-        if "first_stage_model" in key:                 return "VAE",  "BASE"
+        if not ("weight" in key or "bias" in key):
+            return "Not Merge", "Not Merge"
+        if "label_emb" in key or "time_embed" in key:
+            return "Not Merge", "Not Merge"
+        if "conditioner.embedders" in key:
+            return "BASE", "BASE"
+
+        if "first_stage_model" in key:
+            return "VAE", "BASE"
+
+        if "model.diffusion_model.out." in key:
+            return "OUT8", "OUT08"
 
         if "model.diffusion_model" in key:
-            if "model.diffusion_model.out." in key:    return "OUT8", "OUT08"
-            blk = (re.findall(r'input|mid|output', key) or [""])[0].upper().replace("PUT", "")
-            nums = re.sub(r"\D", "", key)
-            tag  = (nums[:1] + "0") if "MID" in blk else nums[:2]
-            add  = (re.findall(r"transformer_blocks\.(\d+)\.", key) or [""])[0]
+            if ".input_blocks." in key:
+                blk = "IN"
+            elif ".middle_block." in key:
+                blk = "MID"
+            elif ".output_blocks." in key:
+                blk = "OUT"
+            else:
+                return "Not Merge", "Not Merge"
+
+            nums = _digits_concat(key)
+            if not nums:
+                return "Not Merge", "Not Merge"
+
+            tag = (nums[:1] + "0") if blk == "MID" else nums[:2]
+
+            add = ""
+            mi = _parse_int_after(key, "transformer_blocks.")
+            if mi is None:
+                m = _re_xl_tf.search(key)
+                if m:
+                    mi = int(m.group(1))
+            if mi is not None:
+                add = str(mi)
+
             left = blk + tag + add
-            right = ("M00" if "MID" in blk else f"{blk}0{tag[0]}")
+            right = ("M00" if blk == "MID" else f"{blk}0{tag[0]}")
             return left, right
-        
-    #Z-IMAGE
+
+        return "Not Merge", "Not Merge"
+
+    # -------------------------
+    # Z-Image
+    # -------------------------
     if iszi:
-        if "qwen3_4b" in key or "cap_embedder" in key:          return "BASE", "BASE"
-        if not ("weight" in key or "bias" in key):     return "Not Merge", "Not Merge"
-        if "t_embedder" in key or "x_embedder" in key:     return "Not Merge", "Not Merge"
-        if "vae" in key:                 return "VAE",  "VAE"
-        if "norm_final" in key:          return "L29", "L29"
-        
+        if ("qwen3_4b" in key) or ("cap_embedder" in key):
+            return "BASE", "BASE"
+        if not ("weight" in key or "bias" in key):
+            return "Not Merge", "Not Merge"
+        if "t_embedder" in key or "x_embedder" in key:
+            return "Not Merge", "Not Merge"
+        if "vae" in key:
+            return "VAE", "VAE"
+        if "norm_final" in key:
+            return "L29", "L29"
+
         if "model.diffusion_model" in key:
-            if "model.diffusion_model.final_layer" in key:    return "L29", "L29"
-            if "model.diffusion_model.context_refiner" in key:    return "CONT", "CONT"
-            if "model.diffusion_model.noise_refiner" in key:    return "NOISE", "NOISE"
-            m = (re.findall(r'layers\.(\d+)\.', key) or [""])[0]
-            return (f"L{int(m):02}", f"L{int(m):02}") if m else ("Not Merge", "Not Merge")
+            if "model.diffusion_model.final_layer" in key:
+                return "L29", "L29"
+            if "model.diffusion_model.context_refiner" in key:
+                return "CONT", "CONT"
+            if "model.diffusion_model.noise_refiner" in key:
+                return "NOISE", "NOISE"
+
+            li = _parse_int_after(key, "layers.")
+            if li is not None:
+                tag = f"L{li:02d}"
+                return tag, tag
+
+        return "Not Merge", "Not Merge"
 
     return "Not Merge", "Not Merge"
+
+
+def blockfromkey(key: str, isxl: bool = False, isflux: bool = False, iszi: bool = False) -> Tuple[str, str]:
+    return _blockfromkey_cached(key, isxl, isflux, iszi)
 
 def elementals(key: str, weight_index: int, deep: list[str], current_alpha: float, blockids=BLOCKID) -> float:
     skey = key + blockids[weight_index]
@@ -797,45 +928,17 @@ def elementals(key: str, weight_index: int, deep: list[str], current_alpha: floa
 
     return current_alpha
 
-def prepare_merge_cache(theta_keys, isxl, isflux, iszi, deep_a, deep_b, weights_a, weights_b, alpha, beta):
-    keymap = {}
-    for k in tqdm(theta_keys, desc="Building merge cache..."):
-        block, tag = blockfromkey(k, isxl, isflux, iszi)
-        if block == "Not Merge": 
-            continue
-        if isflux and tag in BLOCKIDFLUX:
-            wi = BLOCKIDFLUX.index(tag)
-        elif isxl and tag in BLOCKIDXLL:
-            wi = BLOCKIDXLL.index(tag)
-        elif iszi and tag in BLOCKIDZI:
-            wi = BLOCKIDZI.index(tag)
-        elif tag in BLOCKID:
-            wi = BLOCKID.index(tag)
-        else:
-            wi = -1
-            
-        blockids = BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else (BLOCKIDZI if iszi else BLOCKID))
-
-        cur_a = weights_a[wi - 1] if (weights_a is not None and wi > 0) else alpha
-        cur_b = weights_b[wi - 1] if (weights_b is not None and wi > 0) else beta
-
-        if deep_a:
-            cur_a = elementals(k, wi, deep_a, cur_a, blockids)
-        if deep_b:
-            cur_b = elementals(k, wi, deep_b, cur_b, blockids)
-
-        keymap[k] = (wi, cur_a, cur_b)
-    return keymap
 
 def diff_inplace(dst, src, func, desc):
-    for k in tqdm(dst.keys(), desc=desc):
-        if ("model" not in k) and ("text_encoders" not in k): 
+    for k in tqdm(dst.keys(), desc=desc, total=len(dst)):
+        if ("model" not in k) and ("text_encoders" not in k):
             continue
-        t2 = src.get(k, torch.zeros_like(dst[k])) if k in src else None
-        dst[k] = func(dst[k], t2) if t2 is not None else torch.zeros_like(dst[k])
+        v2 = src.get(k)
+        if v2 is None:
+            dst[k] = torch.zeros_like(dst[k])
+        else:
+            dst[k] = func(dst[k], v2)
 
-def clone_dict_tensors(d):
-    return {k[0]: k[1].clone() for k in tqdm(list(d.items()), "Cloning dict...")}
 
 def np_trim_percentiles(arr, lo=1, hi=99):
     arr = arr[~np.isnan(arr)]
@@ -987,33 +1090,6 @@ def _is_clip_key(key: str, isxl: bool, isflux: bool, iszi: bool = False) -> bool
     return any(key.startswith(p) for p in prefixes)
 
 
-def _elemwise_union_minus_intersection(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    same_sign = torch.sign(a) == torch.sign(b)
-    overlap = torch.where(
-        same_sign,
-        torch.sign(a) * torch.minimum(a.abs(), b.abs()),
-        torch.zeros_like(a)
-    )
-    return a + b - overlap
-
-def _elemwise_union_minus_intersection_with_base(base, A, B):
-    dA, dB = A - base, B - base
-    same_sign = torch.sign(dA) == torch.sign(dB)
-    overlap = torch.where(
-        same_sign,
-        torch.sign(dA) * torch.minimum(dA.abs(), dB.abs()),
-        torch.zeros_like(dA)
-    )
-    return base + (dA + dB - overlap)
-
-def _projective_intersection_union(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    a32 = a.detach().float().view(-1); b32 = b.detach().float().view(-1)
-    if a32.numel() == 0:
-        return a
-    proj_b_on_a = (torch.dot(b32, a32) / (a32.norm()**2 + 1e-12)) * a32
-    u = (a32 + b32 - proj_b_on_a).view_as(a)
-    return u.to(a.dtype)
-
 def _tensor_cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     a32 = a.detach().float().view(-1); b32 = b.detach().float().view(-1)
     if a32.numel() == 0:
@@ -1022,10 +1098,6 @@ def _tensor_cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     den = (a32.norm() * b32.norm()).clamp_min(1e-12)
     return (num / den).clamp(-1.0, 1.0)
 
-def _cosine_gate(a: torch.Tensor, b: torch.Tensor, tau: float = 0.30, sharp: float = 0.10) -> torch.Tensor:
-    cos = _tensor_cosine(a, b)
-    g = torch.sigmoid((cos - float(tau)) / max(float(sharp), 1e-3))
-    return g.to(a.dtype)
 
 def _maybe_skip_small_norm_bias_for_clipxor(key: str, tens: torch.Tensor) -> bool:
     if tens.numel() < 128:
@@ -1094,10 +1166,10 @@ def _collect_clip_pairs_by_suffix(sd_a: dict, sd_b: dict,
                                   iszi_a: bool = False, iszi_b: bool = False):
     # map suffix -> (orig_key, tensor) for A and B separately
     map_a = {}
-    for k, root, suf, v in _iter_clip_items(sd_a, isxl_a, isflux_a, iszi_a):
+    for k, _, suf, v in _iter_clip_items(sd_a, isxl_a, isflux_a, iszi_a):
         map_a[suf] = (k, v)
     map_b = {}
-    for k, root, suf, v in _iter_clip_items(sd_b, isxl_b, isflux_b, iszi_b):
+    for k, _, suf, v in _iter_clip_items(sd_b, isxl_b, isflux_b, iszi_b):
         map_b[suf] = (k, v)
 
     # intersect by suffix and by matching shape
@@ -1559,3 +1631,43 @@ def _filter_state_dict_by_components(theta: dict, components: set[str], isxl: bo
         if _key_belongs_to_component(k, prefixes):
             kept[k] = v
     return kept, len(kept), len(theta)
+
+def finalize_and_pack_for_save(theta, *, save_half, save_bhalf, save_quarter, vae_key, make_cpu=True, prefer_fp8="e4m3"):
+    want_fp8 = bool(save_quarter)
+    want_fp16 = bool(save_half) and not want_fp8
+    want_bf16 = bool(save_bhalf) and not want_fp8
+
+    if want_fp8:
+        if prefer_fp8 == "e5m2" and FP8_E5M2 is not None:
+            fp8 = FP8_E5M2
+        else:
+            fp8 = FP8_E4M3 or FP8_E5M2
+        if fp8 is None:
+            want_fp8 = False
+            want_fp16 = want_fp16 or save_half
+
+    out = {}
+    for k, v in theta.items():
+        if not isinstance(v, torch.Tensor):
+            continue
+        if k.startswith(vae_key):
+            out[k] = v
+            continue
+        t = v.detach()
+
+        if want_fp8 and ("model" in k or "text_encoders" in k) and t.is_floating_point():
+            if not (vae_key and k.startswith(vae_key)):
+                if t.dtype != fp8:
+                    t = t.to(fp8)
+        elif want_fp16 and t.dtype in DTYPES and t.dtype != torch.float16:
+            t = t.to(torch.float16)
+        elif want_bf16 and t.dtype in DTYPES and t.dtype != torch.bfloat16:
+            t = t.to(torch.bfloat16)
+
+        if make_cpu and t.device.type != "cpu":
+            t = t.to("cpu")
+        if not t.is_contiguous():
+            t = t.contiguous()
+
+        out[k] = t
+    return out

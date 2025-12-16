@@ -1,0 +1,1460 @@
+{
+    "betas": "skip",
+    "alphas_cumprod": "skip",
+    "alphas_cumprod_prev": "skip",
+    "sqrt_alphas_cumprod": "skip",
+    "sqrt_one_minus_alphas_cumprod": "skip",
+    "log_one_minus_alphas_cumprods": "skip",
+    "sqrt_recip_alphas_cumprod": "skip",
+    "sqrt_recipm1_alphas_cumprod": "skip",
+    "posterior_variance": "skip",
+    "posterior_log_variance_clipped": "skip",
+    "posterior_mean_coef1": "skip",
+    "posterior_mean_coef2": "skip",
+    "log_one_minus_alphas_cumprod": "skip",
+    "model_ema.decay": "skip",
+    "model_ema.num_updates": "skip",
+    "model.diffusion_model.time_embed.0": {
+        "dense": "-1",
+        "bias": true
+    },
+    "model.diffusion_model.time_embed.2": {
+        "dense": "0",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.0.0": {
+        "conv": "2"
+    },
+    "model.diffusion_model.input_blocks.1.0": {
+        "eb": "4"
+    },
+    "model.diffusion_model.input_blocks.1.1.norm": {
+        "norm": "6"
+    },
+    "model.diffusion_model.input_blocks.1.1.proj_in": {
+        "conv": "6"
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "8",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "8",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "8",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "8",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "10",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.ff.net.2": {
+        "dense": "12",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "14",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "16",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "16",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "18",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.norm1": {
+        "norm": "19"
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.norm2": {
+        "norm": "19"
+    },
+    "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.norm3": {
+        "norm": "19"
+    },
+    "model.diffusion_model.input_blocks.1.1.proj_out": {
+        "conv": "19"
+    },
+    "model.diffusion_model.input_blocks.2.0": {
+        "eb": "21"
+    },
+    "model.diffusion_model.input_blocks.2.1.norm": {
+        "norm": "23"
+    },
+    "model.diffusion_model.input_blocks.2.1.proj_in": {
+        "conv": "23"
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "25",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "25",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "25",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "25",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "27",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.ff.net.2": {
+        "dense": "29",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "31",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "33",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "33",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "35",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.norm1": {
+        "norm": "36"
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.norm2": {
+        "norm": "36"
+    },
+    "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.norm3": {
+        "norm": "36"
+    },
+    "model.diffusion_model.input_blocks.2.1.proj_out": {
+        "conv": "36"
+    },
+    "model.diffusion_model.input_blocks.3.0.op": {
+        "conv": "38"
+    },
+    "model.diffusion_model.input_blocks.4.0": {
+        "eb": "40"
+    },
+    "model.diffusion_model.input_blocks.4.0.skip_connection": {
+        "conv": "42"
+    },
+    "model.diffusion_model.input_blocks.4.1.norm": {
+        "norm": "44"
+    },
+    "model.diffusion_model.input_blocks.4.1.proj_in": {
+        "conv": "44"
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "46",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "46",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "46",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "46",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "48",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.ff.net.2": {
+        "dense": "50",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "52",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "54",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "54",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "56",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.norm1": {
+        "norm": "57"
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.norm2": {
+        "norm": "57"
+    },
+    "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.norm3": {
+        "norm": "57"
+    },
+    "model.diffusion_model.input_blocks.4.1.proj_out": {
+        "conv": "57"
+    },
+    "model.diffusion_model.input_blocks.5.0": {
+        "eb": "59"
+    },
+    "model.diffusion_model.input_blocks.5.1.norm": {
+        "norm": "61"
+    },
+    "model.diffusion_model.input_blocks.5.1.proj_in": {
+        "conv": "61"
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "63",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "63",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "63",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "63",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "65",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.ff.net.2": {
+        "dense": "67",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "69",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "71",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "71",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "73",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.norm1": {
+        "norm": "74"
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.norm2": {
+        "norm": "74"
+    },
+    "model.diffusion_model.input_blocks.5.1.transformer_blocks.0.norm3": {
+        "norm": "74"
+    },
+    "model.diffusion_model.input_blocks.5.1.proj_out": {
+        "conv": "74"
+    },
+    "model.diffusion_model.input_blocks.6.0.op": {
+        "conv": "76"
+    },
+    "model.diffusion_model.input_blocks.7.0": {
+        "eb": "78"
+    },
+    "model.diffusion_model.input_blocks.7.0.skip_connection": {
+        "conv": "80"
+    },
+    "model.diffusion_model.input_blocks.7.1.norm": {
+        "norm": "82"
+    },
+    "model.diffusion_model.input_blocks.7.1.proj_in": {
+        "conv": "82"
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "84",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "84",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "84",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "84",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "86",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.ff.net.2": {
+        "dense": "88",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "90",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "92",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "92",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "94",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.norm1": {
+        "norm": "95"
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.norm2": {
+        "norm": "95"
+    },
+    "model.diffusion_model.input_blocks.7.1.transformer_blocks.0.norm3": {
+        "norm": "95"
+    },
+    "model.diffusion_model.input_blocks.7.1.proj_out": {
+        "conv": "95"
+    },
+    "model.diffusion_model.input_blocks.8.0": {
+        "eb": "97"
+    },
+    "model.diffusion_model.input_blocks.8.1.norm": {
+        "norm": "99"
+    },
+    "model.diffusion_model.input_blocks.8.1.proj_in": {
+        "conv": "99"
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "101",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "101",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "101",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "101",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "103",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.ff.net.2": {
+        "dense": "105",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "107",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "109",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "109",
+        "bias": false
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "111",
+        "bias": true
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.norm1": {
+        "norm": "112"
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.norm2": {
+        "norm": "112"
+    },
+    "model.diffusion_model.input_blocks.8.1.transformer_blocks.0.norm3": {
+        "norm": "112"
+    },
+    "model.diffusion_model.input_blocks.8.1.proj_out": {
+        "conv": "112"
+    },
+    "model.diffusion_model.input_blocks.9.0.op": {
+        "conv": "114"
+    },
+    "model.diffusion_model.input_blocks.10.0": {
+        "eb": "115"
+    },
+    "model.diffusion_model.input_blocks.11.0": {
+        "eb": "116"
+    },
+    "model.diffusion_model.middle_block.0": {
+        "eb": "117"
+    },
+    "model.diffusion_model.middle_block.1.norm": {
+        "norm": "119"
+    },
+    "model.diffusion_model.middle_block.1.proj_in": {
+        "conv": "119"
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "121",
+        "bias": false
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "121",
+        "bias": false
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "121",
+        "bias": false
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "121",
+        "bias": true
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "123",
+        "bias": true
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.ff.net.2": {
+        "dense": "125",
+        "bias": true
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "127",
+        "bias": false
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "129",
+        "bias": false
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "129",
+        "bias": false
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "131",
+        "bias": true
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.norm1": {
+        "norm": "132"
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.norm2": {
+        "norm": "132"
+    },
+    "model.diffusion_model.middle_block.1.transformer_blocks.0.norm3": {
+        "norm": "132"
+    },
+    "model.diffusion_model.middle_block.1.proj_out": {
+        "conv": "132"
+    },
+    "model.diffusion_model.middle_block.2": {
+        "eb": "134"
+    },
+    "model.diffusion_model.output_blocks.0.0": {
+        "eb": "136"
+    },
+    "model.diffusion_model.output_blocks.0.0.skip_connection": {
+        "conv": "138"
+    },
+    "model.diffusion_model.output_blocks.1.0": {
+        "eb": "140"
+    },
+    "model.diffusion_model.output_blocks.1.0.skip_connection": {
+        "conv": "142"
+    },
+    "model.diffusion_model.output_blocks.2.0": {
+        "eb": "144"
+    },
+    "model.diffusion_model.output_blocks.2.0.skip_connection": {
+        "conv": "146"
+    },
+    "model.diffusion_model.output_blocks.2.1.conv": {
+        "conv": "148"
+    },
+    "model.diffusion_model.output_blocks.3.0": {
+        "eb": "150"
+    },
+    "model.diffusion_model.output_blocks.3.0.skip_connection": {
+        "conv": "152"
+    },
+    "model.diffusion_model.output_blocks.3.1.norm": {
+        "norm": "154"
+    },
+    "model.diffusion_model.output_blocks.3.1.proj_in": {
+        "conv": "154"
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "156",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "156",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "156",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "156",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "158",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.ff.net.2": {
+        "dense": "160",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "162",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "164",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "164",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "166",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.norm1": {
+        "norm": "167"
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.norm2": {
+        "norm": "167"
+    },
+    "model.diffusion_model.output_blocks.3.1.transformer_blocks.0.norm3": {
+        "norm": "167"
+    },
+    "model.diffusion_model.output_blocks.3.1.proj_out": {
+        "conv": "167"
+    },
+    "model.diffusion_model.output_blocks.4.0": {
+        "eb": "169"
+    },
+    "model.diffusion_model.output_blocks.4.0.skip_connection": {
+        "conv": "171"
+    },
+    "model.diffusion_model.output_blocks.4.1.norm": {
+        "norm": "173"
+    },
+    "model.diffusion_model.output_blocks.4.1.proj_in": {
+        "conv": "173"
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "175",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "175",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "175",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "175",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "177",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.ff.net.2": {
+        "dense": "179",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "181",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "183",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "183",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "185",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.norm1": {
+        "norm": "186"
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.norm2": {
+        "norm": "186"
+    },
+    "model.diffusion_model.output_blocks.4.1.transformer_blocks.0.norm3": {
+        "norm": "186"
+    },
+    "model.diffusion_model.output_blocks.4.1.proj_out": {
+        "conv": "186"
+    },
+    "model.diffusion_model.output_blocks.5.0": {
+        "eb": "188"
+    },
+    "model.diffusion_model.output_blocks.5.0.skip_connection": {
+        "conv": "190"
+    },
+    "model.diffusion_model.output_blocks.5.1.norm": {
+        "norm": "192"
+    },
+    "model.diffusion_model.output_blocks.5.1.proj_in": {
+        "conv": "192"
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "194",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "194",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "194",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "194",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "196",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.ff.net.2": {
+        "dense": "198",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "200",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "202",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "202",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "204",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.norm1": {
+        "norm": "205"
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.norm2": {
+        "norm": "205"
+    },
+    "model.diffusion_model.output_blocks.5.1.transformer_blocks.0.norm3": {
+        "norm": "205"
+    },
+    "model.diffusion_model.output_blocks.5.1.proj_out": {
+        "conv": "205"
+    },
+    "model.diffusion_model.output_blocks.5.2.conv": {
+        "conv": "206"
+    },
+    "model.diffusion_model.output_blocks.6.0": {
+        "eb": "208"
+    },
+    "model.diffusion_model.output_blocks.6.0.skip_connection": {
+        "conv": "210"
+    },
+    "model.diffusion_model.output_blocks.6.1.norm": {
+        "norm": "212"
+    },
+    "model.diffusion_model.output_blocks.6.1.proj_in": {
+        "conv": "212"
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "214",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "214",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "214",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "214",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "216",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.ff.net.2": {
+        "dense": "218",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "220",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "222",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "222",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "224",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.norm1": {
+        "norm": "225"
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.norm2": {
+        "norm": "225"
+    },
+    "model.diffusion_model.output_blocks.6.1.transformer_blocks.0.norm3": {
+        "norm": "225"
+    },
+    "model.diffusion_model.output_blocks.6.1.proj_out": {
+        "conv": "225"
+    },
+    "model.diffusion_model.output_blocks.7.0": {
+        "eb": "227"
+    },
+    "model.diffusion_model.output_blocks.7.0.skip_connection": {
+        "conv": "229"
+    },
+    "model.diffusion_model.output_blocks.7.1.norm": {
+        "norm": "231"
+    },
+    "model.diffusion_model.output_blocks.7.1.proj_in": {
+        "conv": "231"
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "233",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "233",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "233",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "233",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "235",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.ff.net.2": {
+        "dense": "237",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "239",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "241",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "241",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "243",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.norm1": {
+        "norm": "244"
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.norm2": {
+        "norm": "244"
+    },
+    "model.diffusion_model.output_blocks.7.1.transformer_blocks.0.norm3": {
+        "norm": "244"
+    },
+    "model.diffusion_model.output_blocks.7.1.proj_out": {
+        "conv": "244"
+    },
+    "model.diffusion_model.output_blocks.8.0": {
+        "eb": "246"
+    },
+    "model.diffusion_model.output_blocks.8.0.skip_connection": {
+        "conv": "248"
+    },
+    "model.diffusion_model.output_blocks.8.1.norm": {
+        "norm": "250"
+    },
+    "model.diffusion_model.output_blocks.8.1.proj_in": {
+        "conv": "250"
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "252",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "252",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "252",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "252",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "254",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.ff.net.2": {
+        "dense": "256",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "258",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "260",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "260",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "262",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.norm1": {
+        "norm": "263"
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.norm2": {
+        "norm": "263"
+    },
+    "model.diffusion_model.output_blocks.8.1.transformer_blocks.0.norm3": {
+        "norm": "263"
+    },
+    "model.diffusion_model.output_blocks.8.1.proj_out": {
+        "conv": "263"
+    },
+    "model.diffusion_model.output_blocks.8.2.conv": {
+        "conv": "265"
+    },
+    "model.diffusion_model.output_blocks.9.0": {
+        "eb": "267"
+    },
+    "model.diffusion_model.output_blocks.9.0.skip_connection": {
+        "conv": "269"
+    },
+    "model.diffusion_model.output_blocks.9.1.norm": {
+        "norm": "271"
+    },
+    "model.diffusion_model.output_blocks.9.1.proj_in": {
+        "conv": "271"
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "273",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "273",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "273",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "273",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "275",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.ff.net.2": {
+        "dense": "277",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "279",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "281",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "281",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "283",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.norm1": {
+        "norm": "284"
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.norm2": {
+        "norm": "284"
+    },
+    "model.diffusion_model.output_blocks.9.1.transformer_blocks.0.norm3": {
+        "norm": "284"
+    },
+    "model.diffusion_model.output_blocks.9.1.proj_out": {
+        "conv": "284"
+    },
+    "model.diffusion_model.output_blocks.10.0": {
+        "eb": "286"
+    },
+    "model.diffusion_model.output_blocks.10.0.skip_connection": {
+        "conv": "288"
+    },
+    "model.diffusion_model.output_blocks.10.1.norm": {
+        "norm": "290"
+    },
+    "model.diffusion_model.output_blocks.10.1.proj_in": {
+        "conv": "290"
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "292",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "292",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "292",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "292",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "294",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.ff.net.2": {
+        "dense": "296",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "298",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "300",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "300",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "302",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.norm1": {
+        "norm": "303"
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.norm2": {
+        "norm": "303"
+    },
+    "model.diffusion_model.output_blocks.10.1.transformer_blocks.0.norm3": {
+        "norm": "303"
+    },
+    "model.diffusion_model.output_blocks.10.1.proj_out": {
+        "conv": "303"
+    },
+    "model.diffusion_model.output_blocks.11.0": {
+        "eb": "305"
+    },
+    "model.diffusion_model.output_blocks.11.0.skip_connection": {
+        "conv": "307"
+    },
+    "model.diffusion_model.output_blocks.11.1.norm": {
+        "norm": "309"
+    },
+    "model.diffusion_model.output_blocks.11.1.proj_in": {
+        "conv": "309"
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.attn1.to_q": {
+        "dense": "311",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.attn1.to_k": {
+        "dense": "311",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.attn1.to_v": {
+        "dense": "311",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.attn1.to_out.0": {
+        "dense": "311",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.ff.net.0.proj": {
+        "dense": "313",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.ff.net.2": {
+        "dense": "315",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.attn2.to_q": {
+        "dense": "317",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.attn2.to_k": {
+        "dense": "319",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.attn2.to_v": {
+        "dense": "319",
+        "bias": false
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.attn2.to_out.0": {
+        "dense": "321",
+        "bias": true
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.norm1": {
+        "norm": "322"
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.norm2": {
+        "norm": "322"
+    },
+    "model.diffusion_model.output_blocks.11.1.transformer_blocks.0.norm3": {
+        "norm": "322"
+    },
+    "model.diffusion_model.output_blocks.11.1.proj_out": {
+        "conv": "322"
+    },
+    "model.diffusion_model.out.0": {
+        "norm": "324"
+    },
+    "model.diffusion_model.out.2": {
+        "conv": "325"
+    },
+    "cond_stage_model.transformer.text_model.embeddings.position_ids": "skip",
+    "cond_stage_model.transformer.text_model.embeddings.token_embedding": {
+        "dense": "365",
+        "bias": false
+    },
+    "cond_stage_model.transformer.text_model.embeddings.position_embedding": {
+        "dense": "367",
+        "bias": false
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.0.self_attn.k_proj": {
+        "dense": "369",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.0.self_attn.v_proj": {
+        "dense": "369",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.0.self_attn.q_proj": {
+        "dense": "369",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.0.self_attn.out_proj": {
+        "dense": "369",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.0.layer_norm1": {
+        "norm": "370"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.0.mlp.fc1": {
+        "dense": "370",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.0.mlp.fc2": {
+        "dense": "371",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.0.layer_norm2": {
+        "norm": "372"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.1.self_attn.k_proj": {
+        "dense": "372",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.1.self_attn.v_proj": {
+        "dense": "372",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.1.self_attn.q_proj": {
+        "dense": "372",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.1.self_attn.out_proj": {
+        "dense": "372",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.1.layer_norm1": {
+        "norm": "373"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.1.mlp.fc1": {
+        "dense": "373",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.1.mlp.fc2": {
+        "dense": "374",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.1.layer_norm2": {
+        "norm": "375"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.2.self_attn.k_proj": {
+        "dense": "375",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.2.self_attn.v_proj": {
+        "dense": "375",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.2.self_attn.q_proj": {
+        "dense": "375",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.2.self_attn.out_proj": {
+        "dense": "375",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.2.layer_norm1": {
+        "norm": "376"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.2.mlp.fc1": {
+        "dense": "376",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.2.mlp.fc2": {
+        "dense": "377",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.2.layer_norm2": {
+        "norm": "378"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.3.self_attn.k_proj": {
+        "dense": "378",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.3.self_attn.v_proj": {
+        "dense": "378",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.3.self_attn.q_proj": {
+        "dense": "378",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.3.self_attn.out_proj": {
+        "dense": "378",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.3.layer_norm1": {
+        "norm": "379"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.3.mlp.fc1": {
+        "dense": "379",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.3.mlp.fc2": {
+        "dense": "380",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.3.layer_norm2": {
+        "norm": "381"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.4.self_attn.k_proj": {
+        "dense": "381",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.4.self_attn.v_proj": {
+        "dense": "381",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.4.self_attn.q_proj": {
+        "dense": "381",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.4.self_attn.out_proj": {
+        "dense": "381",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.4.layer_norm1": {
+        "norm": "382"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.4.mlp.fc1": {
+        "dense": "382",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.4.mlp.fc2": {
+        "dense": "383",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.4.layer_norm2": {
+        "norm": "384"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.5.self_attn.k_proj": {
+        "dense": "384",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.5.self_attn.v_proj": {
+        "dense": "384",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.5.self_attn.q_proj": {
+        "dense": "384",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.5.self_attn.out_proj": {
+        "dense": "384",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.5.layer_norm1": {
+        "norm": "385"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.5.mlp.fc1": {
+        "dense": "385",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.5.mlp.fc2": {
+        "dense": "386",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.5.layer_norm2": {
+        "norm": "387"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.6.self_attn.k_proj": {
+        "dense": "387",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.6.self_attn.v_proj": {
+        "dense": "387",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.6.self_attn.q_proj": {
+        "dense": "387",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.6.self_attn.out_proj": {
+        "dense": "387",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.6.layer_norm1": {
+        "norm": "389"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.6.mlp.fc1": {
+        "dense": "389",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.6.mlp.fc2": {
+        "dense": "390",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.6.layer_norm2": {
+        "norm": "391"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.7.self_attn.k_proj": {
+        "dense": "391",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.7.self_attn.v_proj": {
+        "dense": "391",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.7.self_attn.q_proj": {
+        "dense": "391",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.7.self_attn.out_proj": {
+        "dense": "391",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.7.layer_norm1": {
+        "norm": "392"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.7.mlp.fc1": {
+        "dense": "392",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.7.mlp.fc2": {
+        "dense": "393",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.7.layer_norm2": {
+        "norm": "394"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.8.self_attn.k_proj": {
+        "dense": "394",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.8.self_attn.v_proj": {
+        "dense": "394",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.8.self_attn.q_proj": {
+        "dense": "394",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.8.self_attn.out_proj": {
+        "dense": "394",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.8.layer_norm1": {
+        "norm": "395"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.8.mlp.fc1": {
+        "dense": "395",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.8.mlp.fc2": {
+        "dense": "396",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.8.layer_norm2": {
+        "norm": "397"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.9.self_attn.k_proj": {
+        "dense": "397",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.9.self_attn.v_proj": {
+        "dense": "397",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.9.self_attn.q_proj": {
+        "dense": "397",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.9.self_attn.out_proj": {
+        "dense": "397",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.9.layer_norm1": {
+        "norm": "398"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.9.mlp.fc1": {
+        "dense": "398",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.9.mlp.fc2": {
+        "dense": "400",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.9.layer_norm2": {
+        "norm": "401"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.10.self_attn.k_proj": {
+        "dense": "401",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.10.self_attn.v_proj": {
+        "dense": "401",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.10.self_attn.q_proj": {
+        "dense": "401",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.10.self_attn.out_proj": {
+        "dense": "401",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.10.layer_norm1": {
+        "norm": "402"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.10.mlp.fc1": {
+        "dense": "402",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.10.mlp.fc2": {
+        "dense": "403",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.10.layer_norm2": {
+        "norm": "404"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.11.self_attn.k_proj": {
+        "dense": "404",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.11.self_attn.v_proj": {
+        "dense": "404",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.11.self_attn.q_proj": {
+        "dense": "404",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.11.self_attn.out_proj": {
+        "dense": "404",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.11.layer_norm1": {
+        "norm": "405"
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.11.mlp.fc1": {
+        "dense": "405",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.11.mlp.fc2": {
+        "dense": "406",
+        "bias": true
+    },
+    "cond_stage_model.transformer.text_model.encoder.layers.11.layer_norm2": {
+        "norm": "407"
+    },
+    "cond_stage_model.transformer.text_model.final_layer_norm": {
+        "norm": "407"
+    }
+}

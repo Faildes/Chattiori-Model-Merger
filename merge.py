@@ -9,38 +9,64 @@ import scipy.ndimage
 import safetensors.torch
 import safetensors
 from tqdm.auto import tqdm
+from collections import OrderedDict
 
 from Utils import wgt, rand_ratio, sha256, read_metadata_from_safetensors \
     , load_model, parse_ratio, qdtyper, maybe_to_qdtype, diff_inplace \
-    , clone_dict_tensors, fineman, weighttoxl, BLOCKID, BLOCKIDFLUX \
-    , BLOCKIDXLL, BLOCKIDZI, blockfromkey, checkpoint_dict_skip_on_merge, elementals \
-    , to_half, to_half_k, prune_model, cache, merge_cache_json, detect_arch \
+    , fineman, weighttoxl, BLOCKID, BLOCKIDFLUX, BLOCKIDXLL, BLOCKIDZI \
+    , blockfromkey, checkpoint_dict_skip_on_merge, elementals \
+    , to_half, cache, set_cache_filename, base_path, merge_cache_json, detect_arch \
     , _swap_components_inplace, _normalize_components_list, _finetune_inplace \
     , _clip_tier_for_xl, _clip_tier_for_flux, _clip_tier_for_zi, _clipxor_semi_hard_blend \
-    , _collect_clipxor_targets, _collect_clip_pairs_by_suffix, prepare_merge_cache\
+    , _collect_clipxor_targets, _collect_clip_pairs_by_suffix \
     , trim_delta, normalize_path, prune_extras_vs_model1, unet_permutation_spec \
-    , weight_matching, apply_permutation, upcast_fp8_state_dict, to_quarter_k \
-    , _common_dtype, _component_prefix_map, _key_belongs_to_component, _filter_state_dict_by_components
+    , weight_matching, apply_permutation, upcast_fp8_state_dict \
+    , _common_dtype, _filter_state_dict_by_components, prepare_state_dict_for_save
 
 # Mode Functions
 
 def weight_max(theta0, theta1, *args):
-    return torch.max(theta0, theta1)
+    return torch.maximum(theta0, theta1)
 
 def geometric(theta0, theta1, alpha):
     return torch.pow(theta0, 1 - alpha) * torch.pow(theta1, alpha)
 
 def sigmoid(theta0, theta1, alpha):
-    return (1 / (1 + torch.exp(-4 * alpha))) * (theta0 + theta1) - (1 / (1 + torch.exp(-alpha))) * theta0
+    a = float(alpha)
+    s1 = 1.0 / (1.0 + np.exp(-4.0 * a))
+    s0 = 1.0 / (1.0 + np.exp(-1.0 * a))
+    return (s1 * (theta0 + theta1) - s0 * theta0)
 
 def weighted_sum(theta0, theta1, alpha):
-    return (1 - alpha) * theta0 + alpha * theta1
+    return torch.lerp(theta0, theta1, float(alpha))
 
+@torch.inference_mode()
 def sum_twice(theta0, theta1, theta2, alpha, beta):
-    return (1 - beta) * ((1 - alpha) * theta0 + alpha * theta1) + beta * theta2
+    dt = _common_dtype(theta0, theta1, theta2)
+    if theta0.dtype != dt: theta0 = theta0.to(dt)
+    if theta1.dtype != dt: theta1 = theta1.to(dt)
+    if theta2.dtype != dt: theta2 = theta2.to(dt)
 
+    out = torch.empty_like(theta0)
+    torch.lerp(theta0, theta1, float(alpha), out=out)     # out = lerp(a,b,alpha)
+    torch.lerp(out,   theta2, float(beta),  out=out)      # out = lerp(out,c,beta)
+    return out
+
+@torch.inference_mode()
 def triple_sum(theta0, theta1, theta2, alpha, beta):
-    return (1 - alpha - beta) * theta0 + alpha * theta1 + beta * theta2
+    dt = _common_dtype(theta0, theta1, theta2)
+    if theta0.dtype != dt: theta0 = theta0.to(dt)
+    if theta1.dtype != dt: theta1 = theta1.to(dt)
+    if theta2.dtype != dt: theta2 = theta2.to(dt)
+
+    a = float(alpha); b = float(beta)
+    c0 = 1.0 - a - b
+
+    out = torch.empty_like(theta0)
+    torch.mul(theta0, c0, out=out)         # out = (1-a-b)*theta0
+    out.add_(theta1, alpha=a)              # out += a*theta1
+    out.add_(theta2, alpha=b)              # out += b*theta2
+    return out
 
 def get_difference(theta1, theta2):
     return theta1 - theta2
@@ -49,22 +75,57 @@ def add_difference(theta0, theta1_2_diff, alpha):
     return theta0 + (alpha * theta1_2_diff)
 
 def multiply_difference(theta0, theta1, theta2, alpha, beta):
-    theta0_float, theta1_float = theta0.float(), theta1.float()
-    diff = (theta0_float - theta2).abs().pow(1 - alpha) * (theta1_float - theta2).abs().pow(alpha)
-    sign = weighted_sum(theta0, theta1, beta) - theta2
-    return theta2 + torch.copysign(diff, sign).to(theta2.dtype)
+    a = theta0.float()
+    b = theta1.float()
+    c = theta2.float() if theta2.dtype != torch.float32 else theta2
+
+    # diff = |a-c|^(1-a) * |b-c|^a
+    da = (a - c).abs()
+    db = (b - c).abs()
+    diff = da.pow(1.0 - float(alpha)).mul_(db.pow(float(alpha)))
+
+    # sign = ((1-beta)*theta0 + beta*theta1) - theta2
+    sign = torch.lerp(theta0, theta1, float(beta)).float().sub_(c)
+
+    out = c + torch.where(sign >= 0, diff, -diff)
+    return out.to(theta2.dtype)
+
+
+_SIM_SCRATCH = OrderedDict()
+_SIM_MAX_SCRATCH = 64
+
+def _sim_buf(device, dtype, shape):
+    key = (str(device), dtype, tuple(shape))
+    buf = _SIM_SCRATCH.get(key)
+    if buf is not None:
+        _SIM_SCRATCH.move_to_end(key)
+        return buf
+    thr = torch.empty(shape, device=device, dtype=dtype)
+    sim = torch.empty(shape, device=device, dtype=dtype)
+    out = torch.empty(shape, device=device, dtype=dtype)
+    _SIM_SCRATCH[key] = (thr, sim, out)
+    if len(_SIM_SCRATCH) > _SIM_MAX_SCRATCH:
+        _SIM_SCRATCH.popitem(last=False)
+    return thr, sim, out
+
+def clear_sim_scratch():
+    _SIM_SCRATCH.clear()
+    
 
 def _match_mean_std_like_a(out, a, eps=1e-6):
-    a32 = a.detach().float()
-    o32 = out.detach().float()
-    stdA = a32.std()
-    stdO = o32.std()
+    a32 = a if a.dtype == torch.float32 else a.detach().float()
+    o32 = out if out.dtype == torch.float32 else out.detach().float()
+
+    varA, meanA = torch.var_mean(a32, unbiased=False)
+    varO, meanO = torch.var_mean(o32, unbiased=False)
+
+    stdA = varA.sqrt()
+    stdO = varO.sqrt()
     if stdO < eps:
         return out
-    meanA = a32.mean()
-    meanO = o32.mean()
+
     mean_mix = 0.5 * (meanO + meanA)
-    std_mix = 0.5 * (stdO + stdA)
+    std_mix  = 0.5 * (stdO + stdA)
     o32 = (o32 - meanO) / stdO * std_mix + mean_mix
     return o32.to(out.dtype)
 
@@ -79,44 +140,39 @@ def similarity_add_difference(a, b, c, alpha, beta):
     if a.dtype != dt: a = a.to(dt)
     if b.dtype != dt: b = b.to(dt)
     if c.dtype != dt: c = c.to(dt)
-    
-    a2 = alpha * 0.5
-    b2 = beta  * 0.5
 
-    # --- similarity = nan_to_num(((a*b)/(max(|a|,|b|)^2) + 1) * beta/2, nan=beta)
-    thr = torch.empty_like(a)
-    sim = torch.empty_like(a)
+    a2 = float(alpha) * 0.5
+    b2 = float(beta)  * 0.5
 
+    thr, sim, out = _sim_buf(a.device, a.dtype, a.shape)
+
+    # thr = max(|a|,|b|)^2
     torch.abs(a, out=thr)
     torch.abs(b, out=sim)
     torch.maximum(thr, sim, out=thr)
-    thr.mul_(thr)  # thr = threshold^2
+    thr.mul_(thr)
 
-    torch.mul(a, b, out=sim)   # sim = a*b
-    sim.div_(thr)              # sim = (a*b)/thr
-    sim.add_(1.0).mul_(b2)     # sim = ((a*b)/thr + 1) * beta/2
+    # sim = ((a*b)/thr + 1) * beta/2
+    torch.mul(a, b, out=sim)
+    sim.div_(thr)
+    sim.add_(1.0).mul_(b2)
+    torch.nan_to_num_(sim, nan=float(beta))
 
-    try:
-        torch.nan_to_num_(sim, nan=beta)
-    except AttributeError:
-        torch.nan_to_num(sim, nan=beta, out=sim)
-
-    # --- ab_diff = a + alpha * (b - c)
-    out = torch.empty_like(a)
+    # out = a + alpha*(b-c)
     torch.sub(b, c, out=out)
-    out.mul_(alpha).add_(a)
+    out.mul_(float(alpha)).add_(a)
 
-    # --- ab_sum = a*(1 - alpha/2) + b*(alpha/2)
+    # thr = a*(1-a/2) + b*(a/2)
     torch.mul(a, (1.0 - a2), out=thr)
     thr.add_(b, alpha=a2)
 
-    # --- out = lerp(ab_diff, ab_sum, similarity)
+    # out = lerp(out, thr, sim)
     torch.lerp(out, thr, sim, out=out)
 
     out = _match_mean_std_like_a(out, a)
     return out.to(dtype=a_orig_dtype)
 
-def dare_merge(theta0, theta1, alpha, beta):
+def dare_merge(theta0, theta1, alpha, beta, generator=None):
     if theta0.dim() in (1, 2):
         dw = theta1.shape[-1] - theta0.shape[-1]
         if dw > 0:
@@ -129,10 +185,10 @@ def dare_merge(theta0, theta1, alpha, beta):
         elif dh < 0:
             theta1 = F.pad(theta1, (0, 0, 0, -dh))
     delta = theta1 - theta0
-    m = torch.bernoulli(torch.full(delta.shape, float(beta), dtype=torch.float32, device=theta0.device))
+    m = (torch.rand_like(delta, dtype=torch.float32, generator=generator) < float(beta)).to(delta.dtype)
     denom = max(1.0 - float(beta), 1e-6)
     delta_hat = (m * delta) / denom
-    return theta0 + alpha * delta_hat.to(theta0.dtype)
+    return theta0 + float(alpha) * delta_hat.to(theta0.dtype)
 
 def feature_weighted_merge(a, b, alpha=0.3, eps=1e-6):
     if a.shape != b.shape or alpha == 0.0:
@@ -180,8 +236,9 @@ def sparse_topk(a, b, alpha, beta):
         return a
     k = max(int(d.numel() * float(beta)), 1)
     thresh = d.kthvalue(d.numel() - k).values
-    mask = ((b.detach().float() - a.detach().float()).abs() >= thresh).to(a.dtype)
-    return (a + alpha * (b - a) * mask).to(a.dtype)
+    diff = (b - a)
+    mask = diff.detach().float().abs().ge_(thresh)
+    return (a + float(alpha) * diff * mask.to(a.dtype)).to(a.dtype)
 
 def norm_dir_blend(a, b, alpha):
     a32 = a.detach().float().view(-1); b32 = b.detach().float().view(-1)
@@ -259,7 +316,7 @@ theta_funcs = {
     "COMP": (None,           None,                       "Save Components (model0 only)"),
     "CLIPXOR": (None,        None,                       "CLIP XOR (union-minus-intersection)"),
     "FWM":  (None,           feature_weighted_merge,     "Feature Weighted Merge"),
-    "TF":  (None,           None,               "Trim and Fill"),
+    "TF":  (None,            None,                       "Trim and Fill"),
 }
 modes_need_m2   = {"sAD", "AD", "TRS", "ST",  "TD", "SIM", "MD", "HUB"}
 modes_need_beta = {"TRS", "ST", "TS",  "SIM", "MD", "DARE", "CHAN", "FREQ", "SPRSE"}
@@ -319,6 +376,7 @@ mode = args.mode
 if mode in modes_need_m2 and (args.model_2 is None):
     raise SystemExit(f"mode '{mode}' needs 3rd model")
 theta_func1, theta_func2, merge_name = theta_funcs[mode]
+bake_vae_enabled = (args.vae is not None)
 
 if mode not in ["SWAP", "CLIPXOR", "COMP"]:
     args.alpha, deep_a, block_a = wgt(args.alpha, [])
@@ -342,6 +400,7 @@ else:
 output_name = args.output
 output_file = f"{output_name}.{'safetensors' if args.save_safetensors else 'ckpt'}"
 output_path = normalize_path(os.path.join(args.model_path, output_file))
+set_cache_filename(os.path.join(base_path(), "cache.json"))
 merge_cache_json(args.model_path)
 cache_data = cache("hashes", None)
 
@@ -423,69 +482,89 @@ if mode not in ["NoIn", "COMP"]:
         alpha = beta = None
         
     elif mode in ["CLIPXOR", "XDARE"]:
-        theta_res = clone_dict_tensors(theta_0)
-        
+        # --- in-place CLIPXOR / XDARE (no theta_res copy) ---
+
         base_hardness = 0.70
         hard_l = base_hardness
         hard_g = base_hardness
-
         hard_t5   = 0.60
         hard_clip = base_hardness
-        
-        isxl_a, isflux_a, iszi_a, theta_0 = detect_arch(theta_0)
-        isxl_b, isflux_b, iszi_b, theta_1 = detect_arch(theta_1)
+
+        # local arch flags for both models (avoid clobbering outer isxl/isflux/iszi)
+        isxl_a, isflux_a, iszi_a, _ = detect_arch(theta_0)
+        isxl_b, isflux_b, iszi_b, _ = detect_arch(theta_1)
 
         targets = _collect_clipxor_targets(theta_0, theta_1, isxl=isxl_a, isflux=isflux_a, iszi=iszi_a)
-        if not targets:
-            suffix_pairs = _collect_clip_pairs_by_suffix(theta_0, theta_1, isxl_a, isflux_a, iszi_a, isxl_b, isflux_b, iszi_b)
-            targets = [ka for (_, ka, _) in suffix_pairs]
-            
-        if not targets:
-            print("[CLIPXOR] No eligible CLIP keys to merge (even after suffix matching). \nArchitectures may be incompatible or shapes differ.")
-        else:
-            for key_a in tqdm(targets, desc="CLIPXOR: Collecting keys...", total=len(targets)):
-                A = theta_0[key_a]
-                if key_a in theta_1:
-                    key_b = key_a
-                else:
-                    if not suffix_pairs:
-                        continue
-                    pass
-        suffix_to_kb = {}
-        if suffix_pairs:
-            for suf, ka, kb in suffix_pairs:
-                suffix_to_kb[ka] = kb
-        
-        for key_a in tqdm(targets, desc="CLIPXOR merging...", total=len(targets)):
-            A = theta_0[key_a]
-            key_b = key_a if key_a in theta_1 else suffix_to_kb.get(key_a, None)
-            if key_b is None:
-                continue
-            B = theta_1[key_b]
 
-            if isxl_a or isxl_b:
-                tier = _clip_tier_for_xl(key_a)
-                hardness = hard_l if tier == "clip-l" else (hard_g if tier == "clip-g" else base_hardness)
-            elif isflux_a or isflux_b:
-                tier = _clip_tier_for_flux(key_a)
-                hardness = hard_t5 if tier == "t5" else (hard_clip if tier == "clip" else base_hardness)
-            elif iszi_a or iszi_b:
-                tier = _clip_tier_for_zi(key_a)
-                hardness = hard_t5 if tier == "qwen3_4b" else (hard_clip if tier == "cap_embedder" else base_hardness)
-            else:
-                hardness = base_hardness
-
-            M_semi = _clipxor_semi_hard_blend(
-                A, B,
-                hardness=float(hardness),
-                use_cosine_gate=True,
-                keep_stats=True
+        suffix_pairs = []
+        if not targets:
+            suffix_pairs = _collect_clip_pairs_by_suffix(
+                theta_0, theta_1,
+                isxl_a, isflux_a, iszi_a,
+                isxl_b, isflux_b, iszi_b
             )
-            if 'fine' in locals() and fine:
-                M_semi = _finetune_inplace(key_a, M_semi, fine)
-            theta_res[key_a] = M_semi
+            targets = [ka for (_, ka, _) in suffix_pairs]
 
-        theta_0 = theta_res
+        if not targets:
+            print("[CLIPXOR] No eligible CLIP keys to merge (even after suffix matching). "
+                "\nArchitectures may be incompatible or shapes differ.")
+        else:
+            suffix_to_kb = {ka: kb for (suf, ka, kb) in suffix_pairs} if suffix_pairs else {}
+
+            # cache tier resolver for speed
+            if isxl_a or isxl_b:
+                tier_fn = _clip_tier_for_xl
+            elif isflux_a or isflux_b:
+                tier_fn = _clip_tier_for_flux
+            elif iszi_a or iszi_b:
+                tier_fn = _clip_tier_for_zi
+            else:
+                tier_fn = None
+
+            do_fine = bool('fine' in locals() and fine)
+            semi_blend = _clipxor_semi_hard_blend
+
+            for key_a in tqdm(targets, desc="CLIPXOR merging...", total=len(targets)):
+                # resolve pair key in theta_1
+                key_b = key_a if key_a in theta_1 else suffix_to_kb.get(key_a, None)
+                if key_b is None:
+                    continue
+
+                A = theta_0.get(key_a, None)
+                B = theta_1.get(key_b, None)
+                if (A is None) or (B is None):
+                    continue
+
+                # hardness by tier
+                hardness = base_hardness
+                if tier_fn is not None:
+                    tier = tier_fn(key_a)
+                    if tier == "clip-l":
+                        hardness = hard_l
+                    elif tier == "clip-g":
+                        hardness = hard_g
+                    elif tier == "t5":
+                        hardness = hard_t5
+                    elif tier == "clip":
+                        hardness = hard_clip
+                    elif tier == "qwen3_4b":
+                        hardness = hard_t5
+                    elif tier == "cap_embedder":
+                        hardness = hard_clip
+
+                M_semi = semi_blend(
+                    A, B,
+                    hardness=float(hardness),
+                    use_cosine_gate=True,
+                    keep_stats=True
+                )
+                if do_fine:
+                    M_semi = _finetune_inplace(key_a, M_semi, fine)
+
+                # in-place writeback (no extra dict)
+                theta_0[key_a] = M_semi
+
+        # mode transition behavior
         if mode == "CLIPXOR":
             mode = "NoIn"
             theta_1 = None
@@ -496,7 +575,7 @@ if mode not in ["NoIn", "COMP"]:
             mode = "DARE"
             usebeta = True
             weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
-            weights_b, beta, beta_info = parse_ratio(args.beta, beta_info, deep_b)
+            weights_b, beta,  beta_info  = parse_ratio(args.beta,  beta_info,  deep_b)
     else:
         weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
         if mode in modes_need_m2:
@@ -573,7 +652,13 @@ if args.vae:
 
 if mode == "DARE":
     g = torch.Generator(device=device)
-    if args.seed is not None: g.manual_seed(args.seed)
+    if args.seed is not None:
+        g.manual_seed(args.seed)
+
+    def theta_func2_dare(a, b, cur_a, cur_b):
+        return dare_merge(a, b, cur_a, cur_b, generator=g)
+
+    theta_func2 = theta_func2_dare
 
 def _is_small_or_norm_or_bias(key, tens):
     n = tens.numel()
@@ -704,15 +789,34 @@ if mode not in ["NoIn", "TF"]:
         # print(f"alpha weights for ZI: {weights_a}")
         # print(f"beta weights for ZI: {weights_b}")
         
-def _resolve_weight_index(key):
+def _resolve_weight_index(key: str) -> int:
     block, tag = blockfromkey(key, isxl, isflux, iszi)
     if block == "Not Merge":
         return -1
-    if isflux and tag in BLOCKIDFLUX: return BLOCKIDFLUX.index(tag)
-    if isxl   and tag in BLOCKIDXLL:  return BLOCKIDXLL.index(tag)
-    if iszi   and tag in BLOCKIDZI:    return BLOCKIDZI.index(tag)
-    if tag in BLOCKID:                return BLOCKID.index(tag)
-    return -1
+    return _TAG2IDX.get(tag, -1)
+
+def make_param_resolver(alpha, beta, weights_a, weights_b, deep_a, deep_b, blockids, usebeta: bool):
+    def get(key: str):
+        wi = _resolve_weight_index(key)
+        if wi < 0:
+            return None
+
+        cur_a = alpha
+        if weights_a is not None and wi > 0:
+            cur_a = weights_a[wi - 1]
+        if deep_a:
+            cur_a = elementals(key, wi, deep_a, cur_a, blockids)
+
+        cur_b = None
+        if usebeta:
+            cur_b = beta
+            if weights_b is not None and wi > 0:
+                cur_b = weights_b[wi - 1]
+            if deep_b:
+                cur_b = elementals(key, wi, deep_b, cur_b, blockids)
+
+        return wi, cur_a, cur_b
+    return get
 
 def _apply_cosine_blend(a, b, kmin, kmax, cur_alpha, variant, tau=0.20, floor=0.05):
     a_f = a.detach().float().view(-1)
@@ -745,6 +849,7 @@ use_cos0 = bool(args.cosine0)
 use_cos1 = bool(args.cosine1)
 use_cos2 = bool(args.cosine2)
 blockids = BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else (BLOCKIDZI if iszi else BLOCKID))
+_TAG2IDX = {t: i for i, t in enumerate(blockids)}
 
 if use_cos0 or use_cos1 or use_cos2:
     base, dA, dB, varA, varB = resolve_cosine_triplet(theta_0, theta_1, theta_2, use_cos0, use_cos1, use_cos2)
@@ -799,124 +904,150 @@ if use_cos0 or use_cos1 or use_cos2:
     theta_0 = base
 
 
-def remerge_model(target_dict, source_dict, desc, mode, theta_2=None):
-    for key in tqdm(source_dict.keys(), desc=desc):
-        if isflux or key in checkpoint_dict_skip_on_merge or ("model" not in key and "text_encoders" not in key) or key in target_dict:
-            continue
+@torch.inference_mode()
+def build_merge_keys(theta_0, theta_1, theta_2, merge_cache, mode, usebeta, vae_key, bake_vae_enabled):
+    if theta_1 is None:
+        return []
 
-        cache_entry = merge_cache.get(key)
-        if cache_entry is None:
-            target_dict[key] = source_dict[key]
-            continue
+    t1 = theta_1
+    t2 = theta_2
+    skip = checkpoint_dict_skip_on_merge
 
-        _,_,cur_b = cache_entry
+    keys = []
+    for k in merge_cache.keys():
+        if (not bake_vae_enabled) and (vae_key in k):
+            continue
+        if k in skip:
+            continue
+        if ("model" not in k and "text_encoders" not in k):
+            continue
+        if k not in t1:
+            continue
+        if (mode != "DARE") and (usebeta or mode == "TD") and (t2 is not None) and (k not in t2):
+            continue
+        keys.append(k)
+    return keys
+
+
+def remerge_model(target_dict, source_dict, desc, mode, resolver, theta_2=None):
+    t = target_dict
+    s = source_dict
+    skip = checkpoint_dict_skip_on_merge
+
+    for key in tqdm(s.keys(), desc=desc, total=len(s)):
+        if isflux:
+            continue
+        if key in skip:
+            continue
+        if ("model" not in key and "text_encoders" not in key):
+            continue
+        if key in t:
+            continue
 
         if mode in {"TRS", "ST"} and theta_2 is not None and key in theta_2:
-            b, c = source_dict[key], theta_2[key]
+            ent = resolver(key)
+            if ent is None:
+                t[key] = s[key]
+                continue
+            _, _, cur_b = ent
             try:
-                target_dict[key] = weighted_sum(b, c, cur_b)
+                t[key] = torch.lerp(s[key], theta_2[key], float(cur_b))
             except Exception:
-                target_dict[key] = b
+                t[key] = s[key]
         else:
-            target_dict[key] = source_dict[key]
+            t[key] = s[key]
+    return t
 
-    return target_dict
-
-# common = len(set(theta_0.keys()) & set(theta_1.keys()))
-# print("[dbg] keys0, keys1, common =", len(theta_0), len(theta_1), common)
 if mode not in ["NoIn", "TF"]:
-    merge_cache = prepare_merge_cache(theta_0.keys(), isxl, isflux, iszi, deep_a, deep_b, weights_a, weights_b, alpha, beta)
-    # print("[dbg] merge_cache keys =", len(merge_cache))
-    # print("[dbg] merge_cache in common =", sum(1 for k in merge_cache if k in theta_1))
-    vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
-    
-    for key in tqdm(theta_0.keys(), desc=f"{merge_name} Merging..."):
-        if args.vae is None and vae_key in key:
-            continue
-        if not (theta_1 and ("model" in key or "text_encoders" in key) and key in theta_1):
-            continue
-        if mode != "DARE" and (usebeta or mode == "TD") and (theta_2 is not None) and key not in theta_2:
-            # print(f"[warn] key '{key}' missing in model 2; skipping.")
-            continue
-        if key in checkpoint_dict_skip_on_merge:
-            continue
-        if key not in merge_cache: 
-            continue
-
-        a, b = theta_0[key], theta_1[key]
-        al, bl = list(a.shape), list(b.shape)
-
-        wi, cur_a, cur_b = merge_cache[key]
-        a, b = theta_0[key], theta_1[key]
-
-        if mode == "sAD":
-            bf = b.detach().float()
-            filt = scipy.ndimage.gaussian_filter(bf.cpu().numpy(), sigma=1)
-            theta_0[key] = a + cur_a * torch.from_numpy(filt).to(a.device, dtype=a.dtype)
-            theta_0[key] = _finetune_inplace(key, theta_0[key], fine); continue
-
-        if mode == "TD":
-            t1 = theta_1[key].float()
-            t2 = theta_2[key].float()
-            t0 = theta_0[key].float()
-            if torch.allclose(t1, t2, rtol=0, atol=0):
-                theta_2[key] = theta_0[key]
-                continue
-            diff_AB = (t1 - t2).abs()
-            dist_A0 = (t1 - t0).abs()
-            dist_A2 = (t1 - t2).abs()
-            denom = dist_A0 + dist_A2
-            scale = torch.where(denom != 0, dist_A0 / denom, torch.tensor(0., device=t0.device))
-            scale = torch.sign(t1 - t2) * scale.abs()
-            theta_0[key] = (t0 + (scale * diff_AB) * (cur_a * 1.8)).to(theta_0[key].dtype)
-            theta_0[key] = _finetune_inplace(key, theta_0[key], fine); continue
-
-        if mode == "TS":
-            if a.dim() == 0:
-                continue
-            n = a.shape[0]
-            if cur_a + cur_b <= 1:
-                s, e = int(n * cur_b), int(n * (cur_a + cur_b))
-                theta_0[key][s:e, ...] = b[s:e, ...].clone()
-            else:
-                s, e = int(n * (cur_a + cur_b - 1)), int(n * cur_b)
-                t = b.clone()
-                t[s:e, ...] = a[s:e, ...].clone()
-                theta_0[key] = t
-            theta_0[key] = _finetune_inplace(key, theta_0[key], fine)
-            continue
-
-        if al != bl and len(al) == 4 and len(bl) == 4 and al[0]==bl[0] and al[2:]==bl[2:]:
-            # print(f"[warn] shape mismatch on key '{key}': {al} vs {bl}, attempting to align channels by cropping...")
-            use = min(al[1], bl[1], 4)
-            ad = a[:, :use, ...]
-        else:
-            ad = a
-
-        if usebeta and mode not in ["DARE", "XDARE"]:
-            c = theta_2[key]
-            theta_0[key] = theta_func2(ad, b, c, cur_a, cur_b)
-        elif usebeta:
-            theta_0[key] = theta_func2(ad, b, cur_a, cur_b)
-        else:
-            theta_0[key] = theta_func2(ad, b, cur_a)
-
-        theta_0[key] = _finetune_inplace(key, theta_0[key], fine)
+    with torch.inference_mode():
+        vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
+        resolver = make_param_resolver(alpha, beta, weights_a, weights_b, deep_a, deep_b, blockids, usebeta)
         
-    merge_cache = prepare_merge_cache(
-        list(set(theta_1.keys()) | (set(theta_2.keys()) if 'theta_2' in locals() and theta_2 else set())),
-        isxl, isflux, iszi, deep_a, deep_b, weights_a, weights_b, alpha, beta
-    )
+        cache_skip = checkpoint_dict_skip_on_merge
+        func = theta_func2
+        do_fine = bool('fine' in locals() and fine)
+        for key in tqdm(theta_0.keys(), desc=f"{merge_name} Merging...", total=len(theta_0)):
+            if (not bake_vae_enabled) and (vae_key in key):
+                continue
+            if key in cache_skip:
+                continue
+            if ("model" not in key and "text_encoders" not in key):
+                continue
+            if theta_1 is None or (key not in theta_1):
+                continue
+            if (mode != "DARE") and (usebeta or mode == "TD") and (theta_2 is not None) and (key not in theta_2):
+                continue
+
+            ent = resolver(key)
+            if ent is None:
+                continue
+            _, cur_a, cur_b = ent
+
+            a = theta_0[key]
+            b = theta_1[key]
+
+            if mode == "sAD":
+                bf = b.detach().float().cpu()
+                filt = scipy.ndimage.gaussian_filter(bf.numpy(), sigma=1)
+                out = a + cur_a * torch.from_numpy(filt).to(a.device, dtype=a.dtype)
+                theta_0[key] = _finetune_inplace(key, out, fine) if do_fine else out
+                continue
+
+            if mode == "TD":
+                t1f = b.float()
+                t2f = theta_2[key].float()
+                if torch.equal(t1f, t2f):
+                    continue
+                t0f = a.float()
+                diff = (t1f - t2f)
+                absdiff = diff.abs()
+                distA0 = (t1f - t0f).abs()
+                denom = distA0 + absdiff
+                scale = torch.where(denom != 0, distA0 / denom, torch.zeros((), device=t0f.device))
+                scale = diff.sign() * scale.abs()
+                out = (t0f + (scale * absdiff) * (float(cur_a) * 1.8)).to(a.dtype)
+                theta_0[key] = _finetune_inplace(key, out, fine) if do_fine else out
+                continue
+
+            if mode == "TS":
+                if a.dim() == 0:
+                    continue
+                n = a.shape[0]
+                if cur_a + cur_b <= 1:
+                    s, e = int(n * cur_b), int(n * (cur_a + cur_b))
+                    theta_0[key][s:e, ...].copy_(b[s:e, ...])
+                else:
+                    s, e = int(n * (cur_a + cur_b - 1)), int(n * cur_b)
+                    t = b.clone()
+                    t[s:e, ...].copy_(a[s:e, ...])
+                    theta_0[key] = t
+                theta_0[key] = _finetune_inplace(key, theta_0[key], fine) if do_fine else theta_0[key]
+                continue
+
+            if (a.shape != b.shape) and (a.dim() == 4) and (b.dim() == 4) and (a.shape[0] == b.shape[0]) and (a.shape[2:] == b.shape[2:]):
+                use = min(a.shape[1], b.shape[1], 4)
+                ad = a[:, :use, ...]
+            else:
+                ad = a
+
+            if usebeta and mode not in ["DARE", "XDARE"]:
+                out = func(ad, b, theta_2[key], cur_a, cur_b)
+            elif usebeta:
+                out = func(ad, b, cur_a, cur_b)
+            else:
+                out = func(ad, b, cur_a)
+
+            theta_0[key] = _finetune_inplace(key, out, fine) if do_fine else out
 
     if mode != "DARE":
         if mode != "AD":
-            theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode, theta_2=theta_2)
+            theta_0 = remerge_model(theta_0, theta_1, "Remerging...", mode, resolver, theta_2=theta_2)
         else:
-            theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode)
+            theta_0 = remerge_model(theta_0, theta_1, "Remerging...", mode, resolver)
     del theta_1
     try:
         if theta_2:
-            theta_0 = remerge_model(theta_0, theta_2, desc="Remerging...", mode=mode)
+            theta_0 = remerge_model(theta_0, theta_2, desc="Remerging...", mode=mode, resolver=resolver)
             del theta_2
     except NameError:
         pass
@@ -924,7 +1055,8 @@ if mode not in ["NoIn", "TF"]:
 else:
     if args.mode == "TF":
         theta_0 = prune_extras_vs_model1(theta_0, theta_1)
-        theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode, theta_2=theta_2)
+        resolver = make_param_resolver(alpha, beta, weights_a, weights_b, deep_a, deep_b, blockids, usebeta)
+        theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode, resolver=resolver, theta_2=theta_2)
     isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
     vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
     if args.fine and not iszi:
@@ -954,15 +1086,15 @@ if isxl:
     for k in tqdm([k for k in theta_0.keys() if "cond_stage_model." in k], desc="Cond resolving..."):
         del theta_0[k]
 
-theta_0 = to_half_k(theta_0, args.save_half, args.save_bhalf, vae=vae_key)
-
-if args.prune:
-    theta_0 = prune_model(theta_0, "Model", args, isxl, isflux, iszi)
-
-theta_0 = to_quarter_k(theta_0, args.save_quarter, prefer="e4m3", vae=vae_key)
-
-for k in tqdm(theta_0.keys(), desc="Check contiguous..."):
-    theta_0[k] = theta_0[k].detach().cpu().contiguous()
+theta_0 = prepare_state_dict_for_save(
+    theta_0,
+    args=args,
+    isxl=isxl, isflux=isflux, iszi=iszi,
+    vae_prefix=vae_key,
+    prune=bool(args.prune),
+    make_cpu=True,
+    make_contiguous=True,
+)
 
 metadata = {"format": "safetensors" if args.save_safetensors else "ckpt", "sd_merge_models": {}, "sd_merge_recipe": None}
 if args.memo is not None:
@@ -981,7 +1113,7 @@ if args.fine:
     calcs.append(f"fine[{fine}]")
 calcl = ",".join(calcs) or None
 
-fp = "fp8" if args.save_quarter else ("fp16" if args.save_half else "fp32")
+fp = "fp8" if args.save_quarter else ("fp16" if args.save_half else ("bf16" if args.save_bhalf else "fp32"))
 
 merge_recipe = {
     "type":                 "merge-models-chattiori",
