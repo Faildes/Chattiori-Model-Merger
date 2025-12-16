@@ -386,17 +386,25 @@ else:
     useblocks = False
     deep_a = deep_b = []
 
-cos_flags = [args.cosine0, args.cosine1, args.cosine2]
+cosine0 = bool(args.cosine0)
+cosine1 = bool(args.cosine1)
+cosine2 = bool(args.cosine2)
+
+cos_flags = [cosine0, cosine1, cosine2]
 if sum(1 for f in cos_flags if f) > 1:
     raise SystemExit("cosine0, cosine1 and cosine2 cannot be posed at same time, choose one only")
 
-if args.cosine2 and (args.model_2 is None):
+if cosine2 and (args.model_2 is None):
     raise SystemExit("--cosine2 cannot be used when there are only 2 models given")
 
-if mode == "WS" and (args.cosine0 ^ args.cosine1):
-    cosine0, cosine1 = args.cosine0, args.cosine1
-else:
-    cosine0 = cosine1 = False
+if cosine0 or cosine1 or cosine2:
+    if mode not in {"WS", "ST", "TRS"}:
+        raise SystemExit("--cosine0/--cosine1/--cosine2 are supported only for modes WS, ST, TRS")
+    if cosine2 and mode == "WS":
+        raise SystemExit("--cosine2 is only supported for ST/TRS (not WS)")
+    if mode == "WS" and not (cosine0 ^ cosine1):
+        raise SystemExit("WS with cosine requires exactly one of --cosine0 or --cosine1")
+    
 output_name = args.output
 output_file = f"{output_name}.{'safetensors' if args.save_safetensors else 'ckpt'}"
 output_path = normalize_path(os.path.join(args.model_path, output_file))
@@ -677,6 +685,167 @@ def _is_small_or_norm_or_bias(key, tens):
         return True
     return False
 
+
+# -----------------------------------------------------------------------------
+# Cosine blend helpers
+# -----------------------------------------------------------------------------
+
+def _cosine_keys_intersection(base: dict, other: dict, vae_key: str, bake_vae_enabled: bool):
+    skip = set(checkpoint_dict_skip_on_merge)
+    keys = []
+    for k in base.keys():
+        if k in skip:
+            continue
+        if (not bake_vae_enabled) and (vae_key in k):
+            continue
+        if ("model" not in k and "text_encoders" not in k):
+            continue
+        if k not in other:
+            continue
+
+        a = base[k]
+        b = other[k]
+        if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
+            continue
+        if (not a.is_floating_point()) or (not b.is_floating_point()):
+            continue
+        if a.shape != b.shape:
+            continue
+        keys.append(k)
+    return keys
+
+
+@torch.inference_mode()
+def _cosine_combined_similarity_tensor(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    a32 = a.detach().to(torch.float32)
+    b32 = b.detach().to(torch.float32)
+
+    a_n = F.normalize(a32, p=2, dim=0)
+    b_n = F.normalize(b32, p=2, dim=0)
+
+    simab = F.cosine_similarity(a_n, b_n, dim=0)
+    simab = torch.nan_to_num(simab, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    dot = torch.dot(a_n.reshape(-1), b_n.reshape(-1))
+    denom = (a_n.norm() * b_n.norm()).clamp_min(1e-12)
+    mag = (dot / denom).clamp(-1.0, 1.0)
+
+    combined = 0.5 * (simab + mag)
+    return combined
+
+def _cosine_trimmed_minmax(samples_np: np.ndarray):
+    samples_np = samples_np[np.isfinite(samples_np)]
+    if samples_np.size == 0:
+        return 0.0, 1.0
+
+    p1  = float(np.percentile(samples_np, 1,  method="midpoint"))
+    p99 = float(np.percentile(samples_np, 99, method="midpoint"))
+    trimmed = samples_np[(samples_np >= p1) & (samples_np <= p99)]
+    if trimmed.size == 0:
+        trimmed = samples_np
+
+    mn = float(np.min(trimmed))
+    mx = float(np.max(trimmed))
+    if abs(mx - mn) < 1e-6:
+        mx = mn + 1e-6
+    return mn, mx
+
+@torch.inference_mode()
+def _cosine_pair_stats(base: dict, other: dict, keys: list, sample_per_key: int = 32):
+    samples = []
+    for k in tqdm(keys, desc="Cosine Stage 0/2 (stats)"):
+        cs = _cosine_combined_similarity_tensor(base[k], other[k])
+        flat = cs.reshape(-1)
+        if flat.numel() == 0:
+            continue
+        n = min(sample_per_key, flat.numel())
+        idx = torch.linspace(0, flat.numel() - 1, steps=n, device=flat.device).to(torch.long)
+        samp = flat.index_select(0, idx).detach().to("cpu").numpy()
+        samples.append(samp)
+
+    if not samples:
+        return 0.0, 1.0
+
+    all_s = np.concatenate(samples, axis=0).astype(np.float64, copy=False)
+    return _cosine_trimmed_minmax(all_s)
+
+@torch.inference_mode()
+def _cosine_blend_tensor(a: torch.Tensor, b: torch.Tensor, strength: float, sims_min: float, sims_max: float):
+    cs = _cosine_combined_similarity_tensor(a, b)
+    k = (cs - sims_min) / (sims_max - sims_min)
+    k = torch.nan_to_num(k, nan=0.0, posinf=1.0, neginf=0.0)
+
+    k = (k - abs(float(strength))).clamp(0.0, 1.0)
+
+    out = torch.lerp(b.to(torch.float32), a.to(torch.float32), k).to(a.dtype)
+    return out
+
+def _strength_getter(alpha, weights, deep, blockids_local):
+    def get(k: str) -> float:
+        wi = _resolve_weight_index(k)
+        cur = float(alpha) if alpha is not None else 0.0
+        if (weights is not None) and wi > 0:
+            cur = float(weights[wi - 1])
+        if deep:
+            cur = float(elementals(k, wi, deep, cur, blockids_local))
+        return cur
+    return get
+
+@torch.inference_mode()
+def _cosine_merge_pair_inplace(
+    base: dict,
+    other: dict,
+    strength_getter,
+    vae_key: str,
+    bake_vae_enabled: bool,
+    sample_per_key: int = 32,
+    fine=None,
+):
+    keys = _cosine_keys_intersection(base, other, vae_key=vae_key, bake_vae_enabled=bake_vae_enabled)
+    if not keys:
+        return base
+
+    sims_min, sims_max = _cosine_pair_stats(base, other, keys, sample_per_key=sample_per_key)
+
+    for k in tqdm(keys, desc="Cosine Stage 1/2 (apply)"):
+        cur = float(strength_getter(k))
+        
+        if _is_small_or_norm_or_bias(k, base[k]):
+            out = weighted_sum(base[k], other[k], cur)
+        else:
+            out = _cosine_blend_tensor(base[k], other[k], cur, sims_min, sims_max)
+
+        if fine:
+            out = _finetune_inplace(k, out, fine)
+        base[k] = out
+
+    skip = set(checkpoint_dict_skip_on_merge)
+    for k, v in other.items():
+        if k in base:
+            continue
+        if k in skip:
+            continue
+        if (not bake_vae_enabled) and (vae_key in k):
+            continue
+        if ("model" not in k and "text_encoders" not in k):
+            continue
+        base[k] = v
+
+    return base
+
+def _pick_base_and_others_for_cosine(theta_0, theta_1, theta_2, cosine_sel: int):
+    if cosine_sel == 0:
+        base_idx, base_sd = 0, theta_0
+        others = [(theta_1, "alpha"), (theta_2, "beta")]
+    elif cosine_sel == 1:
+        base_idx, base_sd = 1, theta_1
+        others = [(theta_0, "alpha"), (theta_2, "beta")]
+    else:
+        base_idx, base_sd = 2, theta_2
+        others = [(theta_0, "alpha"), (theta_1, "beta")]
+    return base_idx, base_sd, others
+
+
 def cosine_minmax_grouped(base_dict, other_dict, desc, variant=0, lo=10.0, hi=90.0):
     by_block = {}
     for k in tqdm(base_dict.keys(), desc=desc):
@@ -824,90 +993,51 @@ def make_param_resolver(alpha, beta, weights_a, weights_b, deep_a, deep_b, block
         return wi, cur_a, cur_b
     return get
 
-def _apply_cosine_blend(a, b, kmin, kmax, cur_alpha, variant, tau=0.20, floor=0.05):
-    a_f = a.detach().float().view(-1)
-    b_f = b.detach().float().view(-1)
-
-    sim = F.cosine_similarity(a_f, b_f, dim=0)
-    sim = torch.nan_to_num(sim, nan=0.0, posinf=1.0, neginf=-1.0)
-
-    if variant == 1:
-        dot = torch.dot(a_f, b_f)
-        denom = (a_f.norm() * b_f.norm()).clamp_min(1e-12)
-        mag = (dot / denom).clamp_(-1.0, 1.0)
-        sim = 0.5 * (sim + mag)
-
-    sim = sim.clamp_(-1.0, 1.0)
-    kmin = float(np.clip(kmin, -1.0, 1.0))
-    kmax = float(np.clip(kmax, -1.0, 1.0))
-    if abs(kmax - kmin) < 1e-6:
-        kmax = kmin + 1e-6
-        
-    t = ((sim - kmin) / (kmax - kmin)).clamp_(0.0, 1.0)
-    mid = 0.5 + float(cur_alpha) * 0.5
-    w = torch.sigmoid((t - mid) / max(tau, 1e-3))
-    w = w.clamp(floor, 1.0 - floor)
-    
-    out = torch.lerp(a, b, w).view_as(a).to(a.dtype)
-    return out
+cosine_applied = False
 
 use_cos0 = bool(args.cosine0)
 use_cos1 = bool(args.cosine1)
 use_cos2 = bool(args.cosine2)
+cosine_sel = None if (not any([use_cos0, use_cos1, use_cos2])) else (0 if use_cos0 else (1 if use_cos1 else 2))
 blockids = BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else (BLOCKIDZI if iszi else BLOCKID))
 _TAG2IDX = {t: i for i, t in enumerate(blockids)}
 
-if use_cos0 or use_cos1 or use_cos2:
-    base, dA, dB, varA, varB = resolve_cosine_triplet(theta_0, theta_1, theta_2, use_cos0, use_cos1, use_cos2)
+if cosine_sel is not None:
+    vae_key_local = "first_stage_model" if not (isflux or iszi) else "vae"
 
-    statsA, defaultA = cosine_minmax_grouped(base, dA, "Cosine(base vs A)", variant=varA)
-    if dB is not None:
-        statsB, defaultB = cosine_minmax_grouped(base, dB, "Cosine(base vs B)", variant=varB)
+    base_idx, base_sd, others = _pick_base_and_others_for_cosine(theta_0, theta_1, theta_2, cosine_sel)
+
+    if mode == "WS":
+        others = [(sd, tag) for (sd, tag) in others if (sd is not None and tag == "alpha")]
     else:
-        statsB = {}; defaultB = (0.0, 1.0)
+        others = [(sd, tag) for (sd, tag) in others if (sd is not None)]
 
-    # theta_res = clone_dict_tensors(base)
+    getA = _strength_getter(alpha, weights_a, deep_a, blockids)
+    getB = _strength_getter(beta,  weights_b, deep_b, blockids) if (beta is not None) else None
 
-    for key in tqdm(base.keys(), desc="Cosine structure-based blending..."):
-        if ("first_stage_model" in key or "vae" in key) or ("model" not in key and "text_encoders" not in key):
+    for other_sd, tag in others:
+        sg = getA if tag == "alpha" else getB
+        if sg is None:
             continue
-        if key not in dA:
-            continue
+        _cosine_merge_pair_inplace(
+            base_sd, other_sd,
+            strength_getter=sg,
+            vae_key=vae_key_local,
+            bake_vae_enabled=bake_vae_enabled,
+            sample_per_key=32,
+            fine=fine,
+        )
 
-        wi = _resolve_weight_index(key)
-        if wi < 0:
-            continue
+    theta_0 = base_sd
 
-        if _is_small_or_norm_or_bias(key, base[key]):
-            cur_a = alpha
-            if weights_a is not None and wi > 0: cur_a = weights_a[wi - 1]
-            if deep_a: cur_a = elementals(key, wi, deep_a, cur_a, blockids)
-            out = weighted_sum(base[key], dA[key], cur_a)
-            if dB is not None and (key in dB) and (beta is not None):
-                cur_b = beta
-                if weights_b is not None and wi > 0: cur_b = weights_b[wi - 1]
-                if deep_b: cur_b = elementals(key, wi, deep_b, cur_b, blockids)
-                out = weighted_sum(out, dB[key], cur_b)
-            base[key] = _finetune_inplace(key, out, fine)
-            continue
-
-        cur_a, cur_b = alpha, beta
-        if wi > 0:
-            if weights_a is not None:            cur_a = weights_a[wi - 1]
-            if (weights_b is not None) and dB is not None: cur_b = weights_b[wi - 1]
-        if deep_a: cur_a = elementals(key, wi, deep_a, cur_a, blockids)
-        if deep_b and dB is not None: cur_b = elementals(key, wi, deep_b, cur_b, blockids)
-
-        ka = statsA.get(wi, defaultA); kminA, kmaxA = ka
-        out = _apply_cosine_blend(base[key], dA[key], kminA, kmaxA, cur_a, variant=varA, tau=0.20, floor=0.05)
-
-        if dB is not None and (key in dB) and (cur_b is not None):
-            kb = statsB.get(wi, defaultB); kminB, kmaxB = kb
-            out = _apply_cosine_blend(out, dB[key], kminB, kmaxB, cur_b, variant=varB, tau=0.20, floor=0.05)
-
-        base[key] = _finetune_inplace(key, out, fine)
-
-    theta_0 = base
+    cosine_applied = True
+    mode = "NoIn"
+    theta_1 = None
+    theta_2 = None
+    usebeta = False
+    weights_a = weights_b = None
+    alpha = beta = None
+    deep_a = deep_b = []
 
 
 @torch.inference_mode()
@@ -1065,13 +1195,13 @@ else:
         theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode, resolver=resolver, theta_2=theta_2)
     isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
     vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
-    if args.fine and not iszi:
+    if (not cosine_applied) and args.fine and not iszi:
         fine = fineman([float(t) for t in args.fine.split(",")], isxl, isflux)
         for key in tqdm(theta_0.keys(), desc="Fine Tuning ..."):
             if args.vae is None and vae_key in key:
                 continue
             theta_0[key] = _finetune_inplace(key, theta_0[key], fine)
-    else:
+    elif not cosine_applied:
         fine = ""
         
 def _strip_vae_root(k: str):
@@ -1108,8 +1238,9 @@ if args.memo is not None:
 
 calcs = [
     name for flag, name in [
-        (cosine0,            "cosine_0"),
-        (cosine1,            "cosine_1"),
+        (bool(args.cosine0),  "cosine_0"),
+        (bool(args.cosine1),  "cosine_1"),
+        (bool(args.cosine2),  "cosine_2"),
         (args.use_dif_10,    "use_dif_10"),
         (args.use_dif_20,    "use_dif_20"),
         (args.use_dif_21,    "use_dif_21"),
@@ -1124,8 +1255,8 @@ fp = "fp8" if args.save_quarter else ("fp16" if args.save_half else ("bf16" if a
 merge_recipe = {
     "type":                 "merge-models-chattiori",
     "primary_model_hash":   model_0_sha256,
-    "secondary_model_hash": model_1_sha256 if mode != "NoIn" else None,
-    "tertiary_model_hash":  model_2_sha256 if mode in modes_need_m2 else None,
+    "secondary_model_hash": model_1_sha256 if (model_1_sha256 is not None) else None,
+    "tertiary_model_hash":  model_2_sha256 if (model_2_sha256 is not None) else None,
     "merge_method":         merge_name,
     "block_weights":        (weights_a is not None or weights_b is not None),
     "alpha_info":           alpha_info or None,
@@ -1161,9 +1292,9 @@ def add_model_metadata(s256, hashed, meta, model_name):
     metadata["sd_merge_models"].update(meta.get("sd_merge_models", {}))
 
 add_model_metadata(model_0_sha256, model_0_hash, model_0_meta, model_0_name)
-if mode != "NoIn":
+if model_1_sha256 is not None:
     add_model_metadata(model_1_sha256, model_1_hash, model_1_meta, model_1_name)
-if mode in modes_need_m2:
+if model_2_sha256 is not None:
     add_model_metadata(model_2_sha256, model_2_hash, model_2_meta, model_2_name)
 
 metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
@@ -1172,8 +1303,8 @@ delete_targets = []
 if args.delete_source:
     for p, cond in [
         (os.path.join(args.model_path, args.model_0), True),
-        (os.path.join(args.model_path, args.model_1), mode != "NoIn"),
-        (os.path.join(args.model_path, args.model_2), mode in modes_need_m2),
+        (os.path.join(args.model_path, args.model_1), model_1_sha256 is not None),
+        (os.path.join(args.model_path, args.model_2), model_2_sha256 is not None),
     ]:
         if cond and os.path.isfile(p):
             delete_targets.append(p)
