@@ -381,7 +381,7 @@ def parse_ratio(ratios, info, dp):
         prefix = f"preset:[{info}]," if info else ""
         info = f"{prefix}{round(ratio,3)},[{rounded},[{round_deep}]]"
     else:
-        ratio, weights, info = ratios, [ratios]*25, f"{round(ratios,3)}"
+        ratio, weights, info = ratios, [ratios]*34, f"{round(ratios,3)}"
     return weights, ratio, info
 
 
@@ -456,7 +456,7 @@ def prepare_state_dict_for_save(
         v = theta.get(k, None)
 
         # prune
-        if prune and not any(k.startswith(r) for r in roots):
+        if prune and (".scale" in k and iszi) or (not any(k.startswith(r) for r in roots)):
             theta.pop(k, None)
             continue
 
@@ -501,8 +501,6 @@ def prepare_state_dict_for_save(
 def set_cache_filename(path: str):
     global cache_filename
     cache_filename = normalize_path(path)
-
-cache_filename = os.path.join(os.getcwd(), "cache.json")
 
 def _safe_load_json(path: str):
     try:
@@ -664,23 +662,33 @@ def detect_arch(theta):
     isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta
     isflux = any("double_block" in k for k in theta.keys())
 
-    if "model.diffusion_model.cap_embedder.0.weight" in theta:
-        iszi = True
-        return isxl, isflux, iszi, theta
+    keys = list(theta.keys())
+    iszi = (
+        ("model.diffusion_model.cap_embedder.0.weight" in theta) or
+        ("cap_embedder.0.weight" in theta) or
+        any(k.startswith("model.diffusion_model.layers.") or k.startswith("diffusion_model.layers.") for k in keys) or
+        any("diffusion_model.context_refiner" in k or "context_refiner" in k for k in keys) or
+        any("diffusion_model.noise_refiner" in k or "noise_refiner" in k for k in keys) or
+        any("x_embedder." in k or "t_embedder." in k for k in keys)
+    )
 
-    if "cap_embedder.0.weight" in theta:
-        def _zi_key(k: str) -> str:
-            if k.startswith(("vae.", "text_encoders.")):
-                return k
-            if k.startswith("model.diffusion_model."):
-                return k
+    if not iszi:
+        return isxl, isflux, False, theta
+
+    def _zi_key(k: str) -> str:
+        if k.startswith(("vae.", "text_encoders.", "model.diffusion_model.")):
+            return k
+
+        if k.startswith("diffusion_model."):
+            return "model." + k  # -> model.diffusion_model....
+
+        if k.startswith(("layers.", "context_refiner.", "noise_refiner.", "final_layer.", "cap_embedder.")):
             return "model.diffusion_model." + k
 
-        theta = {_zi_key(k): v for k, v in theta.items()}
-        iszi = True
-        return isxl, isflux, iszi, theta
+        return k
 
-    return isxl, isflux, False, theta
+    theta = {_zi_key(k): v for k, v in theta.items()}
+    return isxl, isflux, True, theta
 
 
 def _common_dtype(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
@@ -1241,6 +1249,19 @@ def _maybe_skip_small_norm_bias_for_clipxor(key: str, tens: torch.Tensor) -> boo
         return True
     return False
 
+
+def _is_small_or_norm_or_bias(key, tens):
+    n = tens.numel()
+    if n < 128:
+        return True
+    k = key.lower()
+    if (k.endswith(".bias") or ".bias" in k or "norm" in k or "ln" in k or "bn" in k):
+        return True
+    if "emb" in k or "pos" in k:
+        return True
+    return False
+
+
 def _collect_clipxor_targets(theta_base: dict, theta_other: dict,
                              isxl: bool, isflux: bool, iszi: bool = False):
     targets = []
@@ -1289,9 +1310,8 @@ def _iter_clip_items(sd: dict, isxl: bool, isflux: bool, iszi: bool = False):
                 break
 
 def _collect_clip_pairs_by_suffix(sd_a: dict, sd_b: dict,
-                                  isxl_a: bool, isflux_a: bool,
-                                  isxl_b: bool, isflux_b: bool,
-                                  iszi_a: bool = False, iszi_b: bool = False):
+                                  isxl_a: bool, isflux_a: bool, iszi_a: bool,
+                                  isxl_b: bool, isflux_b: bool, iszi_b: bool):
     # map suffix -> (orig_key, tensor) for A and B separately
     map_a = {}
     for k, _, suf, v in _iter_clip_items(sd_a, isxl_a, isflux_a, iszi_a):
@@ -1313,9 +1333,9 @@ def _collect_clip_pairs_by_suffix(sd_a: dict, sd_b: dict,
 
 def _clip_tier_for_xl(key: str) -> str:
     k = key.lower()
-    if ("clip_l" in k) or ("text_model" in k and "clip" in k):
+    if ("clip_l" in k) or ("text_model" in k and "clip" in k) or ("conditioner.embedders.0" in k):
         return "clip-l"
-    if ("clip_g" in k) or ("text2_model" in k and "clip" in k) or ("open_clip" in k):
+    if ("clip_g" in k) or ("text2_model" in k and "clip" in k) or ("open_clip" in k)  or ("conditioner.embedders.1" in k):
         return "clip-g"
     return "other"
 
@@ -1796,3 +1816,137 @@ def finalize_and_pack_for_save(theta, *, save_half, save_bhalf, save_quarter, va
 
         out[k] = t
     return out
+
+def _turbo_force_copy_key(k: str) -> bool:
+    kl = k.lower()
+    return (
+        "alphas_cumprod" in kl or "betas" in kl or "posterior_" in kl or
+        "sqrt_" in kl or "log_" in kl or "sigmas" in kl or
+        "model_ema." in kl or "num_batches_tracked" in kl
+    )
+
+@torch.inference_mode()
+def _scalar_ls_scale(tb: torch.Tensor, tc: torch.Tensor, sample: int = 2048) -> float:
+    b = tb.detach().to(torch.float32).reshape(-1)
+    c = tc.detach().to(torch.float32).reshape(-1)
+    n = b.numel()
+    if n == 0:
+        return 1.0
+    if n > sample:
+        if sample <= 1:
+            idx = torch.zeros((1,), device=b.device, dtype=torch.int64)
+        else:
+            idx = torch.arange(sample, device=b.device, dtype=torch.int64)
+            idx = (idx * (n - 1)) // (sample - 1)
+        idx.clamp_(0, n - 1)
+        b = b.index_select(0, idx)
+        c = c.index_select(0, idx)
+    denom = float(torch.dot(c, c).clamp_min(1e-12))
+    num   = float(torch.dot(b, c))
+    s = num / denom
+    if not np.isfinite(s):
+        s = 1.0
+    return s
+
+def _is_cond_sensitive_key(k: str) -> bool:
+    kl = k.lower()
+    return (
+        "attn2" in kl or "cross_attn" in kl or "crossattn" in kl or
+        ".to_q" in kl or ".to_k" in kl or ".to_v" in kl or ".to_out" in kl or
+        "q_proj" in kl or "k_proj" in kl or "v_proj" in kl or "out_proj" in kl or
+        "encoder_hid_proj" in kl or
+        "conditioner." in kl or "cond_stage_model." in kl or "text_encoders" in kl or
+        "context_refiner" in kl or "cap_embedder" in kl
+    )
+
+@torch.inference_mode()
+def turbo_convert_inplace(
+    A: dict, B: dict, C: dict, resolver,
+    *, deturbo: bool,
+    vae_key: str,
+    bake_vae_enabled: bool,
+    fine=None,
+):
+    def allow_vae(k: str) -> bool:
+        return bake_vae_enabled or (vae_key not in k)
+
+    keys = set(A.keys()) | (set(B.keys()) & set(C.keys()))
+
+    for k in tqdm(keys, desc=("DeTurbo" if deturbo else "Turbo") + " converting..."):
+        tb = B.get(k, None)
+        tc = C.get(k, None)
+
+        if not (isinstance(tb, torch.Tensor) and isinstance(tc, torch.Tensor)):
+            continue
+        if tb.shape != tc.shape:
+            continue
+
+        if not allow_vae(k):
+            continue
+
+        ent = resolver(k)
+        if ent is None:
+            continue
+        _, cur_a, _ = ent
+        a = float(cur_a)
+        if a == 0.0:
+            continue
+
+        ta = A.get(k, None)
+
+        if _turbo_force_copy_key(k) or (not tb.is_floating_point()) or (not tc.is_floating_point()):
+            tgt = tc if deturbo else tb
+            if isinstance(ta, torch.Tensor) and ta.shape == tgt.shape and ta.is_floating_point() and tgt.is_floating_point():
+                out = torch.lerp(ta.to(torch.float32), tgt.to(torch.float32), a).to(ta.dtype)
+            else:
+                out = tgt
+            A[k] = _finetune_inplace(k, out, fine) if fine else out
+            continue
+
+        s = _scalar_ls_scale(tb, tc)
+        hi = 6.0 if deturbo and _is_cond_sensitive_key(k) else 4.0
+        s = float(np.clip(s, 0.25, hi))
+        invs = 1.0 / max(s, 1e-6)
+
+        if isinstance(ta, torch.Tensor) and ta.is_floating_point() and ta.shape == tb.shape:
+            A32 = ta.detach().to(torch.float32)
+        else:
+            A32 = (tc.detach().to(torch.float32) if deturbo else tb.detach().to(torch.float32))
+
+        B32 = tb.detach().to(torch.float32)
+        C32 = tc.detach().to(torch.float32)
+
+        if deturbo:
+            # A' = A*(1-a + a*(1/s)) + a*(C - B/s)
+            out32 = A32.mul(1.0 - a + a * invs).add_(C32 - B32 * invs, alpha=a)
+        else:
+            # A' = A*(1-a + a*s) + a*(B - s*C)
+            out32 = A32.mul(1.0 - a + a * s).add_(B32 - C32 * s, alpha=a)
+            
+        def _soft_match_mean_std(out32: torch.Tensor, ref32: torch.Tensor, strength: float = 0.5, eps: float = 1e-6):
+            varO, meanO = torch.var_mean(out32, unbiased=False)
+            varR, meanR = torch.var_mean(ref32, unbiased=False)
+            stdO = varO.sqrt().clamp_min(eps)
+            stdR = varR.sqrt().clamp_min(eps)
+            normed = (out32 - meanO) / stdO
+            matched = normed * stdR + meanR
+            return torch.lerp(out32, matched, float(strength))
+        
+        if deturbo and _is_cond_sensitive_key(k) and (not _is_small_or_norm_or_bias(k, tb)):
+            COND_DAMP = 0.35 
+            out32 = C32 + (out32 - C32) * COND_DAMP
+
+            out32 = _soft_match_mean_std(out32, C32, strength=0.5)
+
+        out = out32.to(ta.dtype if isinstance(ta, torch.Tensor) and ta.is_floating_point() else tb.dtype)
+        A[k] = _finetune_inplace(k, out, fine) if fine else out
+
+    fill = C if deturbo else B
+    for k, v in fill.items():
+        if k in A:
+            continue
+        if not allow_vae(k):
+            continue
+        A[k] = v
+
+    return A

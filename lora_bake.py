@@ -5,7 +5,8 @@ import argparse
 import torch
 import torch.nn.functional as F
 import safetensors.torch
-from tqdm.autonotebook import tqdm
+import safetensors
+from tqdm.auto import tqdm
 
 from Utils import (
     load_model,
@@ -95,6 +96,114 @@ _ZI_LAYER_RE = re.compile(
     r"^(?:model\.)?diffusion_model\.layers\.(\d+)\.(.+)\.lora_(A|down)\.weight$"
 )
 
+_ZI_DOWN_SPLIT_RE = re.compile(r"^(.*)\.lora_(?:A|down)\.weight$")
+_ZI_DOT_BASE_RE   = re.compile(r"^(?:model\.)?diffusion_model\.layers\.(\d+)\.(.+)$")
+_ZI_US_BASE_RE    = re.compile(r"^(?:lora_(?:unet|diffusion_model)_)?layers_(\d+)_(.+)$")
+_ZI_US2_BASE_RE   = re.compile(r"^diffusion_model_layers_(\d+)_(.+)$")
+
+_ZI_NORM_RE = re.compile(r"[^a-z0-9]+")
+
+def _zi_norm_tail(s: str) -> str:
+    s = s.lower()
+    s = s.replace("weight", "")
+    return _ZI_NORM_RE.sub("", s)
+
+def _zi_extract_layer_tail_from_downkey(down_k: str):
+    m = _ZI_DOWN_SPLIT_RE.match(down_k)
+    if not m:
+        return None, None
+    base = m.group(1)
+
+    m2 = _ZI_DOT_BASE_RE.match(base)
+    if m2:
+        return int(m2.group(1)), m2.group(2)
+
+    m3 = _ZI_US_BASE_RE.match(base)
+    if m3:
+        return int(m3.group(1)), m3.group(2)
+
+    m4 = _ZI_US2_BASE_RE.match(base)
+    if m4:
+        return int(m4.group(1)), m4.group(2)
+
+    return None, None
+
+def _build_zi_layer_index(theta_0: dict):
+    """
+    layer -> { normalized_tail -> full_weight_key }
+    weight key is: model.diffusion_model.layers.{i}.{tail}.weight
+    """
+    idx = {}
+    prefix = "model.diffusion_model.layers."
+    for k in theta_0.keys():
+        if not (k.startswith(prefix) and k.endswith(".weight")):
+            continue
+        rest = k[len(prefix):]  # "{i}.{tail}.weight"
+        p = rest.find(".")
+        if p < 0:
+            continue
+        li = rest[:p]
+        if not li.isdigit():
+            continue
+        layer = int(li)
+        tail = rest[p + 1 : -len(".weight")]
+        idx.setdefault(layer, {})[_zi_norm_tail(tail)] = k
+    return idx
+
+def zimage_resolve_target_any(down_k: str, zi_index: dict):
+    layer, tail = _zi_extract_layer_tail_from_downkey(down_k)
+    if layer is None:
+        return None, None
+
+    m = zi_index.get(layer)
+    if not m:
+        return None, None
+
+    t = tail
+    tu = re.sub(r"[./]", "_", t).lower()
+
+    if "attention" in tu and "to_q" in tu:
+        k_sep = m.get(_zi_norm_tail("attention.to_q")) or m.get(_zi_norm_tail("attention_to_q"))
+        if k_sep:
+            return k_sep, None
+        k_fused = m.get(_zi_norm_tail("attention.qkv")) or m.get(_zi_norm_tail("attention_qkv"))
+        if k_fused:
+            return k_fused, "q"
+        return None, None
+
+    if "attention" in tu and "to_k" in tu:
+        k_sep = m.get(_zi_norm_tail("attention.to_k")) or m.get(_zi_norm_tail("attention_to_k"))
+        if k_sep:
+            return k_sep, None
+        k_fused = m.get(_zi_norm_tail("attention.qkv")) or m.get(_zi_norm_tail("attention_qkv"))
+        if k_fused:
+            return k_fused, "k"
+        return None, None
+
+    if "attention" in tu and "to_v" in tu:
+        k_sep = m.get(_zi_norm_tail("attention.to_v")) or m.get(_zi_norm_tail("attention_to_v"))
+        if k_sep:
+            return k_sep, None
+        k_fused = m.get(_zi_norm_tail("attention.qkv")) or m.get(_zi_norm_tail("attention_qkv"))
+        if k_fused:
+            return k_fused, "v"
+        return None, None
+
+    if "attention" in tu and ("to_out" in tu or tu.endswith("_out")):
+        for cand in ("attention.out", "attention.to_out.0", "attention.to_out", "attention_out", "attention_to_out_0"):
+            kk = m.get(_zi_norm_tail(cand))
+            if kk:
+                return kk, None
+
+    kk = m.get(_zi_norm_tail(t))
+    if kk:
+        return kk, None
+    kk = m.get(_zi_norm_tail(tu))
+    if kk:
+        return kk, None
+
+    return None, None
+
 @torch.inference_mode()
 def apply_lora_to_weight_inplace(W: torch.Tensor, up: torch.Tensor, down: torch.Tensor, scale: float, ratio: float):
     if W.ndim == 2:
@@ -149,18 +258,16 @@ def zimage_resolve_target(down_k: str):
     return target, part
 
 @torch.inference_mode()
-def apply_zimage_lora(
-    theta_0: dict,
-    target_key: str,
+def apply_zimage_lora_to_weight(
+    W: torch.Tensor,
     part: str | None,
     up: torch.Tensor,
     down: torch.Tensor,
     alpha,
     ratio: float,
-):
-    W = theta_0.get(target_key)
-    if W is None or not isinstance(W, torch.Tensor):
-        return False
+) -> torch.Tensor | None:
+    if W is None or (not isinstance(W, torch.Tensor)):
+        return None
 
     rank = int(down.size(0))
     a = alpha
@@ -172,7 +279,7 @@ def apply_zimage_lora(
     alpha_mm = float(ratio) * scale
 
     orig_dtype = W.dtype
-    compute_dtype = (torch.float32 if (W.device.type == "cpu" and orig_dtype != torch.float32) else orig_dtype)
+    compute_dtype = torch.float32 if (W.device.type == "cpu") else orig_dtype
 
     Wc = W.to(dtype=compute_dtype)
     uc = up.to(device=W.device, dtype=compute_dtype)
@@ -184,16 +291,23 @@ def apply_zimage_lora(
         if part is None:
             Wc.addmm_(uc, dc, beta=1.0, alpha=alpha_mm)
         else:
-            d = uc.shape[0]
+            d = int(uc.shape[0])
             off = {"q": 0, "k": d, "v": 2 * d}[part]
-            view = Wc.narrow(0, off, d)
-            view.addmm_(uc, dc, beta=1.0, alpha=alpha_mm)
+
+            if Wc.shape[0] >= off + d and Wc.shape[0] in (3 * d, off + d, Wc.shape[0]):
+                view = Wc.narrow(0, off, d)
+                view.addmm_(uc, dc, beta=1.0, alpha=alpha_mm)
+            elif Wc.shape[1] >= off + d and Wc.shape[1] in (3 * d, off + d, Wc.shape[1]):
+                view = Wc.narrow(1, off, d)
+                view.addmm_(uc, dc, beta=1.0, alpha=alpha_mm)
+            else:
+                return None
 
     if compute_dtype != orig_dtype:
         Wc = Wc.to(orig_dtype)
 
-    theta_0[target_key] = Wc
-    return True
+    return Wc
+
 
 
 def load_state_dict(path: str, dtype=torch.float, device="cpu", depatch=True):
@@ -428,6 +542,10 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
     isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
+    
+    zi_index = None
+    if iszi:
+        zi_index = _build_zi_layer_index(theta_0)
 
     blocks  = LBLOCKS_ZI if iszi else (LBLOCKS_FLUX if isflux else (LBLOCKS_SDXL if isxl else LBLOCKS26))
     blocksN = _normalize_blocks(blocks)
@@ -456,7 +574,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
 
         # --- apply plan build ---
         plan = []  # (kind, target_key, part, down_k, up_k, alpha_k, ratio)
-        for down_k in tqdm(list(_iter_lora_down_keys(lsd)), desc=f"Planning {lora_model}...", leave=False):
+        for down_k in tqdm(list(_iter_lora_down_keys(lsd)), desc=f"Planning {lora_model}..."):
             d, u, a = _pair_from_down_key(down_k)
             if d is None:
                 continue
@@ -464,7 +582,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                 continue
             
             if iszi:
-                target_key, part = zimage_resolve_target(d)
+                target_key, part = zimage_resolve_target_any(d, zi_index)
                 if target_key is None:
                     continue
                 full = convert_diffusers_name_to_compvis_cached(d, lisv2)
@@ -504,12 +622,18 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
             sc = float(alpha) / float(dim)
 
             if kind == "zi":
-                apply_zimage_lora(
-                    theta_0, target_key, part,
+                W = theta_0.get(target_key)
+                if not isinstance(W, torch.Tensor):
+                    continue
+
+                out = apply_zimage_lora_to_weight(
+                    W, part=part,
                     up=up, down=down,
                     alpha=alpha,
-                    ratio=ratio
+                    ratio=ratio,
                 )
+                if out is not None:
+                    theta_0[target_key] = out
                 continue
 
             W = theta_0[target_key]
@@ -520,7 +644,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
             d = down.to(device=dev, dtype=dt, non_blocking=False)
 
             theta_0[target_key] = apply_lora_to_weight_inplace(W, u, d, sc, ratio)
-
+            
         del lsd
         
     prepare_state_dict_for_save(
@@ -576,8 +700,14 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
     isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
+    
+    zi_index = None
+    if iszi:
+        zi_index = _build_zi_layer_index(theta_0)
+
     blocks  = LBLOCKS_ZI if iszi else (LBLOCKS_FLUX if isflux else (LBLOCKS_SDXL if isxl else LBLOCKS26))
     blocknum = BLOCKIDZI if iszi else (BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else BLOCKID))
+    blocksN = _normalize_blocks(blocks)
     vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
 
     keymap = _build_keymap(theta_0)
@@ -608,7 +738,21 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
         lw = merge_weights_inplace(lsd, lisv2, isxl, blocks, p, lam, scale, ratios)
 
         for kind, down_k, up_k, alpha_k, tgt, part in tqdm(plan, desc=f"Applying {lora_model}...", leave=False):
-            if (down_k not in lw) or (up_k not in lw):
+            d, u, a = _pair_from_down_key(down_k)
+            if d is None:
+                continue
+            if (u not in lsd) or (d not in lsd):
+                continue
+            
+            if iszi:
+                target_key, part = zimage_resolve_target_any(d, zi_index)
+                if target_key is None:
+                    continue
+                full = convert_diffusers_name_to_compvis_cached(d, lisv2)
+                msd  = full.split(".", 1)[0]
+                bi   = _find_block_index(full, msd, blocksN)
+                ratio = ratios[bi] if bi < len(ratios) else ratios[0]
+                plan.append(("zi", target_key, part, d, u, a, float(ratio)))
                 continue
 
             # alpha / scale
@@ -619,12 +763,18 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
             sc = float(alpha) / float(dim)
 
             if kind == "zi":
-                apply_zimage_lora(
-                    theta_0, tgt, part,
+                W = theta_0.get(target_key)
+                if not isinstance(W, torch.Tensor):
+                    continue
+
+                out = apply_zimage_lora_to_weight(
+                    W, part=part,
                     up=up, down=down,
                     alpha=alpha,
-                    ratio=1.0,
+                    ratio=ratio,
                 )
+                if out is not None:
+                    theta_0[target_key] = out
                 continue
 
             if tgt not in theta_0:

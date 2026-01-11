@@ -14,11 +14,11 @@ from collections import OrderedDict
 from Utils import wgt, rand_ratio, sha256, read_metadata_from_safetensors \
     , load_model, parse_ratio, qdtyper, maybe_to_qdtype, diff_inplace \
     , fineman, weighttoxl, BLOCKID, BLOCKIDFLUX, BLOCKIDXLL, BLOCKIDZI \
-    , blockfromkey, checkpoint_dict_skip_on_merge, elementals \
+    , blockfromkey, checkpoint_dict_skip_on_merge, elementals, _is_small_or_norm_or_bias \
     , to_half, cache, set_cache_filename, base_path, merge_cache_json, detect_arch \
     , _swap_components_inplace, _normalize_components_list, _finetune_inplace \
     , _clip_tier_for_xl, _clip_tier_for_flux, _clip_tier_for_zi, _clipxor_semi_hard_blend \
-    , _collect_clipxor_targets, _collect_clip_pairs_by_suffix \
+    , _collect_clipxor_targets, _collect_clip_pairs_by_suffix, turbo_convert_inplace \
     , trim_delta, normalize_path, prune_extras_vs_model1, unet_permutation_spec \
     , weight_matching, apply_permutation, upcast_fp8_state_dict, _parse_components_with_only \
     , _common_dtype, _filter_state_dict_by_components, prepare_state_dict_for_save
@@ -38,6 +38,7 @@ def sigmoid(theta0, theta1, alpha):
     return (s1 * (theta0 + theta1) - s0 * theta0)
 
 def weighted_sum(theta0, theta1, alpha):
+    if theta1.dtype != theta0.dtype: theta1 = theta1.to(theta0.dtype)
     return torch.lerp(theta0, theta1, float(alpha))
 
 @torch.inference_mode()
@@ -172,23 +173,44 @@ def similarity_add_difference(a, b, c, alpha, beta):
     out = _match_mean_std_like_a(out, a)
     return out.to(dtype=a_orig_dtype)
 
+def _rand_like_compat(ref: torch.Tensor, *, dtype=torch.float32, generator=None) -> torch.Tensor:
+    if generator is None:
+        return torch.rand(ref.shape, device=ref.device, dtype=dtype)
+    return torch.rand(ref.shape, device=ref.device, dtype=dtype, generator=generator)
+
 def dare_merge(theta0, theta1, alpha, beta, generator=None):
+    # match the shapes by padding with zeros
     if theta0.dim() in (1, 2):
-        dw = theta1.shape[-1] - theta0.shape[-1]
-        if dw > 0:
-            theta0 = F.pad(theta0, (0, dw, 0, 0))
-        elif dw < 0: 
-            theta1 = F.pad(theta1, (0, -dw, 0, 0))
-        dh = theta1.shape[0] - theta0.shape[0]
-        if dh > 0:
-            theta0 = F.pad(theta0, (0, 0, 0, dh))
-        elif dh < 0:
-            theta1 = F.pad(theta1, (0, 0, 0, -dh))
+        if theta0.dim() == 1:
+            d = theta1.shape[0] - theta0.shape[0]
+            if d > 0:
+                theta0 = F.pad(theta0, (0, d))
+            elif d < 0:
+                theta1 = F.pad(theta1, (0, -d))
+        else:  # dim == 2
+            dw = theta1.shape[-1] - theta0.shape[-1]
+            if dw > 0:
+                theta0 = F.pad(theta0, (0, dw, 0, 0))
+            elif dw < 0:
+                theta1 = F.pad(theta1, (0, -dw, 0, 0))
+
+            dh = theta1.shape[0] - theta0.shape[0]
+            if dh > 0:
+                theta0 = F.pad(theta0, (0, 0, 0, dh))
+            elif dh < 0:
+                theta1 = F.pad(theta1, (0, 0, 0, -dh))
+
+    a = float(alpha)
+    b = float(beta)
+    denom = max(1.0 - b, 1e-6)
+
     delta = theta1 - theta0
-    m = (torch.rand_like(delta, dtype=torch.float32, generator=generator) < float(beta)).to(delta.dtype)
-    denom = max(1.0 - float(beta), 1e-6)
-    delta_hat = (m * delta) / denom
-    return theta0 + float(alpha) * delta_hat.to(theta0.dtype)
+
+    mask = _rand_like_compat(delta, dtype=torch.float32, generator=generator) < b
+    scaled = (delta / denom)
+    scaled = scaled * mask.to(delta.dtype)
+    
+    return torch.add(theta0, scaled.to(theta0.dtype), alpha=a)
 
 def feature_weighted_merge(a, b, alpha=0.3, eps=1e-6):
     if a.shape != b.shape or alpha == 0.0:
@@ -352,6 +374,8 @@ for flag, helpmsg in {
     "no_metadata":      "Save without metadata",
     "prune":            "Prune Model",
     "force":            "Overwrite output if exists",
+    "turbo":            "Apply delta (model_1 turbo, model_2 base) to model_0",
+    "deturbo":          "Remove turbo delta (model_1 turbo, model_2 base) from model_0",
 }.items():
     parser.add_argument(f"--{flag}", action="store_true", help=helpmsg, required=False)
 
@@ -371,6 +395,12 @@ if args.save_quarter and args.save_half:
     print("[warn] --save_half and --save_quarter are both set; prioritizing --save_quarter (fp8).")
     args.save_half = False
 
+if args.turbo and args.deturbo:
+    raise SystemExit("--turbo and --deturbo cannot be used together")
+turbo_convert = bool(args.turbo or args.deturbo)
+if turbo_convert and (args.model_1 is None or args.model_2 is None):
+    raise SystemExit("--turbo/--deturbo require model_1 and --model_2 (B=turbo, C=base)")
+
 device = args.device
 mode = args.mode
 if mode in modes_need_m2 and (args.model_2 is None):
@@ -378,7 +408,7 @@ if mode in modes_need_m2 and (args.model_2 is None):
 theta_func1, theta_func2, merge_name = theta_funcs[mode]
 bake_vae_enabled = (args.vae is not None)
 
-if mode not in ["SWAP", "CLIPXOR", "COMP"]:
+if mode not in ["SWAP", "CLIPXOR", "COMP"] and not turbo_convert:
     args.alpha, deep_a, block_a = wgt(args.alpha, [])
     args.beta,  deep_b, block_b = wgt(args.beta, [])
     useblocks = block_a or block_b
@@ -673,17 +703,6 @@ if mode == "DARE":
         return dare_merge(a, b, cur_a, cur_b, generator=g)
 
     theta_func2 = theta_func2_dare
-
-def _is_small_or_norm_or_bias(key, tens):
-    n = tens.numel()
-    if n < 128:
-        return True
-    k = key.lower()
-    if (k.endswith(".bias") or ".bias" in k or "norm" in k or "ln" in k or "bn" in k):
-        return True
-    if "emb" in k or "pos" in k:
-        return True
-    return False
 
 
 # -----------------------------------------------------------------------------
@@ -1039,6 +1058,43 @@ if cosine_sel is not None:
     alpha = beta = None
     deep_a = deep_b = []
 
+if turbo_convert:
+    # ensure refs are loaded
+    # B = model_1 (turbo), C = model_2 (base)
+    # if deturbo, sign = -1 else +1
+
+    # (load theta_1, theta_2 as usual; make sure you DO load both)
+    # (optional) arch check: detect_arch(theta_1/theta_2) matches A
+
+    # parse alpha/weights like usual (default alpha=1.0 recommended for full convert)
+    if str(args.alpha).strip() in {"", "0", "0.0"}:
+        args.alpha = 1.0
+
+    args.alpha, deep_a, block_a = wgt(args.alpha, [])
+    weights_a, alpha, alpha_info = parse_ratio(args.alpha, "", deep_a)
+
+    blockids = BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else (BLOCKIDZI if iszi else BLOCKID))
+    _TAG2IDX = {t: i for i, t in enumerate(blockids)}
+
+    vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
+    resolver = make_param_resolver(alpha, None, weights_a, None, deep_a, [], blockids, usebeta=False)
+
+    do_fine = bool('fine' in locals() and fine)
+    theta_0 = turbo_convert_inplace(
+        theta_0, theta_1, theta_2, resolver,
+        deturbo=bool(args.deturbo),
+        vae_key=vae_key,
+        bake_vae_enabled=bake_vae_enabled,
+        fine=(fine if do_fine else None),
+    )
+
+    # stop normal merge path
+    mode = "NoIn"
+    theta_1 = theta_2 = None
+    usebeta = False
+    weights_a = weights_b = None
+    alpha = beta = None
+    deep_a = deep_b = []
 
 @torch.inference_mode()
 def build_merge_keys(theta_0, theta_1, theta_2, merge_cache, mode, usebeta, vae_key, bake_vae_enabled):
@@ -1102,7 +1158,8 @@ if mode not in ["NoIn", "TF"]:
         cache_skip = checkpoint_dict_skip_on_merge
         func = theta_func2
         do_fine = bool('fine' in locals() and fine)
-        for key in tqdm(theta_0.keys(), desc=f"{merge_name} Merging...", total=len(theta_0)):
+        key_list = list(theta_0.keys())
+        for key in tqdm(key_list, desc=f"{merge_name} Merging...", total=len(theta_0)):
             if (not bake_vae_enabled) and (vae_key in key):
                 continue
             if key in cache_skip:
