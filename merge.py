@@ -13,15 +13,15 @@ from collections import OrderedDict
 
 from Utils import wgt, rand_ratio, sha256, read_metadata_from_safetensors \
     , load_model, parse_ratio, qdtyper, maybe_to_qdtype, diff_inplace \
-    , fineman, weighttoxl, BLOCKID, BLOCKIDFLUX, BLOCKIDXLL, BLOCKIDZI \
-    , blockfromkey, checkpoint_dict_skip_on_merge, elementals, _is_small_or_norm_or_bias \
+    , fineman, weighttoxl, BLOCKID, BLOCKIDFLUX, BLOCKIDXLL, BLOCKIDZI, BLOCKIDAM \
+    , blockfromkey, checkpoint_dict_skip_on_merge, elementals2, extra_tag_for_key, _is_small_or_norm_or_bias \
     , to_half, cache, set_cache_filename, base_path, merge_cache_json, detect_arch \
     , _swap_components_inplace, _normalize_components_list, _finetune_inplace \
     , _clip_tier_for_xl, _clip_tier_for_flux, _clip_tier_for_zi, _clipxor_semi_hard_blend \
     , _collect_clipxor_targets, _collect_clip_pairs_by_suffix, turbo_convert_inplace \
     , trim_delta, normalize_path, prune_extras_vs_model1, unet_permutation_spec \
     , weight_matching, apply_permutation, upcast_fp8_state_dict, _parse_components_with_only \
-    , _common_dtype, _filter_state_dict_by_components, prepare_state_dict_for_save
+    , _common_dtype, _filter_state_dict_by_components, prepare_state_dict_for_save, apply_vae_saturation_inplace, normalize_external_text_encoder
 
 # Mode Functions
 
@@ -253,14 +253,29 @@ def ortho_merge(a, b, alpha):
     return (a + alpha * d_ortho.to(a.dtype)).to(a.dtype)
 
 def sparse_topk(a, b, alpha, beta):
-    d = (b.detach().float() - a.detach().float()).abs().view(-1)
-    if d.numel() == 0:
-        return a
-    k = max(int(d.numel() * float(beta)), 1)
-    thresh = d.kthvalue(d.numel() - k).values
+    # alpha: mix strength
+    # beta : fraction of elements to take (Top-k)
     diff = (b - a)
-    mask = diff.detach().float().abs().ge_(thresh)
-    return (a + float(alpha) * diff * mask.to(a.dtype)).to(a.dtype)
+    d = diff.detach().float().abs().view(-1)
+    n = d.numel()
+    if n == 0:
+        return a
+
+    # k = number of elements to replace
+    k = int(n * float(beta))
+    if k <= 0:
+        return a
+    if k >= n:
+        # replace all (alpha controls full replace)
+        return (a + float(alpha) * diff).to(a.dtype)
+
+    # kthvalue is 1-indexed: threshold for top-k largest == (n-k+1)-th smallest
+    kth = n - k + 1
+    thresh = d.kthvalue(kth).values
+
+    mask = d.view_as(diff).ge_(thresh).to(diff.dtype)
+    out = a + float(alpha) * diff * mask
+    return out.to(a.dtype)
 
 def norm_dir_blend(a, b, alpha):
     a32 = a.detach().float().view(-1); b32 = b.detach().float().view(-1)
@@ -271,42 +286,53 @@ def norm_dir_blend(a, b, alpha):
     out = (du * mag).view_as(a)
     return out.to(a.dtype)
 
-def channel_cosine_gate(a, b, alpha, beta):
+def channel_cosine_gate(a, b, alpha, beta, eps=1e-12):
     if a.dim() == 4:
-        axis = (1,2,3)
+        axis = (1, 2, 3)   # per-out-channel
     elif a.dim() == 2:
-        axis = (1,)
+        axis = (1,)        # per-out-feature
     else:
-        return (1 - alpha) * a + alpha * b
+        return (1 - float(alpha)) * a + float(alpha) * b
 
     a32 = a.detach().float()
     b32 = b.detach().float()
+
     num = (a32 * b32).sum(dim=axis)
-    den = (a32.norm(dim=axis) * b32.norm(dim=axis) + 1e-12)
-    cos = (num / den).clamp_(-1, 1)
-    g = (1 - cos) * float(beta)
+    den = (
+        torch.linalg.vector_norm(a32, ord=2, dim=axis) *
+        torch.linalg.vector_norm(b32, ord=2, dim=axis) + eps
+    )
+
+    cos = (num / den).clamp_(-1.0, 1.0)
+
+    g = ((1.0 - cos) * float(beta)).clamp_(0.0, 1.0)
     while g.dim() < a.dim():
         g = g.unsqueeze(-1)
-    mix = (1 - alpha) * a + alpha * b
-    return (a * (1 - g) + mix * g).to(a.dtype)
+
+    mix = (1.0 - float(alpha)) * a + float(alpha) * b
+    return (a * (1.0 - g) + mix * g).to(a.dtype)
 
 def freq_band_blend(a, b, alpha, beta):
     if a.dim() != 4 or a.shape[-1] < 3 or a.shape[-2] < 3:
         return (1 - alpha) * a + alpha * b
+
     a32 = a.detach().float(); b32 = b.detach().float()
     A = torch.fft.rfft2(a32, norm="ortho")
     B = torch.fft.rfft2(b32, norm="ortho")
+
     H, W = a32.shape[-2], a32.shape[-1]
     cut = max(int(min(H, W) * float(beta)), 1)
+
     yy = torch.arange(A.shape[-2], device=a.device).view(-1,1).float()
     xx = torch.arange(A.shape[-1], device=a.device).view(1,-1).float()
     cy = (A.shape[-2]-1)/2; cx = (A.shape[-1]-1)/2
     dist = torch.sqrt((yy-cy)**2 + (xx-cx)**2)
-    low = (dist <= cut).to(A.dtype)
+
+    low  = (dist <= cut).to(A.dtype)
     high = 1 - low
-    Aout = low * ((1 - alpha) * A + alpha * A) + high * ((1 - alpha) * A + alpha * B)
-    Bout = low * ((1 - alpha) * B + alpha * A) + high * ((1 - alpha) * B + alpha * B)
-    F = low * Aout + high * Bout
+
+    F = low * A + high * ((1 - float(alpha)) * A + float(alpha) * B)
+
     out = torch.fft.irfft2(F, s=(H, W), norm="ortho")
     return out.to(a.dtype)
 
@@ -349,7 +375,7 @@ parser.add_argument("mode",         choices=list(theta_funcs.keys()),   help="Me
 parser.add_argument("model_path",   type=str,                           help="Path to models")
 parser.add_argument("model_0",      type=str,                           help="Name of model 0")
 parser.add_argument("model_1",      type=str,                nargs="?", help="Optional, Name of model 1", default=None)
-parser.add_argument(f"--model_2",   type=str,                           help="Optional, Name of model 2", default=None, required=False)
+parser.add_argument("model_2",      type=str,                nargs="?", help="Optional, Name of model 2", default=None)
 
 for i in range(3):
     parser.add_argument(f"--m{i}_name", type=str, help=f"Custom name of model {i}", default=None, required=False)
@@ -386,6 +412,35 @@ parser.add_argument("--memo",   type=str,   help="Additional info bake in metada
 parser.add_argument("--fine",   type=str,   help="Finetune the given keys on model 0", default=None, required=False)
 parser.add_argument("--output",             help="Output file name without extension", default="merged", required=False)
 parser.add_argument("--device", type=str,   help="Device to use, defaults to cpu", default="cpu", required=False)
+parser.add_argument("--cfg_sens", type=float, default=1.0,
+    help="(SDXL) Post-scale UNet cross-attention (attn2) projections to make CFG more sensitive. 1.0=off. सुझ: 1.05-1.15")
+
+parser.add_argument("--cfg_sens_targets", type=str, default="kv,out",
+    help="Which attn2 projections to scale: q,k,v,out,kv,qkv,all. Default: kv,out")
+
+parser.add_argument("--sat_boost", type=float, default=1.0,
+    help="(SDXL) Multiply merge strength for saturation-related layers. 1.0=off. Use 2.0 to double.")
+
+parser.add_argument("--sat_boost_side", choices=["alpha", "beta", "both"], default="alpha",
+    help="Apply sat_boost to alpha/beta/both. Default: alpha")
+
+parser.add_argument("--sat_boost_tags", type=str, default=None,
+    help="Comma-separated XL block tags to treat as saturation-related (e.g. IN00,IN01,IN02,IN03,M00). If omitted, heuristic is used.")
+
+parser.add_argument("--sat_profile", choices=["legacy", "safe_attn2_out"], default="legacy",
+    help="How sat_boost is applied. legacy=old behavior. safe_attn2_out=only OUT-block attn2.to_v/to_out + capped delta.")
+
+parser.add_argument("--sat_delta_cap_pct", type=float, default=0.0,
+    help="Cap the per-tensor delta magnitude by percentile (e.g. 99.5). 0=off. Helps prevent geometry break.")
+
+parser.add_argument("--sat_boost_mix", type=float, default=1.0,
+    help="Blend between normal and boosted result on sat targets. 1.0=fully boosted, 0.0=no effect. Suggest 0.3-0.8.")
+
+parser.add_argument("--boost_clamp", choices=["auto", "clamp01", "none"], default="auto",
+    help="Clamp boosted strengths for unstable modes. auto clamps for WS/TRS/ST/TS/DARE/CHAN/FREQ/SPRSE/MD/SIM etc.")
+
+parser.add_argument("--vae_sat", type=float, default=1.0,
+    help="Apply RGB saturation scaling inside VAE output (decoder.conv_out). 1.0=off. >1 more saturation, <1 less.")
 
 args = parser.parse_args()
 if args.mode not in {"NoIn", "RM", "SWAP", "CLIPXOR", "COMP"} and args.model_1 is None:
@@ -485,7 +540,7 @@ print(f"Loading {model_0_name}...")
 theta_0, model_0_sha256, model_0_hash, model_0_meta, cache_data = load_model(model_0_path, device, cache_data=cache_data)
 qd0 = qdtyper(theta_0)
 
-isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
+arch, theta_0 = detect_arch(theta_0)
 theta_0 = upcast_fp8_state_dict(theta_0)
 
 theta_1 = theta_2 = None
@@ -499,9 +554,12 @@ if mode not in ["NoIn", "COMP"]:
     theta_1, model_1_sha256, model_1_hash, model_1_meta, cache_data = load_model(model_1_path, device, cache_data=cache_data)
     qd1 = qdtyper(theta_1)
     theta_1 = upcast_fp8_state_dict(theta_1)
-    _, _, _, theta_1 = detect_arch(theta_1)
-    if args.fine and not iszi:
-        fine = fineman([float(t) for t in args.fine.split(",")], isxl, isflux)
+    if mode == "SWAP":
+        theta_1 = normalize_external_text_encoder(theta_1, arch)
+    else:
+        _, theta_1 = detect_arch(theta_1)
+    if args.fine and not arch.get("ZI", False):
+        fine = fineman([float(t) for t in args.fine.split(",")], arch)
     else:
         fine = ""
         
@@ -514,7 +572,7 @@ if mode not in ["NoIn", "COMP"]:
         moved, created, skipped, theta_0 = _swap_components_inplace(
             theta_0, theta_1,
             components,
-            isxl=isxl, isflux=isflux, iszi=iszi,
+            arch,
             src_only=only,
         )
         print(f"[SWAP] components={sorted(list(components))} only={sorted(list(only))}  moved:{moved}  created:{created}  shape_skipped:{skipped}")
@@ -535,17 +593,17 @@ if mode not in ["NoIn", "COMP"]:
         hard_clip = base_hardness
 
         # local arch flags for both models (avoid clobbering outer isxl/isflux/iszi)
-        isxl_a, isflux_a, iszi_a, _ = detect_arch(theta_0)
-        isxl_b, isflux_b, iszi_b, _ = detect_arch(theta_1)
+        arch_a = detect_arch(theta_0)[0]
+        arch_b = detect_arch(theta_1)[0]
 
-        targets = _collect_clipxor_targets(theta_0, theta_1, isxl=isxl_a, isflux=isflux_a, iszi=iszi_a)
+        targets = _collect_clipxor_targets(theta_0, theta_1, arch=arch_a)
 
         suffix_pairs = []
         if not targets:
             suffix_pairs = _collect_clip_pairs_by_suffix(
                 theta_0, theta_1,
-                isxl_a, isflux_a, iszi_a,
-                isxl_b, isflux_b, iszi_b
+                arch_a,
+                arch_b
             )
             targets = [ka for (_, ka, _) in suffix_pairs]
 
@@ -556,11 +614,11 @@ if mode not in ["NoIn", "COMP"]:
             suffix_to_kb = {ka: kb for (suf, ka, kb) in suffix_pairs} if suffix_pairs else {}
 
             # cache tier resolver for speed
-            if isxl_a or isxl_b:
+            if arch_a.get("XL", False) or arch_b.get("XL", False):
                 tier_fn = _clip_tier_for_xl
-            elif isflux_a or isflux_b:
+            elif arch_a.get("FLUX", False) or arch_b.get("FLUX", False):
                 tier_fn = _clip_tier_for_flux
-            elif iszi_a or iszi_b:
+            elif arch_a.get("ZI", False) or arch_b.get("ZI", False):
                 tier_fn = _clip_tier_for_zi
             else:
                 tier_fn = None
@@ -603,7 +661,7 @@ if mode not in ["NoIn", "COMP"]:
                     keep_stats=True
                 )
                 if do_fine:
-                    M_semi = _finetune_inplace(key_a, M_semi, fine)
+                    M_semi = _finetune_inplace(key_a, M_semi, fine, arch=arch)
 
                 # in-place writeback (no extra dict)
                 theta_0[key_a] = M_semi
@@ -628,7 +686,7 @@ if mode not in ["NoIn", "COMP"]:
             print(f"Loading {model_2_name}...")
             theta_2, model_2_sha256, model_2_hash, model_2_meta, cache_data = load_model(model_2_path, device, cache_data=cache_data)
             qd2 = qdtyper(theta_2)
-            _,_,_, theta_2 = detect_arch(theta_2)
+            _, theta_2 = detect_arch(theta_2)
             theta_2 = upcast_fp8_state_dict(theta_2)
 
         usebeta = mode in modes_need_beta
@@ -637,11 +695,11 @@ if mode not in ["NoIn", "COMP"]:
         else:
             weights_b, beta = None, None
         if args.rebasin is not None:
-            if isflux or iszi:
+            if arch.get("FLUX") or arch.get("ZI") or arch.get("AM"):
                 print("[ReBasin] Unavailable architecture detected, skipping ReBasin (not supported).")
             else:
                 print(f"[ReBasin] Running weight matching (Hungarian)... iter={args.rebasin}")
-                ps = unet_permutation_spec(isxl)
+                ps = unet_permutation_spec(arch.get("XL", False))
                 perm_01, gain_01 = weight_matching(
                     ps,
                     params_a=theta_0,
@@ -676,16 +734,16 @@ else:
             comp_components = {"unet", "vae", "clip-l", "clip-g", "clip", "transformer", "text", "text2"}
 
         before = len(theta_0)
-        theta_0, kept, total = _filter_state_dict_by_components(theta_0, comp_components, isxl, isflux, iszi)
+        theta_0, kept, total = _filter_state_dict_by_components(theta_0, comp_components, arch)
         print(f"[COMP] components={sorted(list(comp_components))}  kept:{kept} / {before}")
 
         mode = "NoIn"
         theta_1 = None
         deep_a = deep_b = []
-    usebeta = False
+    usebeta = False 
     weights_a = weights_b = None
     alpha = beta = None
-    isxl, isflux, iszi = False, False, False
+    arch = {t: False for t in arch.keys()}
 
 if args.vae:
     if args.mode == "COMP" and comp_components is not None and ("vae" not in comp_components):
@@ -735,22 +793,34 @@ def _cosine_keys_intersection(base: dict, other: dict, vae_key: str, bake_vae_en
 
 
 @torch.inference_mode()
-def _cosine_combined_similarity_tensor(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def _cosine_combined_similarity_tensor(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     a32 = a.detach().to(torch.float32)
     b32 = b.detach().to(torch.float32)
 
-    a_n = F.normalize(a32, p=2, dim=0)
-    b_n = F.normalize(b32, p=2, dim=0)
+    # conv weight: [out, in, kh, kw] -> gate per out channel
+    if a32.dim() == 4:
+        a2 = a32.view(a32.shape[0], -1)
+        b2 = b32.view(b32.shape[0], -1)
+        cos = F.cosine_similarity(a2, b2, dim=1, eps=eps)  # [out]
+        g = ((cos + 1.0) * 0.5).clamp_(0.0, 1.0).view(-1, 1, 1, 1)
+        return g
 
-    simab = F.cosine_similarity(a_n, b_n, dim=0)
-    simab = torch.nan_to_num(simab, nan=0.0, posinf=1.0, neginf=-1.0)
+    # linear: [out, in] -> gate per out channel
+    if a32.dim() == 2:
+        a2 = a32.view(a32.shape[0], -1)
+        b2 = b32.view(b32.shape[0], -1)
+        cos = F.cosine_similarity(a2, b2, dim=1, eps=eps)  # [out]
+        g = ((cos + 1.0) * 0.5).clamp_(0.0, 1.0).view(-1, 1)
+        return g
 
-    dot = torch.dot(a_n.reshape(-1), b_n.reshape(-1))
-    denom = (a_n.norm() * b_n.norm()).clamp_min(1e-12)
-    mag = (dot / denom).clamp(-1.0, 1.0)
-
-    combined = 0.5 * (simab + mag)
-    return combined
+    # 1D or other: scalar gate
+    av = a32.reshape(1, -1)
+    bv = b32.reshape(1, -1)
+    cos = F.cosine_similarity(av, bv, dim=1, eps=eps).squeeze(0)  # scalar
+    g = ((cos + 1.0) * 0.5).clamp_(0.0, 1.0)
+    while g.dim() < a.dim():
+        g = g.unsqueeze(-1)
+    return g
 
 def _cosine_trimmed_minmax(samples_np: np.ndarray):
     samples_np = samples_np[np.isfinite(samples_np)]
@@ -789,25 +859,37 @@ def _cosine_pair_stats(base: dict, other: dict, keys: list, sample_per_key: int 
     return _cosine_trimmed_minmax(all_s)
 
 @torch.inference_mode()
-def _cosine_blend_tensor(a: torch.Tensor, b: torch.Tensor, strength: float, sims_min: float, sims_max: float):
-    cs = _cosine_combined_similarity_tensor(a, b)
-    k = (cs - sims_min) / (sims_max - sims_min)
-    k = torch.nan_to_num(k, nan=0.0, posinf=1.0, neginf=0.0)
+def _cosine_blend_tensor(a: torch.Tensor, b: torch.Tensor, strength: float, keep_stats: bool = True):
+    # g: 似てるほど1、似てないほど0
+    g = _cosine_combined_similarity_tensor(a, b)
 
-    k = (k - abs(float(strength))).clamp(0.0, 1.0)
+    # alphaは「混合量」として素直に効かせる（thresholdにしない）
+    mix = (abs(float(strength)) * g).clamp_(0.0, 1.0)
 
-    out = torch.lerp(b.to(torch.float32), a.to(torch.float32), k).to(a.dtype)
-    return out
+    out32 = torch.lerp(a.to(torch.float32), b.to(torch.float32), mix)
+
+    # 色/トーンの事故を減らす（特にproj/ff等で有効）
+    if keep_stats:
+        out32 = _match_mean_std_like_a(out32, a)
+
+    return out32.to(a.dtype)
 
 def _strength_getter(alpha, weights, deep, blockids_local):
     def get(k: str) -> float:
         wi = _resolve_weight_index(k)
+
+        # base strength
         cur = float(alpha) if alpha is not None else 0.0
         if (weights is not None) and wi > 0:
             cur = float(weights[wi - 1])
+
+        # deep override (supports CLIP/LABEL/TIME/OUT)
         if deep:
-            cur = float(elementals(k, wi, deep, cur, blockids_local))
-        return cur
+            cur = elementals2(
+                k, wi, deep, float(cur),
+                blockids=blockids_local, arch=arch
+            )
+        return float(cur)
     return get
 
 @torch.inference_mode()
@@ -819,23 +901,23 @@ def _cosine_merge_pair_inplace(
     bake_vae_enabled: bool,
     sample_per_key: int = 32,
     fine=None,
+    arch=None,
 ):
     keys = _cosine_keys_intersection(base, other, vae_key=vae_key, bake_vae_enabled=bake_vae_enabled)
     if not keys:
         return base
 
-    sims_min, sims_max = _cosine_pair_stats(base, other, keys, sample_per_key=sample_per_key)
-
     for k in tqdm(keys, desc="Cosine Stage 1/2 (apply)"):
         cur = float(strength_getter(k))
-        
+
         if _is_small_or_norm_or_bias(k, base[k]):
-            out = weighted_sum(base[k], other[k], cur)
+            cur_eff = cur * 0.25
+            out = weighted_sum(base[k], other[k], cur_eff)
         else:
-            out = _cosine_blend_tensor(base[k], other[k], cur, sims_min, sims_max)
+            out = _cosine_blend_tensor(base[k], other[k], cur, keep_stats=True)
 
         if fine:
-            out = _finetune_inplace(k, out, fine)
+            out = _finetune_inplace(k, out, fine, arch=arch)
         base[k] = out
 
     skip = set(checkpoint_dict_skip_on_merge)
@@ -909,12 +991,12 @@ def cosine_minmax_grouped(base_dict, other_dict, desc, variant=0, lo=10.0, hi=90
     return stats, (0.0, 1.0)
 
 if theta_func1:
-    if isflux:
+    if arch.get("FLUX", False):
         theta_1, theta_2 = maybe_to_qdtype(theta_1, theta_2, qd1, qd2, device)
     diff_inplace(theta_1, theta_2, theta_func1, "Getting Difference of Model 1 and 2")
     del theta_2
 
-if isflux:
+if arch.get("FLUX", False):
     theta_0, theta_1 = maybe_to_qdtype(theta_0, theta_1, qd0, qd1, device)
     if 'theta_2' in locals() and theta_2 is not None:
         theta_0, theta_2 = maybe_to_qdtype(theta_0, theta_2, qd0, qd2, device)
@@ -947,23 +1029,34 @@ def resolve_cosine_triplet(theta_0, theta_1, theta_2, use_cos0, use_cos1, use_co
     return base, dA, dB, varA, varB
 
 ZI_WLEN = len(BLOCKIDZI) - 1  # 33
+AM_WLEN = len(BLOCKIDAM) - 1  # 29
 
-def _fit_weights_for_zi(w):
+def _fit_weights_to_len(w, target_len: int):
     if w is None:
         return None
     w = list(w)
-    if len(w) == 25:
-        x0 = np.arange(25)
-        x1 = np.linspace(0, 24, ZI_WLEN)
+    if not w:
+        return [0.0] * target_len
+
+    if len(w) != target_len:
+        x0 = np.arange(len(w))
+        x1 = np.linspace(0, len(w) - 1, target_len)
         w = np.interp(x1, x0, np.asarray(w, dtype=np.float64)).tolist()
-    if len(w) > ZI_WLEN:
-        w = w[:ZI_WLEN]
-    elif len(w) < ZI_WLEN:
-        w += [w[-1]] * (ZI_WLEN - len(w))
+
+    if len(w) > target_len:
+        w = w[:target_len]
+    elif len(w) < target_len:
+        w += [w[-1]] * (target_len - len(w))
     return w
 
+def _fit_weights_for_am(w):
+    return _fit_weights_to_len(w, AM_WLEN)
+
+def _fit_weights_for_zi(w):
+    return _fit_weights_to_len(w, ZI_WLEN)
+
 if mode not in ["NoIn", "TF"]:
-    if isxl and useblocks:
+    if arch.get("XL", False) and useblocks:
         print("Detected XL architecture.")
         if len(weights_a) == 25:
             weights_a = weighttoxl(weights_a)
@@ -976,15 +1069,19 @@ if mode not in ["NoIn", "TF"]:
                 print(f"beta weight converted for XL{weights_b}")
             elif len(weights_b) == 19:
                 weights_b += [0]
-    elif iszi and useblocks:
+    elif arch.get("ZI", False) and useblocks:
         print("Detected Zimage architecture.")
         weights_a = _fit_weights_for_zi(weights_a)
         weights_b = _fit_weights_for_zi(weights_b) if weights_b is not None else None
         # print(f"alpha weights for ZI: {weights_a}")
         # print(f"beta weights for ZI: {weights_b}")
+    elif arch.get("AM", False) and useblocks:
+        print("Detected Anima (AM) architecture.")
+        weights_a = _fit_weights_for_am(weights_a)
+        weights_b = _fit_weights_for_am(weights_b) if weights_b is not None else None
         
 def _resolve_weight_index(key: str) -> int:
-    block, tag = blockfromkey(key, isxl, isflux, iszi)
+    block, tag = blockfromkey(key, arch=arch)
     if block == "Not Merge":
         return -1
     return _TAG2IDX.get(tag, -1)
@@ -992,14 +1089,21 @@ def _resolve_weight_index(key: str) -> int:
 def make_param_resolver(alpha, beta, weights_a, weights_b, deep_a, deep_b, blockids, usebeta: bool):
     def get(key: str):
         wi = _resolve_weight_index(key)
+
+        # allow pseudo-tag keys even when _blockfromkey_cached returns Not Merge
         if wi < 0:
-            return None
+            tag = extra_tag_for_key(key, arch=arch)
+            if tag is None:
+                return None
 
         cur_a = alpha
         if weights_a is not None and wi > 0:
             cur_a = weights_a[wi - 1]
         if deep_a:
-            cur_a = elementals(key, wi, deep_a, cur_a, blockids)
+            cur_a = elementals2(
+                key, wi, deep_a, float(cur_a),
+                blockids=blockids, arch=arch
+            )
 
         cur_b = None
         if usebeta:
@@ -1007,10 +1111,187 @@ def make_param_resolver(alpha, beta, weights_a, weights_b, deep_a, deep_b, block
             if weights_b is not None and wi > 0:
                 cur_b = weights_b[wi - 1]
             if deep_b:
-                cur_b = elementals(key, wi, deep_b, cur_b, blockids)
+                cur_b = elementals2(
+                    key, wi, deep_b, float(cur_b),
+                    blockids=blockids, arch=arch
+                )
 
         return wi, cur_a, cur_b
     return get
+
+def _parse_csv_set(s: str):
+    return {x.strip() for x in s.split(",") if x.strip()}
+
+def _tag_for_key_safe(key: str):
+    # returns block tag like IN00, M00, OUTxx... if available
+    block, tag = blockfromkey(key, arch=arch)
+    if block == "Not Merge" or tag is None:
+        tag = extra_tag_for_key(key, arch=arch)
+    return tag
+
+def _is_vae_key(key: str, vae_key: str):
+    return (vae_key in key) or key.startswith("vae.") or key.startswith("first_stage_model.") or key.startswith("model.vae.") or key.startswith("model.first_stage_model.")
+
+def _is_cfg_attn2_key(key: str):
+    k = key.lower()
+    # SDXL UNet cross-attn usually includes "attn2" in transformer blocks
+    if "attn2" not in k:
+        return False
+    # avoid norms etc if you want stricter: keep projections only
+    return any(p in k for p in (".to_q.", ".to_k.", ".to_v.", ".to_out.", ".proj_in.", ".proj_out.", "to_out.0."))
+
+def _cfg_targets_match(key: str, targets_set: set[str]):
+    k = key.lower()
+    # normalize: if user says kv -> k,v
+    if "all" in targets_set:
+        return _is_cfg_attn2_key(key)
+    want_q = ("q" in targets_set) or ("qkv" in targets_set)
+    want_k = ("k" in targets_set) or ("kv" in targets_set) or ("qkv" in targets_set)
+    want_v = ("v" in targets_set) or ("kv" in targets_set) or ("qkv" in targets_set)
+    want_o = ("out" in targets_set)
+
+    if "attn2" not in k:
+        return False
+    if want_q and ".to_q." in k: return True
+    if want_k and ".to_k." in k: return True
+    if want_v and ".to_v." in k: return True
+    if want_o and (".to_out." in k or "to_out.0." in k): return True
+    # proj_in/out are sometimes used by implementations; treat as out-ish
+    if want_o and (".proj_out." in k): return True
+    if want_q and (".proj_in." in k): return True
+    return False
+
+def _is_saturation_key(key: str, vae_key: str, sat_tags: set[str] | None):
+    # Heuristic:
+    # 1) VAE decoder-ish keys
+    if _is_vae_key(key, vae_key):
+        kl = key.lower()
+        # focus on decoder & quant conv (color response is often here)
+        if ("decoder" in kl) or ("post_quant" in kl) or ("quant_conv" in kl):
+            return True
+        # if user really wants broad VAE boosting, allow through tags (sat_tags=None => heuristic only)
+        return False
+
+    # 2) UNet early blocks by tag (if available)
+    tag = _tag_for_key_safe(key)
+    if sat_tags is not None and tag in sat_tags:
+        return True
+
+    # 3) Fallback key-pattern for early convs
+    kl = key.lower()
+    if any(p in kl for p in ("conv_in", "conv_out", "input_blocks.0", "input_blocks.1", "input_blocks.2")):
+        return True
+
+    return False
+
+def _clamp_for_mode(mode: str, a: float, b: float | None):
+    if args.boost_clamp == "none":
+        return a, b
+
+    clamp01 = (args.boost_clamp == "clamp01")
+    auto = (args.boost_clamp == "auto")
+
+    def c01(x): 
+        return 0.0 if x < 0.0 else (1.0 if x > 1.0 else float(x))
+
+    # modes where alpha/beta should be in [0,1] to avoid nonsense
+    if clamp01 or (auto and mode in {"WS","SIG","GEO","MAX","ST","TRS","TS","DARE","CHAN","FREQ","SPRSE","SIM","MD"}):
+        a = c01(a)
+        if b is not None:
+            b = c01(b)
+
+        # TRS expects a+b<=1 typically
+        if mode == "TRS" and b is not None:
+            s = a + b
+            if s > 1.0 and s > 1e-12:
+                a = a / s
+                b = b / s
+
+    return a, b
+
+def apply_merge_strength_boosts(key: str, cur_a: float, cur_b: float | None, mode: str, vae_key: str):
+    # sat tags default for SDXL if user didn't specify
+    sat_tags = None
+    if args.sat_boost_tags:
+        sat_tags = _parse_csv_set(args.sat_boost_tags)
+    else:
+        # safe-ish default: early-ish tags (you can refine later)
+        sat_tags = {"IN00","IN01","IN02","IN03","IN04","IN05","M00"}
+        
+    if _is_vae_key(key, vae_key):
+        return _clamp_for_mode(mode, float(cur_a), (float(cur_b) if cur_b is not None else None))
+
+    # ---- SAFE PROFILE: only OUT attn2 v/out ----
+    if args.sat_profile == "safe_attn2_out":
+        if args.sat_boost != 1.0 and _is_outblock_attn2_vout_key(key):
+            if args.sat_boost_side in {"alpha","both"}:
+                cur_a *= float(args.sat_boost)
+            if cur_b is not None and args.sat_boost_side in {"beta","both"}:
+                cur_b *= float(args.sat_boost)
+
+        cur_a, cur_b = _clamp_for_mode(mode, float(cur_a), (float(cur_b) if cur_b is not None else None))
+        return cur_a, cur_b
+
+    # saturation boost
+    if args.sat_boost != 1.0 and _is_saturation_key(key, vae_key=vae_key, sat_tags=sat_tags):
+        if args.sat_boost_side in {"alpha","both"}:
+            # avoid over-boosting tiny/norm/bias
+            if _is_small_or_norm_or_bias(key, theta_0.get(key, torch.empty(0))):
+                cur_a *= (1.0 + (args.sat_boost - 1.0) * 0.35)
+            else:
+                cur_a *= args.sat_boost
+        if cur_b is not None and args.sat_boost_side in {"beta","both"}:
+            cur_b *= args.sat_boost
+
+    # (optional) you can also boost CFG-related layers pre-merge here if you want:
+    # if args.cfg_boost != 1.0 and _is_cfg_attn2_key(key): ...
+
+    cur_a, cur_b = _clamp_for_mode(mode, float(cur_a), (float(cur_b) if cur_b is not None else None))
+    return cur_a, cur_b
+
+@torch.inference_mode()
+def apply_cfg_sens_inplace(sd: dict, gain: float, targets: str):
+    if abs(float(gain) - 1.0) < 1e-12:
+        return sd
+    tset = _parse_csv_set(targets.lower())
+    # allow shorthand like "kv,out"
+    # already handled by _cfg_targets_match
+    scaled = 0
+    for k, v in sd.items():
+        if not isinstance(v, torch.Tensor) or (not v.is_floating_point()):
+            continue
+        if not _cfg_targets_match(k, tset):
+            continue
+        sd[k] = v.mul(float(gain))
+        scaled += 1
+    print(f"[cfg_sens] scaled {scaled} tensors (gain={gain}, targets={targets})")
+    return sd
+
+def _is_outblock_attn2_vout_key(key: str):
+    tag = _tag_for_key_safe(key)  # already in your code
+    if tag is None or (not str(tag).startswith("OUT")):
+        return False
+    kl = key.lower()
+    if "attn2" not in kl:
+        return False
+    # only value/out projections
+    if (".to_v." in kl) or (".to_out." in kl) or ("to_out.0." in kl):
+        return True
+    return False
+
+@torch.inference_mode()
+def _cap_delta_percentile(delta: torch.Tensor, pct: float):
+    pct = float(pct)
+    if pct <= 0.0 or pct >= 100.0:
+        return delta
+    d = delta.detach().float().abs().reshape(-1)
+    if d.numel() == 0:
+        return delta
+    # kthvalue: k-th smallest (1-indexed)
+    k = int(d.numel() * (pct / 100.0))
+    k = max(1, min(k, d.numel()))
+    thr = d.kthvalue(k).values
+    return delta.clamp(min=-thr, max=thr)
 
 cosine_applied = False
 
@@ -1018,11 +1299,16 @@ use_cos0 = bool(args.cosine0)
 use_cos1 = bool(args.cosine1)
 use_cos2 = bool(args.cosine2)
 cosine_sel = None if (not any([use_cos0, use_cos1, use_cos2])) else (0 if use_cos0 else (1 if use_cos1 else 2))
-blockids = BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else (BLOCKIDZI if iszi else BLOCKID))
+blockids = (
+    BLOCKIDFLUX if arch.get("FLUX", False) else
+    (BLOCKIDXLL if arch.get("XL", False) else
+     (BLOCKIDZI if arch.get("ZI", False) else
+      (BLOCKIDAM if arch.get("AM", False) else BLOCKID)))
+)
 _TAG2IDX = {t: i for i, t in enumerate(blockids)}
 
 if cosine_sel is not None:
-    vae_key_local = "first_stage_model" if not (isflux or iszi) else "vae"
+    vae_key_local = "first_stage_model" if not (arch.get("FLUX", False) or arch.get("ZI", False)) else "vae"
 
     base_idx, base_sd, others = _pick_base_and_others_for_cosine(theta_0, theta_1, theta_2, cosine_sel)
 
@@ -1073,10 +1359,15 @@ if turbo_convert:
     args.alpha, deep_a, block_a = wgt(args.alpha, [])
     weights_a, alpha, alpha_info = parse_ratio(args.alpha, "", deep_a)
 
-    blockids = BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else (BLOCKIDZI if iszi else BLOCKID))
+    blockids = (
+        BLOCKIDFLUX if arch.get("FLUX", False) else
+        (BLOCKIDXLL if arch.get("XL", False) else
+        (BLOCKIDZI if arch.get("ZI", False) else
+        (BLOCKIDAM if arch.get("AM", False) else BLOCKID)))
+    )
     _TAG2IDX = {t: i for i, t in enumerate(blockids)}
 
-    vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
+    vae_key = "first_stage_model" if not (arch.get("FLUX", False) or arch.get("ZI", False)) else "vae"
     resolver = make_param_resolver(alpha, None, weights_a, None, deep_a, [], blockids, usebeta=False)
 
     do_fine = bool('fine' in locals() and fine)
@@ -1127,7 +1418,7 @@ def remerge_model(target_dict, source_dict, desc, mode, resolver, theta_2=None):
     skip = checkpoint_dict_skip_on_merge
 
     for key in tqdm(s.keys(), desc=desc, total=len(s)):
-        if isflux:
+        if arch.get("FLUX", False):
             continue
         if key in skip:
             continue
@@ -1152,7 +1443,7 @@ def remerge_model(target_dict, source_dict, desc, mode, resolver, theta_2=None):
 
 if mode not in ["NoIn", "TF"]:
     with torch.inference_mode():
-        vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
+        vae_key = "first_stage_model" if not (arch.get("FLUX", False) or arch.get("ZI", False)) else "vae"
         resolver = make_param_resolver(alpha, beta, weights_a, weights_b, deep_a, deep_b, blockids, usebeta)
         
         cache_skip = checkpoint_dict_skip_on_merge
@@ -1176,14 +1467,60 @@ if mode not in ["NoIn", "TF"]:
                 continue
             _, cur_a, cur_b = ent
 
+            is_sat_target = (args.sat_profile == "safe_attn2_out" and _is_outblock_attn2_vout_key(key))
+
+            if is_sat_target and (float(args.sat_boost_mix) < 1.0 or float(args.sat_delta_cap_pct) > 0.0):
+                # 1) normal (no sat boost)
+                cur_a0, cur_b0 = _clamp_for_mode(mode, float(cur_a), (float(cur_b) if cur_b is not None else None))
+
+                # 2) boosted
+                cur_a1, cur_b1 = apply_merge_strength_boosts(key, cur_a, cur_b, mode=mode, vae_key=vae_key)
+
+                # compute both
+                if usebeta and mode in modes_need_m2:
+                    out0 = func(ad, b, theta_2[key], cur_a0, cur_b0)
+                    out1 = func(ad, b, theta_2[key], cur_a1, cur_b1)
+                elif usebeta:
+                    out0 = func(ad, b, cur_a0, cur_b0)
+                    out1 = func(ad, b, cur_a1, cur_b1)
+                else:
+                    out0 = func(ad, b, cur_a0)
+                    out1 = func(ad, b, cur_a1)
+
+                mix = float(args.sat_boost_mix)
+                out = torch.lerp(out0.to(torch.float32), out1.to(torch.float32), mix).to(out0.dtype)
+
+                if float(args.sat_delta_cap_pct) > 0.0:
+                    delta = (out.to(torch.float32) - a.to(torch.float32))
+                    delta = _cap_delta_percentile(delta, float(args.sat_delta_cap_pct))
+                    out = (a.to(torch.float32) + delta).to(a.dtype)
+
+            else:
+                cur_a, cur_b = apply_merge_strength_boosts(
+                    key, cur_a, cur_b,
+                    mode=mode,
+                    vae_key=vae_key
+                )
+
             a = theta_0[key]
             b = theta_1[key]
+            
+            if (not isinstance(a, torch.Tensor)) or (not isinstance(b, torch.Tensor)):
+                continue
+            if (not a.is_floating_point()) or (not b.is_floating_point()):
+                continue
+            if a.shape != b.shape:
+                continue
+            if usebeta and (mode in modes_need_m2) and (usebeta or mode == "TD"):
+                c = theta_2[key]
+                if (not isinstance(c, torch.Tensor)) or (not c.is_floating_point()) or (c.shape != a.shape):
+                    continue
 
             if mode == "sAD":
                 bf = b.detach().float().cpu()
                 filt = scipy.ndimage.gaussian_filter(bf.numpy(), sigma=1)
                 out = a + cur_a * torch.from_numpy(filt).to(a.device, dtype=a.dtype)
-                theta_0[key] = _finetune_inplace(key, out, fine) if do_fine else out
+                theta_0[key] = _finetune_inplace(key, out, fine, arch=arch) if do_fine else out
                 continue
 
             if mode == "TD":
@@ -1199,7 +1536,7 @@ if mode not in ["NoIn", "TF"]:
                 scale = torch.where(denom != 0, distA0 / denom, torch.zeros((), device=t0f.device))
                 scale = diff.sign() * scale.abs()
                 out = (t0f + (scale * absdiff) * (float(cur_a) * 1.8)).to(a.dtype)
-                theta_0[key] = _finetune_inplace(key, out, fine) if do_fine else out
+                theta_0[key] = _finetune_inplace(key, out, fine, arch=arch) if do_fine else out
                 continue
 
             if mode == "TS":
@@ -1214,7 +1551,7 @@ if mode not in ["NoIn", "TF"]:
                     t = b.clone()
                     t[s:e, ...].copy_(a[s:e, ...])
                     theta_0[key] = t
-                theta_0[key] = _finetune_inplace(key, theta_0[key], fine) if do_fine else theta_0[key]
+                theta_0[key] = _finetune_inplace(key, theta_0[key], fine, arch=arch) if do_fine else theta_0[key]
                 continue
 
             if (a.shape != b.shape) and (a.dim() == 4) and (b.dim() == 4) and (a.shape[0] == b.shape[0]) and (a.shape[2:] == b.shape[2:]):
@@ -1223,14 +1560,14 @@ if mode not in ["NoIn", "TF"]:
             else:
                 ad = a
 
-            if usebeta and mode not in ["DARE", "XDARE"]:
+            if usebeta and mode in modes_need_m2:
                 out = func(ad, b, theta_2[key], cur_a, cur_b)
             elif usebeta:
                 out = func(ad, b, cur_a, cur_b)
             else:
                 out = func(ad, b, cur_a)
 
-            theta_0[key] = _finetune_inplace(key, out, fine) if do_fine else out
+            theta_0[key] = _finetune_inplace(key, out, fine, arch=arch) if do_fine else out
 
     if mode != "DARE":
         if mode != "AD":
@@ -1250,14 +1587,14 @@ else:
         theta_0 = prune_extras_vs_model1(theta_0, theta_1)
         resolver = make_param_resolver(alpha, beta, weights_a, weights_b, deep_a, deep_b, blockids, usebeta)
         theta_0 = remerge_model(theta_0, theta_1, desc="Remerging...", mode=mode, resolver=resolver, theta_2=theta_2)
-    isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
-    vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
-    if (not cosine_applied) and args.fine and not iszi:
-        fine = fineman([float(t) for t in args.fine.split(",")], isxl, isflux)
+    arch, theta_0 = detect_arch(theta_0)
+    vae_key = "first_stage_model" if not (arch.get("FLUX", False) or arch.get("ZI", False)) else "vae"
+    if (not cosine_applied) and args.fine and not arch.get("ZI", False):
+        fine = fineman([float(t) for t in args.fine.split(",")], arch=arch)
         for key in tqdm(theta_0.keys(), desc="Fine Tuning ..."):
             if args.vae is None and vae_key in key:
                 continue
-            theta_0[key] = _finetune_inplace(key, theta_0[key], fine)
+            theta_0[key] = _finetune_inplace(key, theta_0[key], fine, arch=arch)
     elif not cosine_applied:
         fine = ""
         
@@ -1272,17 +1609,25 @@ if args.vae:
         tk = vae_key + "." + _strip_vae_root(k)
         theta_0[tk] = to_half(vae[k], args.save_half)
     del vae
+    
+    if float(args.vae_sat) != 1.0:
+        theta_0 = apply_vae_saturation_inplace(theta_0, vae_key=vae_key, sat=float(args.vae_sat))
 
-isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
+arch, theta_0 = detect_arch(theta_0)
 
-if isxl:
+if arch.get("XL", False):
     for k in tqdm([k for k in theta_0.keys() if "cond_stage_model." in k], desc="Cond resolving..."):
         del theta_0[k]
+
+if float(args.cfg_sens) != 1.0:
+    if not arch.get("XL", False):
+        print("[cfg_sens] Warning: --cfg_sens is tuned for SDXL; applying anyway.")
+    theta_0 = apply_cfg_sens_inplace(theta_0, gain=float(args.cfg_sens), targets=str(args.cfg_sens_targets))
 
 theta_0 = prepare_state_dict_for_save(
     theta_0,
     args=args,
-    isxl=isxl, isflux=isflux, iszi=iszi,
+    arch=arch,
     vae_prefix=vae_key,
     prune=bool(args.prune),
     make_cpu=True,
@@ -1337,6 +1682,11 @@ elif args.rebasin is not None:
         "min_channels": 64,
         "max_channels": 4096,
     }
+    
+if float(args.cfg_sens) != 1.0:
+    calcs.append(f"cfg_sens[{args.cfg_sens}|{args.cfg_sens_targets}]")
+if float(args.sat_boost) != 1.0:
+    calcs.append(f"sat_boost[{args.sat_boost}|{args.sat_boost_side}|{args.sat_boost_tags or 'auto'}]")
     
 metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
 

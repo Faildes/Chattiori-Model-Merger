@@ -17,7 +17,7 @@ Supports **`.ckpt`** and **`.safetensors`**. Runs on **CPU by default** (GPU opt
 
 ## Architectures & Formats
 
-- **Architectures:** SD 1.x / 2.x / XL / Flux.1 / Z-Image (via `detect_arch`)
+- **Architectures:** SD 1.x / 2.x / XL / Flux.1 / Z-Image / Anima (via `detect_arch`)
 - **Checkpoints:** `.ckpt` (PyTorch) and `.safetensors`
 - **VAE:** Optional bake-in with `--vae`
 - **DTypes:** fp32 (default), **fp16** (`--save_half`), **fp8** (`--save_quarter`, experimental)
@@ -95,7 +95,7 @@ mode model_path model_0 model_1
 - `model_path`: directory containing the checkpoints
 - `model_0`: filename of the first model
 - `model_1`: filename of the second model (required for merging modes)
-- `--model_2`: filename of the third model (required by some modes, or when using `--cosine2`)
+- `model_2`: filename of the third model (required by some modes, or when using `--cosine2`)
 
 ### Options
 
@@ -141,27 +141,27 @@ python merge.py WS models "A.safetensors" "B.safetensors"   --cosine1 --alpha 0.
 
 ### 3) Cosine2 (3 models): keep model2’s structure; inject 0 then 1 with α/β
 ```bash
-python merge.py WS models "A.safetensors" "B.safetensors" --model_2 "C.safetensors"   --cosine2 --alpha 0.25 --beta 0.15 --output merged_cos2
+python merge.py WS models "A.safetensors" "B.safetensors" "C.safetensors"   --cosine2 --alpha 0.25 --beta 0.15 --output merged_cos2
 ```
 
 ### 4) Sparse Top-k delta (current build marks it as needs model_2)
 ```bash
-python merge.py SPRSE models "A.safetensors" "B.safetensors" --model_2 "C.safetensors"   --alpha 0.5 --output merged_sparse
+python merge.py SPRSE models "A.safetensors" "B.safetensors" "C.safetensors"   --alpha 0.5 --output merged_sparse
 ```
 
 ### 5) Frequency-band blend (Conv kernels; marked as needs model_2)
 ```bash
-python merge.py FREQ models "A.safetensors" "B.safetensors" --model_2 "C.safetensors"   --alpha 0.4 --output merged_freq
+python merge.py FREQ models "A.safetensors" "B.safetensors" "C.safetensors"   --alpha 0.4 --output merged_freq
 ```
 
 ### 6) No interpolation + finetune only (e.g., Flux.1 quick tweak)
 ```bash
-python merge.py NoIn models "FluxModel.safetensors" "dummy.safetensors"   --fine "2,0,1,0,0,5" --output flux_finetuned
+python merge.py NoIn models "FluxModel.safetensors" --fine "2,0,1,0,0,5" --output flux_finetuned
 ```
 
 ### 7) Read metadata only
 ```bash
-python merge.py RM models "A.safetensors" "dummy.safetensors" --output meta_dump
+python merge.py RM models "A.safetensors" --output meta_dump
 ```
 
 ---

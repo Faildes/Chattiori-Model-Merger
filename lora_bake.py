@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import safetensors.torch
 import safetensors
 from tqdm.auto import tqdm
+import math
 
 from Utils import (
     load_model,
@@ -16,10 +17,12 @@ from Utils import (
     LBLOCKS_FLUX,
     LBLOCKS_ZI,
     LBLOCKS_SDXL,
+    LBLOCKS_AM,
     BLOCKID,
     BLOCKIDFLUX,
     BLOCKIDZI,
     BLOCKIDXLL,
+    BLOCKIDAM,
     cache,
     dump_cache,
     normalize_path,
@@ -29,6 +32,8 @@ from Utils import (
     set_cache_filename,
     base_path,
     merge_cache_json,
+    blockfromkey,
+    elementals2,
 )
 
 _re_digits = re.compile(r"\d+")
@@ -91,6 +96,140 @@ def convert_diffusers_name_to_compvis(key: str, is_sd2: bool) -> str:
         r = g[1].replace("mlp_fc1","mlp_c_fc").replace("mlp_fc2","mlp_c_proj").replace("self_attn","attn")
         return f"1_model_transformer_resblocks_{g[0]}_{r}"
     return key
+
+_AM_UNET_BASE_RE = re.compile(r"^lora_unet_blocks_(\d+)_(.+)$")
+_AM_TE_BASE_RE   = re.compile(r"^lora_te_layers_(\d+)_(.+)$")
+_AM_VAE_BASE_RE  = re.compile(r"^(?:lora_vae|lora_first_stage_model)_(.+)$")
+
+def _am_strip_lora_suffix(down_k: str) -> str | None:
+    if down_k.endswith(".lora_down.weight"):
+        return down_k[:-len(".lora_down.weight")]
+    if down_k.endswith(".lora_A.weight"):
+        return down_k[:-len(".lora_A.weight")]
+    return None
+
+def _am_merge_pairs(tokens: list[str]) -> list[str]:
+    # q_proj, k_proj, v_proj, o_proj, out_proj, output_proj, *_norm >> single token
+    out = []
+    i = 0
+    pair2 = {"proj", "norm"}
+    head_ok = {"q","k","v","o","out","output"}
+    while i < len(tokens):
+        if (i + 1) < len(tokens) and (tokens[i] in head_ok) and (tokens[i+1] in pair2):
+            out.append(tokens[i] + "_" + tokens[i+1])
+            i += 2
+            continue
+        out.append(tokens[i])
+        i += 1
+    return out
+
+def _am_tail_to_path(tail: str) -> list[str]:
+    """
+    tail eg.):
+      self_attn_q_proj            -> self_attn.q_proj
+      cross_attn_k_norm           -> cross_attn.k_norm
+      adaln_modulation_mlp_1      -> adaln_modulation_mlp.1
+      adaln_modulation_cross_attn_2 -> adaln_modulation_cross_attn.2
+    """
+    groups = [
+        "adaln_modulation_cross_attn",
+        "adaln_modulation_self_attn",
+        "adaln_modulation_mlp",
+        "cross_attn",
+        "self_attn",
+        "mlp",
+    ]
+    grp = None
+    for g in sorted(groups, key=len, reverse=True):
+        if tail.startswith(g + "_"):
+            grp = g
+            rest = tail[len(g) + 1:]
+            break
+    if grp is None:
+        # fallback
+        return [tail.replace("_", ".")]
+
+    # index-only (Sequential)
+    if rest.isdigit():
+        return [f"{grp}.{rest}"]
+
+    toks = _am_merge_pairs(rest.split("_"))
+    sub = ".".join(toks)
+
+    paths = [f"{grp}.{sub}"]
+
+    if sub.endswith("o_proj"):
+        paths.append(f"{grp}.{sub[:-len('o_proj')] + 'output_proj'}")
+        paths.append(f"{grp}.{sub[:-len('o_proj')] + 'out_proj'}")
+    if sub.endswith("output_proj"):
+        paths.append(f"{grp}.{sub[:-len('output_proj')] + 'o_proj'}")
+        paths.append(f"{grp}.{sub[:-len('output_proj')] + 'out_proj'}")
+    if sub.endswith("out_proj"):
+        paths.append(f"{grp}.{sub[:-len('out_proj')] + 'o_proj'}")
+        paths.append(f"{grp}.{sub[:-len('out_proj')] + 'output_proj'}")
+
+    # Delete duplicates while preserving order
+    seen = set()
+    out = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+def anima_resolve_target_any(down_k: str, theta_0: dict) -> str | None:
+    """
+    AM LoRA down key -> checkpoint weight key
+    """
+    base = _am_strip_lora_suffix(down_k)
+    if base is None:
+        return None
+
+    # --- UNet/DiT side ---
+    m = _AM_UNET_BASE_RE.match(base)
+    if m:
+        bi = int(m.group(1))
+        tail = m.group(2)
+        for path in _am_tail_to_path(tail):
+            cand = f"model.diffusion_model.blocks.{bi}.{path}.weight"
+            if cand in theta_0:
+                return cand
+        return f"model.diffusion_model.blocks.{bi}.{_am_tail_to_path(tail)[0]}.weight"
+
+    # --- Text encoder side (Qwen3-0.6B) ---
+    m = _AM_TE_BASE_RE.match(base)
+    if m:
+        li = int(m.group(1))
+        tail = m.group(2)
+
+        keep = {"input_layernorm", "post_attention_layernorm", "final_layernorm"}
+        if tail in keep:
+            paths = [tail]
+        else:
+            paths = _am_tail_to_path(tail)
+
+        prefixes = [
+            "text_encoders.qwen3_06b.transformer.model.layers.",
+            "text_encoders.qwen3_06b_base.transformer.model.layers.",
+        ]
+        for pref in prefixes:
+            for path in paths:
+                cand = f"{pref}{li}.{path}.weight"
+                if cand in theta_0:
+                    return cand
+        # fallback
+        return f"text_encoders.qwen3_06b.transformer.model.layers.{li}.{paths[0]}.weight"
+
+    # --- VAE side (optional) ---
+    mv = _AM_VAE_BASE_RE.match(base)
+    if mv:
+        tail = mv.group(1)
+        cand = "first_stage_model." + tail.replace("_", ".") + ".weight"
+        if cand in theta_0:
+            return cand
+        return cand
+
+    return None
 
 _ZI_LAYER_RE = re.compile(
     r"^(?:model\.)?diffusion_model\.layers\.(\d+)\.(.+)\.lora_(A|down)\.weight$"
@@ -203,6 +342,27 @@ def zimage_resolve_target_any(down_k: str, zi_index: dict):
         return kk, None
 
     return None, None
+
+def _am_target_key_from_lora_down(down_k: str) -> str | None:
+    base = _am_strip_lora_suffix(down_k)
+    if base is None:
+        return None
+    m = _AM_UNET_BASE_RE.match(base)
+    if m:
+        bi = int(m.group(1))
+        tail = m.group(2)
+        path = _am_tail_to_path(tail)[0]
+        return f"model.diffusion_model.blocks.{bi}.{path}.weight"
+    m = _AM_TE_BASE_RE.match(base)
+    if m:
+        li = int(m.group(1))
+        tail = m.group(2)
+        path = tail if tail in {"input_layernorm","post_attention_layernorm","final_layernorm"} else _am_tail_to_path(tail)[0]
+        return f"text_encoders.qwen3_06b.transformer.model.layers.{li}.{path}.weight"
+    mv = _AM_VAE_BASE_RE.match(base)
+    if mv:
+        return "first_stage_model." + mv.group(1).replace("_",".") + ".weight"
+    return None
 
 @torch.inference_mode()
 def apply_lora_to_weight_inplace(W: torch.Tensor, up: torch.Tensor, down: torch.Tensor, scale: float, ratio: float):
@@ -421,22 +581,31 @@ def merge_weights_inplace(
     return lora
 
 @torch.inference_mode()
-def build_apply_plan(main_keys, *, isxl: bool, iszi: bool, mlv2: bool, keymap: dict):
+def build_apply_plan(main_keys, *, arch: dict, mlv2: bool, keymap: dict, theta_0: dict | None = None):
     plan = []
     for k in main_keys:
         down_k, up_k, alpha_k = parse_lora_key(k)
         if down_k is None:
             continue
 
-        if iszi:
+        if arch.get("ZI", False):
             tgt, part = zimage_resolve_target(down_k)
             if tgt is not None:
                 plan.append(("zi", down_k, up_k, alpha_k, tgt, part))
             continue
 
+        if arch.get("AM", False):
+            if theta_0 is None:
+                continue
+            tgt = anima_resolve_target_any(down_k, theta_0)
+            if tgt is None:
+                continue
+            plan.append(("std", down_k, up_k, alpha_k, tgt, None))
+            continue
+
         full = convert_diffusers_name_to_compvis(down_k, mlv2)
         msd  = full.split(".", 1)[0]
-        if isxl:
+        if arch.get("XL", False):
             msd = msd.replace("lora_unet", "diffusion_model").replace("lora_te1_text_model", "0_transformer_text_model")
 
         wkey = keymap.get(msd)
@@ -445,8 +614,209 @@ def build_apply_plan(main_keys, *, isxl: bool, iszi: bool, mlv2: bool, keymap: d
         plan.append(("std", down_k, up_k, alpha_k, wkey, None))
     return plan
 
+def _split_top_level(s: str, sep: str = ",") -> list[str]:
+    # split by sep, but ignore seps inside (), [], {}
+    opens = {"(": ")", "[": "]", "{": "}"}
+    stack = []
+    out = []
+    buf = []
+    for ch in s:
+        if ch in opens:
+            stack.append(opens[ch])
+        elif stack and ch == stack[-1]:
+            stack.pop()
+        elif (ch == sep) and (not stack):
+            part = "".join(buf).strip()
+            if part:
+                out.append(part)
+            buf = []
+            continue
+        buf.append(ch)
+    part = "".join(buf).strip()
+    if part:
+        out.append(part)
+    return out
+
 def get_loralist(arg: str):
-    return [x.split(":", 1) if ":" in x else [x, "1.0"] for x in arg.split(",") if x.strip()]
+    parts = _split_top_level(arg, ",")
+    out = []
+    for x in parts:
+        if ":" in x:
+            p, r = x.split(":", 1)
+            out.append([p.strip(), r.strip()])
+        else:
+            out.append([x.strip(), "1.0"])
+    return out
+
+def _is_float(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except Exception:
+        return False
+
+def _strip_quotes(s: str) -> str:
+    s = s.strip()
+    if (len(s) >= 2) and ((s[0] == s[-1]) and s[0] in ("'", '"')):
+        return s[1:-1].strip()
+    return s
+
+def _split_rules(s: str) -> list[str]:
+    if not s:
+        return []
+    buf = s.strip()
+    if (buf.startswith("[") and buf.endswith("]")) or (buf.startswith("{") and buf.endswith("}")):
+        buf = buf[1:-1].strip()
+
+    parts = _split_top_level(buf, ",")
+    if len(parts) == 1:
+        parts = []
+        for x in re.split(r"[;\n]+", buf):
+            x = x.strip()
+            if x:
+                parts.append(x)
+
+    out = []
+    for p in parts:
+        p = _strip_quotes(p.strip())
+        if p:
+            out.append(p)
+    return out
+
+def _parse_float_list(s: str) -> list[float]:
+    t = s.strip()
+    if t.startswith("[") and t.endswith("]"):
+        t = t[1:-1].strip()
+    if t == "":
+        return []
+    xs = [x.strip() for x in _split_top_level(t, ",")]
+    out = []
+    for x in xs:
+        x = _strip_quotes(x)
+        if x == "":
+            continue
+        out.append(float(x))
+    return out
+
+def _consume_one_bracket_group(s: str, open_ch: str = "[", close_ch: str = "]"):
+    if not s.startswith(open_ch):
+        return None, s
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return s[: i + 1], s[i + 1 :].lstrip()
+    return None, s
+
+def parse_ratio_spec(ratio_str: str, nblocks: int):
+    """
+    backward compatible + elementals
+      "1.0"                         -> g=1.0, weights=[1.0], deep=[]
+      "0.8,0.8,0.8"                 -> g=1.0, weights=[0.8,0.8,0.8], deep=[]
+      "[...]"                       -> g=1.0, weights=[...], deep=[]
+      "g,[weights]"                 -> g=g, weights=[...], deep=[]
+      "g,[[weights],[deep...]]"     -> g=g, weights=[...], deep=[...]
+      "[weights][deep...]"          -> g=1.0, weights=[...], deep=[...]
+      "{deep...}" / "[deep...]"     -> g=1.0, weights=[1.0], deep=[...]
+    """
+    s = (ratio_str or "").strip()
+    if s == "":
+        return 1.0, [1.0], []
+
+    g = 1.0
+    parts = _split_top_level(s, ",")
+    if len(parts) >= 2 and _is_float(parts[0]) and parts[1].lstrip().startswith(("[", "{")):
+        g = float(parts[0])
+        rest = s[len(parts[0]):].lstrip()
+        if rest.startswith(","):
+            rest = rest[1:].lstrip()
+    else:
+        rest = s
+
+    weights: list[float] = []
+    deep: list[str] = []
+
+    if rest.lstrip().startswith("["):
+        rest = rest.lstrip()
+        g1, tail = _consume_one_bracket_group(rest, "[", "]")
+        if g1 is not None:
+            tail2 = tail.lstrip()
+            g2 = None
+            if tail2.startswith("["):
+                g2, tail3 = _consume_one_bracket_group(tail2, "[", "]")
+            elif tail2.startswith("{"):
+                g2, tail3 = _consume_one_bracket_group(tail2, "{", "}")
+
+            inner = g1[1:-1].strip()
+            inner_parts = _split_top_level(inner, ",")
+            if (len(inner_parts) >= 2) and inner_parts[0].lstrip().startswith("[") and inner_parts[1].lstrip().startswith("["):
+                weights = _parse_float_list(inner_parts[0])
+                deep = _split_rules(inner_parts[1])
+            else:
+                try:
+                    weights = _parse_float_list(g1)
+                    if len(weights) == 0:
+                        deep = _split_rules(g1)
+                        weights = [1.0]
+                except Exception:
+                    deep = _split_rules(g1)
+                    weights = [1.0]
+
+            if g2 is not None:
+                deep2 = _split_rules(g2)
+                if deep2:
+                    deep.extend(deep2)
+
+            if not weights:
+                weights = [1.0]
+
+            return g, weights, deep
+
+    if rest.lstrip().startswith("{") and rest.rstrip().endswith("}"):
+        deep = _split_rules(rest)
+        return g, [1.0], deep
+
+    try:
+        weights = _parse_float_list(rest)
+        if not weights:
+            weights = [float(rest)]
+    except Exception:
+        weights = [1.0]
+
+    return g, weights, deep
+
+def _weight_index_for_target_key(target_key: str, blockids: list[str], *, arch: dict) -> int:
+    left, right = blockfromkey(target_key, arch=arch)
+
+    if right in blockids:
+        return blockids.index(right)
+    if left in blockids:
+        return blockids.index(left)
+
+    return 0
+
+def _effective_ratio_for_target(
+    target_key: str,
+    *,
+    g: float,
+    weights: list[float],
+    deep: list[str],
+    blockids: list[str],
+    arch: dict,
+) -> float:
+    wi = _weight_index_for_target_key(target_key, blockids, arch=arch)
+    base = weights[wi] if (weights and wi < len(weights)) else (weights[0] if weights else 1.0)
+    r0 = float(g) * float(base)
+
+    r = elementals2(
+        target_key, wi, deep, r0,
+        blockids=blockids,
+        arch=arch,
+    )
+    return float(r)
 
 def _build_keymap(sd: dict):
     km = {}
@@ -524,6 +894,196 @@ def parse_lora_key(k: str):
     return None, None, None
 
 
+def _is_text_encoder_lora_key(down_k: str, target_key: str | None = None) -> bool:
+    s = down_k
+    if target_key:
+        s = s + " " + target_key
+    s = s.lower()
+    # kohya/diffusers/flux-ish
+    return (
+        "lora_te" in s or
+        "text_model" in s or
+        "text_encoder" in s or
+        "text_encoders" in s or
+        "transformer_text_model" in s or
+        "conditioner" in s or
+        "clip" in s
+    )
+
+@torch.inference_mode()
+def _preprocess_up_down(
+    up: torch.Tensor,
+    down: torch.Tensor,
+    *,
+    rank_cap: int = 0,
+    clamp_q: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # to 2d
+    up2d, down2d, is_conv, shape_info = _to_2d_up_down(up, down)
+
+    # rank cap
+    if rank_cap and rank_cap > 0 and int(up2d.shape[1]) > int(rank_cap):
+        up2d, down2d = _compress_uv_rankcap_dimstyle(up2d, down2d, int(rank_cap))
+
+    # clamp
+    if clamp_q and clamp_q > 0.0:
+        up2d, down2d = _clamp_uv_quantile_inplace(up2d, down2d, float(clamp_q))
+
+    # reshape back compatible with apply_lora_to_weight_inplace
+    if is_conv:
+        in_ch, kh, kw = shape_info
+        r = int(down2d.shape[0])
+        down_new = down2d.reshape(r, int(in_ch), int(kh), int(kw))
+        up_new   = up2d.reshape(int(up2d.shape[0]), r, 1, 1)
+    else:
+        down_new = down2d
+        up_new   = up2d
+
+    return up_new, down_new
+
+def _apply_delta_cap_to_ratio(
+    W: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    *,
+    sc: float,
+    ratio: float,
+    cap: float,
+) -> float:
+    """
+    Enforce ||ΔW||_F <= cap * ||W||_F (approx upper bound using ||U||_F||V||_F).
+    ΔW ≈ (ratio*sc) * (up@down)
+    """
+    if not cap or cap <= 0.0:
+        return ratio
+
+    # compute in float32
+    Wn = torch.linalg.norm(W.detach().float()).item()
+    if not (Wn > 0.0):
+        return ratio
+
+    up2d, down2d, _is_conv, _shape = _to_2d_up_down(up, down)
+    Un = torch.linalg.norm(up2d.float()).item()
+    Vn = torch.linalg.norm(down2d.float()).item()
+    if not (Un > 0.0 and Vn > 0.0):
+        return ratio
+
+    # upper bound of ||up@down||_F <= ||up||_F||down||_F
+    denom = abs(float(ratio) * float(sc)) * Un * Vn + 1e-12
+    limit = float(cap) * Wn
+    if denom <= limit:
+        return ratio
+
+    factor = limit / denom
+    return float(ratio) * float(factor)
+
+def _estimate_rel_update_bound(
+    Wn0: float,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    *,
+    sc: float,
+    ratio: float,
+) -> float:
+    """
+    Estimate rho = ||ΔW||_F / ||W0||_F by upper bound:
+      ||ΔW||_F <= |ratio*sc| * ||U||_F * ||V||_F
+    where U=up2d, V=down2d
+    """
+    if not (Wn0 > 0.0):
+        return 0.0
+
+    up2d, down2d, _is_conv, _shape = _to_2d_up_down(up, down)
+    Un = torch.linalg.norm(up2d.float()).item()
+    Vn = torch.linalg.norm(down2d.float()).item()
+    if not (Un > 0.0 and Vn > 0.0):
+        return 0.0
+
+    num = abs(float(ratio) * float(sc)) * float(Un) * float(Vn)
+    return float(num) / (float(Wn0) + 1e-12)
+
+def _parse_budget_spec(s: str, nblocks: int):
+    """
+    returns ("off", None) or ("zones", [vals...]) or ("ratio", (g, weights, deep))
+    zones:
+      "a:b" or "a:b:c" with floats, applied by block index split
+    ratio:
+      reuse parse_ratio_spec (e.g. "0.18", "0.18,[...]", "[...]" etc)
+    """
+    if not s:
+        return ("off", None)
+    t = s.strip()
+    if (":" in t) and ("[" not in t) and ("{" not in t):
+        parts = [p.strip() for p in t.split(":")]
+        if parts and all(_is_float(p) for p in parts):
+            vals = [float(p) for p in parts]
+            if len(vals) in (2, 3):
+                return ("zones", vals)
+
+    g, weights, deep = parse_ratio_spec(t, nblocks)
+    return ("ratio", (float(g), list(weights), list(deep)))
+
+
+def _budget_for_target(
+    target_key: str,
+    *,
+    spec,
+    blockids: list[str],
+    arch: dict,
+) -> float:
+    kind, payload = spec
+    if kind == "off" or payload is None:
+        return 0.0
+
+    wi = _weight_index_for_target_key(target_key, blockids, arch=arch)
+    n = max(1, len(blockids))
+
+    if kind == "zones":
+        vals = payload
+        if len(vals) == 2:
+            cut = n // 2
+            return float(vals[0] if wi < cut else vals[1])
+        else:
+            cut1 = n // 3
+            cut2 = (2 * n) // 3
+            if wi < cut1:   return float(vals[0])
+            if wi < cut2:   return float(vals[1])
+            return float(vals[2])
+
+    # ratio-like
+    g, weights, deep = payload
+    return float(_effective_ratio_for_target(
+        target_key,
+        g=g, weights=weights, deep=deep,
+        blockids=blockids,
+        arch=arch,
+    ))
+
+def _estimate_rel_delta_bound(
+    Wn: float,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    *,
+    sc: float,
+    ratio: float,
+) -> float:
+    """
+    Estimate rho = ||ΔW||_F / ||W||_F using upper bound:
+      ||ΔW||_F <= |ratio*sc| * ||U||_F ||V||_F
+    """
+    if not (Wn > 0.0):
+        return float("inf")
+
+    up2d, down2d, _is_conv, _shape = _to_2d_up_down(up, down)
+    Un = torch.linalg.norm(up2d.float()).item()
+    Vn = torch.linalg.norm(down2d.float()).item()
+    if not (Un > 0.0 and Vn > 0.0):
+        return 0.0
+
+    denom = abs(float(ratio) * float(sc)) * float(Un) * float(Vn)
+    return float(denom) / (float(Wn) + 1e-12)
+
+
 @torch.inference_mode()
 def pluslora(lora_list, model, output, model_path, device="cpu"):
     set_cache_filename(os.path.join(base_path(), "cache.json"))
@@ -541,29 +1101,178 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
     theta_0 = upcast_fp8_state_dict(theta_0)
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
-    isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
+    arch, theta_0 = detect_arch(theta_0)
     
     zi_index = None
-    if iszi:
+    if arch.get("ZI", False):
         zi_index = _build_zi_layer_index(theta_0)
+        
+    Wn_cache = {}
+    for k, W in theta_0.items():
+        if isinstance(W, torch.Tensor) and W.is_floating_point():
+            Wn_cache[k] = float(torch.linalg.norm(W.detach().float()).item())
+        else:
+            Wn_cache[k] = 0.0
 
-    blocks  = LBLOCKS_ZI if iszi else (LBLOCKS_FLUX if isflux else (LBLOCKS_SDXL if isxl else LBLOCKS26))
+    def _get_Wn(key: str) -> float:
+        return float(Wn_cache.get(key, 0.0))
+        
+    # ---- W0 norms (fixed) for order-independent budget ----
+    W0_norm: dict[str, float] = {}
+    for k, W in theta_0.items():
+        if isinstance(W, torch.Tensor) and W.is_floating_point():
+            W0_norm[k] = float(torch.linalg.norm(W.detach().float()).item())
+        else:
+            W0_norm[k] = 0.0
+
+    def _get_W0n(key: str) -> float:
+        return float(W0_norm.get(key, 0.0))
+
+    blocks = (
+        LBLOCKS_ZI if arch.get("ZI", False) else
+        (LBLOCKS_FLUX if arch.get("FLUX", False) else
+        (LBLOCKS_SDXL if arch.get("XL", False) else
+        (LBLOCKS_AM if arch.get("AM", False) else LBLOCKS26)))
+    )
     blocksN = _normalize_blocks(blocks)
 
-    blocknum = BLOCKIDZI if iszi else (BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else BLOCKID))
-    vae_key  = "first_stage_model" if not (isflux or iszi) else "vae"
+    blocknum = (
+        BLOCKIDZI if arch.get("ZI", False) else
+        (BLOCKIDFLUX if arch.get("FLUX", False) else
+        (BLOCKIDXLL if arch.get("XL", False) else
+        (BLOCKIDAM if arch.get("AM", False) else BLOCKID)))
+    )
+    vae_key  = "first_stage_model" if not (arch.get("FLUX", False) or arch.get("ZI", False)) else "vae"
 
     keymap   = _build_keymap(theta_0)
 
     lr_strs   = []
     lora_meta = {}
+    
+    # ---- global normalization when baking many LoRAs ----
+    n_loras = max(1, len(lora_list))
+    if getattr(args, "bake_norm", "sqrt") == "mean":
+        bake_norm = 1.0 / float(n_loras)
+    elif getattr(args, "bake_norm", "sqrt") == "sqrt":
+        bake_norm = 1.0 / math.sqrt(float(n_loras))
+    else:
+        bake_norm = 1.0
+    bake_norm *= float(getattr(args, "bake_scale", 1.0))
+
+    bake_unet_only = bool(getattr(args, "bake_unet_only", False))
+    bake_rank_cap  = int(getattr(args, "bake_rank_cap", 0))
+    bake_clamp_q   = float(getattr(args, "bake_clamp_q", 0.0))
+    bake_delta_cap = float(getattr(args, "bake_delta_cap", 0.0))
+    bake_clip_scale = float(getattr(args, "bake_clip_scale", 1.0))
+    bake_delta_cap_user = float(getattr(args, "bake_delta_cap", 0.0))
+    bake_guard = str(getattr(args, "bake_guard", "auto"))
+    bake_guard_cap = float(getattr(args, "bake_guard_cap", 0.05))
+    bake_guard_skip = float(getattr(args, "bake_guard_skip", 0.25))
+    budget_spec = _parse_budget_spec(str(getattr(args, "bake_budget", "")).strip(), len(blocknum))
+    use_budget = (budget_spec[0] != "off")
+
+    # effective delta cap
+    bake_delta_cap_eff = bake_delta_cap_user
+    if bake_guard == "cap":
+        bake_delta_cap_eff = bake_guard_cap
+    elif bake_guard == "auto":
+        if (n_loras >= 2) and (bake_delta_cap_user <= 0.0):
+            bake_delta_cap_eff = bake_guard_cap
+            
+    bake_fp32      = bool(getattr(args, "bake_fp32", False))
+    
+    from collections import defaultdict
+    sum_rho = defaultdict(float)
+    
+    if use_budget:
+        print("Budget pass-1: collecting per-target update sums...")
+
+        for lora_model, ratio_str in lora_list:
+            lpath = normalize_path(os.path.join(model_path, lora_model))
+            lsd, _meta, lisv2 = load_state_dict(lpath, torch.float, depatch=False)
+
+            g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
+
+            for down_k in tqdm(list(_iter_lora_down_keys(lsd)), desc=f"Budget scan {lora_model}...", leave=False):
+                bake_norm_use = bake_norm
+                d, u, a = _pair_from_down_key(down_k)
+                if d is None or (u not in lsd) or (d not in lsd):
+                    continue
+                if bake_unet_only and _is_text_encoder_lora_key(d):
+                    continue
+                
+                if _is_text_encoder_lora_key(d):
+                    bake_norm_use *= bake_clip_scale
+
+                # resolve target_key (std path only for SDXL; iszi ignored per your requirement)
+                if arch.get("AM", False):
+                    target_key = anima_resolve_target_any(d, theta_0)
+                    if target_key is None or (target_key not in theta_0):
+                        continue
+                else:
+                    full = convert_diffusers_name_to_compvis_cached(d, bool(lisv2))
+                    msd  = full.split(".", 1)[0]
+                    if arch.get("XL", False):
+                        msd = msd.replace("lora_unet","diffusion_model").replace("lora_te1_text_model","0_transformer_text_model")
+                    target_key = keymap.get(msd)
+                    if target_key is None or (target_key not in theta_0):
+                        continue
+
+                # ratio (include bake_norm)
+                ratio_eff = _effective_ratio_for_target(
+                    target_key,
+                    g=g, weights=weights, deep=deep,
+                    blockids=blocknum,
+                    arch=arch,
+                )
+                ratio_eff = float(ratio_eff) * float(bake_norm_use)
+
+                down = lsd[d]
+                up   = lsd[u]
+                if not (isinstance(down, torch.Tensor) and isinstance(up, torch.Tensor)):
+                    continue
+                dim = int(down.size(0))
+                alpha = lsd.get(a, dim)
+                if alpha is None and isinstance(a, str) and a.endswith(".weight"):
+                    alpha = lsd.get(a[:-len(".weight")], dim)
+                if isinstance(alpha, torch.Tensor):
+                    alpha = float(alpha.item())
+                sc = float(alpha) / float(dim)
+
+                # preprocess (same as apply side) to keep estimate consistent
+                up_p, down_p = _preprocess_up_down(up, down, rank_cap=bake_rank_cap, clamp_q=bake_clamp_q)
+
+                Wn0 = _get_W0n(target_key)
+                rho = _estimate_rel_update_bound(Wn0, up_p, down_p, sc=sc, ratio=ratio_eff)
+                if rho > 0.0:
+                    sum_rho[target_key] += float(rho)
+
+            del lsd
+            
+        budget_factor = {}  # target_key -> multiplier in (0,1]
+        for tk, sr in sum_rho.items():
+            if not (sr > 0.0):
+                continue
+            b = _budget_for_target(tk, spec=budget_spec, blockids=blocknum, arch=arch)
+            if b <= 0.0:
+                continue
+            f = min(1.0, float(b) / float(sr))
+            budget_factor[tk] = float(f)
+
+        if getattr(args, "bake_budget_report", False):
+            xs = sorted(((v, k, sum_rho[k], _budget_for_target(k, spec=budget_spec, blockids=blocknum, arch=arch))
+                         for k, v in budget_factor.items()), key=lambda x: x[0])
+            print("Budget report (most shrunk targets):")
+            for f, k, sr, b in xs[:30]:
+                print(f"  f={f:.3f}  sum_rho={sr:.3f}  budget={b:.3f}  key={k}")
+    else:
+        budget_factor = None
 
     for lora_model, ratio_str in lora_list:
         print(f"loading: {lora_model}")
 
-        ratios = ([float(x) for x in ratio_str.replace(" ", "").split(",")]
-                  if isinstance(ratio_str, str) else [float(ratio_str)] * len(blocknum))
-        lr_strs.append("[" + ",".join(str(x) for x in ratios) + "]")
+        g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
+        lr_strs.append(ratio_str)
 
         lpath = normalize_path(os.path.join(model_path, lora_model))
         lsd, meta, lisv2 = load_state_dict(lpath, torch.float, depatch=False)
@@ -575,35 +1284,47 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
         # --- apply plan build ---
         plan = []  # (kind, target_key, part, down_k, up_k, alpha_k, ratio)
         for down_k in tqdm(list(_iter_lora_down_keys(lsd)), desc=f"Planning {lora_model}..."):
+            bake_norm_use = bake_norm
             d, u, a = _pair_from_down_key(down_k)
             if d is None:
                 continue
             if (u not in lsd) or (d not in lsd):
                 continue
+            if bake_unet_only and _is_text_encoder_lora_key(d):
+                continue
+            if _is_text_encoder_lora_key(d):
+                bake_norm_use *= bake_clip_scale
             
-            if iszi:
+            if arch.get("ZI", False):
                 target_key, part = zimage_resolve_target_any(d, zi_index)
                 if target_key is None:
                     continue
-                full = convert_diffusers_name_to_compvis_cached(d, lisv2)
-                msd  = full.split(".", 1)[0]
-                bi   = _find_block_index(full, msd, blocksN)
-                ratio = ratios[bi] if bi < len(ratios) else ratios[0]
+                ratio = _effective_ratio_for_target(
+                    target_key,
+                    g=g, weights=weights, deep=deep,
+                    blockids=blocknum,
+                    arch=arch,
+                )
                 plan.append(("zi", target_key, part, d, u, a, float(ratio)))
                 continue
 
             # standard (SD/SDXL/Flux)
             full = convert_diffusers_name_to_compvis_cached(d, lisv2)
             msd  = full.split(".", 1)[0]
-            if isxl:
+            if arch.get("XL", False):
                 msd = msd.replace("lora_unet","diffusion_model").replace("lora_te1_text_model","0_transformer_text_model")
 
             target = keymap.get(msd)
             if target is None:
                 continue
 
-            bi    = _find_block_index(full, msd, blocksN)
-            ratio = ratios[bi] if bi < len(ratios) else ratios[0]
+            ratio = _effective_ratio_for_target(
+                target,
+                g=g, weights=weights, deep=deep,
+                blockids=blocknum,
+                arch=arch,
+            )
+            ratio = float(ratio) * float(bake_norm_use)
             plan.append(("std", target, None, d, u, a, float(ratio)))
 
         # --- apply ---
@@ -620,6 +1341,38 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                 alpha = lsd.get(alpha_k[:-len(".weight")], dim)
 
             sc = float(alpha) / float(dim)
+            
+            # preprocess (rank cap + clamp) on CPU tensors
+            up_p, down_p = _preprocess_up_down(
+                up, down, rank_cap=bake_rank_cap, clamp_q=bake_clamp_q
+            )
+
+            # ---- Guard: auto scale down / skip only problematic modules ----
+            if bake_guard != "none":
+                Wn = _get_Wn(target_key)
+                rho = _estimate_rel_delta_bound(Wn, up_p, down_p, sc=sc, ratio=ratio)
+
+                # too extreme -> skip this module only
+                if (bake_guard_skip and bake_guard_skip > 0.0) and (rho > bake_guard_skip):
+                    # (optional) log
+                    # print(f"[guard-skip] {lora_model} :: {target_key} rho={rho:.3f} ratio={ratio:.4g}")
+                    continue
+
+                # cap -> scale ratio down to satisfy cap
+                if (bake_delta_cap_eff and bake_delta_cap_eff > 0.0) and (rho > bake_delta_cap_eff):
+                    ratio = float(ratio) * float(bake_delta_cap_eff / max(rho, 1e-12))
+                    # (optional) log
+                    # print(f"[guard-cap ] {lora_model} :: {target_key} rho={rho:.3f}->{bake_delta_cap_eff:.3f} ratio-> {ratio:.4g}")
+
+            # delta cap (adjust ratio downward if too strong for this module)
+            if bake_delta_cap > 0.0:
+                # for zi we cap vs the actual target weight
+                W_ref = theta_0.get(target_key)
+                if isinstance(W_ref, torch.Tensor):
+                    ratio = _apply_delta_cap_to_ratio(W_ref, up_p, down_p, sc=sc, ratio=ratio, cap=bake_delta_cap)
+
+            # overwrite local up/down used below
+            up, down = up_p, down_p
 
             if kind == "zi":
                 W = theta_0.get(target_key)
@@ -638,18 +1391,24 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
 
             W = theta_0[target_key]
             dev = W.device
-            dt  = W.dtype if (isinstance(W, torch.Tensor) and W.is_floating_point()) else torch.float32
 
-            u = up.to(device=dev, dtype=dt, non_blocking=False)
-            d = down.to(device=dev, dtype=dt, non_blocking=False)
-
-            theta_0[target_key] = apply_lora_to_weight_inplace(W, u, d, sc, ratio)
+            if bake_fp32 and isinstance(W, torch.Tensor) and W.is_floating_point():
+                W_work = W.float()
+                u = up.to(device=dev, dtype=torch.float32, non_blocking=False)
+                d = down.to(device=dev, dtype=torch.float32, non_blocking=False)
+                W_out = apply_lora_to_weight_inplace(W_work, u, d, sc, ratio)
+                theta_0[target_key] = W_out.to(dtype=W.dtype)
+            else:
+                dt = W.dtype if (isinstance(W, torch.Tensor) and W.is_floating_point()) else torch.float32
+                u = up.to(device=dev, dtype=dt, non_blocking=False)
+                d = down.to(device=dev, dtype=dt, non_blocking=False)
+                theta_0[target_key] = apply_lora_to_weight_inplace(W, u, d, sc, ratio)
             
         del lsd
         
     prepare_state_dict_for_save(
         theta_0, args,
-        isxl=isxl, isflux=isflux, iszi=iszi,
+        arch=arch,
         vae_prefix=vae_key,
         prune=bool(getattr(args, "prune", False)),
         make_cpu=True,
@@ -699,22 +1458,22 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     theta_0 = upcast_fp8_state_dict(theta_0)
     model_name  = os.path.splitext(os.path.basename(mpath))[0]
 
-    isxl, isflux, iszi, theta_0 = detect_arch(theta_0)
+    arch, theta_0 = detect_arch(theta_0)
     
     zi_index = None
-    if iszi:
+    if arch.get("ZI", False):
         zi_index = _build_zi_layer_index(theta_0)
 
-    blocks  = LBLOCKS_ZI if iszi else (LBLOCKS_FLUX if isflux else (LBLOCKS_SDXL if isxl else LBLOCKS26))
-    blocknum = BLOCKIDZI if iszi else (BLOCKIDFLUX if isflux else (BLOCKIDXLL if isxl else BLOCKID))
+    blocks  = LBLOCKS_ZI if arch.get("ZI", False) else (LBLOCKS_FLUX if arch.get("FLUX", False) else (LBLOCKS_SDXL if arch.get("XL", False) else LBLOCKS26))
+    blocknum = BLOCKIDZI if arch.get("ZI", False) else (BLOCKIDFLUX if arch.get("FLUX", False) else (BLOCKIDXLL if arch.get("XL", False) else BLOCKID))
     blocksN = _normalize_blocks(blocks)
-    vae_key = "first_stage_model" if not (isflux or iszi) else "vae"
+    vae_key = "first_stage_model" if not (arch.get("FLUX", False) or arch.get("ZI", False)) else "vae"
 
     keymap = _build_keymap(theta_0)
 
     # mainlora
     main_sd, _, mlv2 = load_state_dict(mainlora, torch.float, depatch=False)
-    plan = build_apply_plan(main_sd.keys(), isxl=isxl, iszi=iszi, mlv2=mlv2, keymap=keymap)
+    plan = build_apply_plan(main_sd.keys(), arch=arch, mlv2=mlv2, keymap=keymap, theta_0=theta_0)
     del main_sd
 
     # DARE params
@@ -726,16 +1485,15 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     for lora_model, ratio_str in lora_list:
         print(f"loading: {lora_model}")
 
-        ratios = ([float(x) for x in ratio_str.replace(" ", "").split(",")]
-                  if isinstance(ratio_str, str) else [ratio_str] * len(blocknum))
-        lr_strs.append("[" + ",".join(str(x) for x in ratios) + "]")
-
+        g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
+        lr_strs.append(ratio_str)
+        
         lpath = normalize_path(os.path.join(model_path, lora_model))
         lsd, meta, lisv2 = load_state_dict(lpath, torch.float, depatch=False)
         lhash, _, cache_data = sha256_from_cache(lpath, f"lora/{os.path.splitext(os.path.basename(lpath))[0]}", cache_data)
         lora_meta[lhash] = meta
 
-        lw = merge_weights_inplace(lsd, lisv2, isxl, blocks, p, lam, scale, ratios)
+        lw = merge_weights_inplace(lsd, lisv2, arch.get("XL", False), blocks, p, lam, scale, [1.0])
 
         for kind, down_k, up_k, alpha_k, tgt, part in tqdm(plan, desc=f"Applying {lora_model}...", leave=False):
             d, u, a = _pair_from_down_key(down_k)
@@ -744,16 +1502,24 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
             if (u not in lsd) or (d not in lsd):
                 continue
             
-            if iszi:
+            if arch.get("ZI", False):
                 target_key, part = zimage_resolve_target_any(d, zi_index)
                 if target_key is None:
                     continue
                 full = convert_diffusers_name_to_compvis_cached(d, lisv2)
                 msd  = full.split(".", 1)[0]
                 bi   = _find_block_index(full, msd, blocksN)
-                ratio = ratios[bi] if bi < len(ratios) else ratios[0]
+                ratio = _effective_ratio_for_target(
+                    tgt,
+                    g=g, weights=weights, deep=deep,
+                    blockids=blocknum,
+                    arch=arch,
+                )
                 plan.append(("zi", target_key, part, d, u, a, float(ratio)))
                 continue
+            
+            if arch.get("AM", False):
+                tgt = anima_resolve_target_any(down_k, keymap)
 
             # alpha / scale
             down = lw[down_k]
@@ -783,14 +1549,14 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
 
             dev = W.device
             W32 = W.float()
-            out = apply_lora_to_weight_inplace(W32, up.to(dev).float(), down.to(dev).float(), sc, ratio=1.0)
+            out = apply_lora_to_weight_inplace(W32, up.to(dev).float(), down.to(dev).float(), sc, ratio=ratio)
             theta_0[tgt] = out.to(W.dtype)
 
         del lw, lsd
         
     prepare_state_dict_for_save(
         theta_0, args,
-        isxl=isxl, isflux=isflux, iszi=iszi,
+        arch=arch,
         vae_prefix=vae_key,
         prune=bool(getattr(args, "prune", False)),
         make_cpu=True,
@@ -821,18 +1587,475 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
     del theta_0
     dump_cache(cache_data)
     print(f"Done! ({round(os.path.getsize(output)/1073741824, 2)}G)")
+    
+def _infer_arch_from_lora_keys(keys: list[str]) -> tuple[bool, bool, bool]:
+    """
+    return (isxl, isflux, iszi)  heuristic
+    """
+    arch = {"XL": False, "FLUX": False, "ZI": False, "AM": False}
+
+    # AM (Anima)
+    for k in keys:
+        if "lora_unet_blocks_" in k or "lora_te_layers_" in k:
+            arch["AM"] = True
+            return arch
+        
+    # Z-Image / DiT
+    for k in keys:
+        if _ZI_LAYER_RE.match(k) or "diffusion_model.layers." in k or "diffusion_model_layers_" in k:
+            arch["ZI"] = True
+            return arch
+        if "context_refiner" in k or "noise_refiner" in k:
+            arch["ZI"] = True
+            return arch
+
+    # SDXL 
+    for k in keys:
+        if k.startswith("lora_te2_") or "te2_text_model" in k or "lora_te2_text_model_encoder_layers_" in k:
+            arch["XL"] = True
+            return arch
+
+    # Flux
+    for k in keys:
+        if "text_encoders" in k or "qwen" in k:
+            arch["FLUX"] = True
+            return arch
+
+    return arch
+
+
+def _canonical_lora_base(down_k: str) -> str | None:
+    """
+    '...lora_A.weight' or '...lora_down.weight' -> base (without suffix)
+    """
+    if down_k.endswith(".lora_A.weight"):
+        return down_k[:-len(".lora_A.weight")]
+    if down_k.endswith(".lora_down.weight"):
+        return down_k[:-len(".lora_down.weight")]
+    return None
+
+
+def _to_2d_up_down(up: torch.Tensor, down: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, bool, tuple]:
+    """
+    Returns (up2d [out,r], down2d [r,in_flat], is_conv, shape_info)
+      shape_info:
+        if conv: (in_ch, kh, kw)
+        else:    (in_ch, 1, 1)
+    """
+    # up: (out, r) or (out, r, 1, 1)
+    if up.ndim == 4:
+        up2d = up.squeeze(3).squeeze(2)
+        is_up_conv = True
+    else:
+        up2d = up
+        is_up_conv = False
+
+    # down: (r, in) or (r, in, kh, kw)
+    if down.ndim == 4:
+        r, in_ch, kh, kw = down.shape
+        down2d = down.reshape(r, in_ch * kh * kw)
+        is_down_conv = True
+        shape_info = (in_ch, kh, kw)
+    else:
+        r, in_ch = down.shape
+        down2d = down
+        is_down_conv = False
+        shape_info = (in_ch, 1, 1)
+
+    is_conv = bool(is_up_conv or is_down_conv)
+    return up2d, down2d, is_conv, shape_info
+
+
+def _compress_uv_rankcap(U: torch.Tensor, V: torch.Tensor, r_cap: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compress factorization (U [out,k], V [k,in]) into rank r_cap using:
+      U = Qu Ru, V^T = Qv Rv  => UV = Qu (Ru Rv^T) Qv^T
+      SVD on (Ru Rv^T) which is k x k
+    """
+    k = int(U.shape[1])
+    if (r_cap <= 0) or (k <= r_cap):
+        return U, V
+
+    Uc = U.to(dtype=torch.float32)
+    Vc = V.to(dtype=torch.float32)
+
+    Qu, Ru = torch.linalg.qr(Uc, mode="reduced")       # Qu: [out,k], Ru: [k,k]
+    Qv, Rv = torch.linalg.qr(Vc.t(), mode="reduced")   # Qv: [in,k],  Rv: [k,k]
+
+    M = Ru @ Rv.t()  # [k,k]
+    P, S, Vh = torch.linalg.svd(M, full_matrices=False)  # M = P diag(S) Vh
+
+    r = min(int(r_cap), int(S.numel()))
+    A = Qu @ P[:, :r]              # [out,r]
+    B = Qv @ Vh.t()[:, :r]         # [in,r]
+
+    sqrtS = torch.sqrt(S[:r].clamp_min(0.0))
+    U_new = A * sqrtS              # [out,r]
+    V_new = (sqrtS[:, None] * B.t())  # [r,in]
+
+    return U_new, V_new
+
+CLAMP_QUANTILE_DEFAULT = 0.99
+
+@torch.inference_mode()
+def _compress_uv_rankcap_dimstyle(U: torch.Tensor, V: torch.Tensor, r_cap: int) -> tuple[torch.Tensor, torch.Tensor]:
+    k = int(U.shape[1])
+    if (r_cap <= 0) or (k <= r_cap):
+        return U, V
+
+    Uc = U.to(dtype=torch.float32)
+    Vc = V.to(dtype=torch.float32)
+
+    # U = Qu Ru,  V^T = Qv Rv  => M = Qu (Ru Rv^T) Qv^T
+    Qu, Ru = torch.linalg.qr(Uc, mode="reduced")       # Qu: [out,k], Ru: [k,k]
+    Qv, Rv = torch.linalg.qr(Vc.t(), mode="reduced")   # Qv: [in,k],  Rv: [k,k]
+
+    Msmall = Ru @ Rv.t()                               # [k,k]
+    P, S, Vh = torch.linalg.svd(Msmall, full_matrices=False)
+
+    r = min(int(r_cap), int(S.numel()))
+    if r <= 0:
+        return U[:, :0], V[:0, :]
+
+    # up = (Qu P) diag(S)
+    up = (Qu @ P[:, :r]) * S[:r]                       # [out,r]
+
+    # down = (Vh Qv^T)
+    down = (Vh[:r, :] @ Qv.t())                        # [r,in]
+
+    return up, down
+
+
+@torch.inference_mode()
+def _clamp_uv_quantile_inplace(up: torch.Tensor, down: torch.Tensor, q: float) -> tuple[torch.Tensor, torch.Tensor]:
+    if q is None:
+        return up, down
+    q = float(q)
+    if not (0.0 < q < 1.0):
+        return up, down
+
+    dist = torch.cat([up.reshape(-1), down.reshape(-1)]).to(dtype=torch.float32)
+    if dist.numel() == 0:
+        return up, down
+
+    hi = torch.quantile(dist.abs(), q)
+    hi = float(hi.item()) if isinstance(hi, torch.Tensor) else float(hi)
+    if not (hi > 0.0):
+        return up, down
+
+    lo = -hi
+    up = up.clamp(lo, hi)
+    down = down.clamp(lo, hi)
+    return up, down
+
+
+@torch.inference_mode()
+def merge_loras_only(
+    lora_list: list[list[str]],
+    output: str,
+    model_path: str,
+    device: str = "cpu",
+    *,
+    merge_rank: int = 64,
+    arch_set: str = "auto",
+    merge_norm="none",
+    merge_scale=1.0,
+    unet_only=False,
+    clamp_quantile: float = CLAMP_QUANTILE_DEFAULT,
+    intermediate_mult: int = 4,
+):
+    set_cache_filename(os.path.join(base_path(), "cache.json"))
+    merge_cache_json(model_path)
+    cache_data = cache("hashes", None)
+
+    model_path = normalize_path(model_path)
+    if not lora_list:
+        return "ERROR: No LoRA Selected"
+
+    print("Merge LoRAs start")
+    print(f"Output: {output}")
+    print(f"merge_rank(target): {merge_rank}  (0=keep as-is per module)")
+    print(f"arch: {arch}")
+    print(f"merge_norm: {merge_norm}  merge_scale: {merge_scale}")
+    print(f"clamp_quantile: {clamp_quantile}  intermediate_mult: {intermediate_mult}")
+
+    # arch decision
+    arch = {"XL": False, "FLUX": False, "ZI": False, "AM": False}
+    decided = False
+    blocknum = None
+
+    merged_meta = {}
+    merged_sources = []
+
+    n_src = max(1, len(lora_list))
+    if merge_norm == "mean":
+        global_norm = 1.0 / n_src
+    elif merge_norm == "sqrt":
+        global_norm = 1.0 / math.sqrt(n_src)
+    else:
+        global_norm = 1.0
+    global_norm *= float(merge_scale)
+
+    # base -> state(U,V,is_conv,shape_info,out_ch,in_flat)
+    merged: dict[str, dict] = {}
+
+    # intermediate keep rank
+    k_soft = 0
+    if merge_rank > 0:
+        k_soft = max(int(merge_rank), 1) * max(int(intermediate_mult), 1)
+
+    for lora_model, ratio_str in lora_list:
+        lpath = normalize_path(os.path.join(model_path, lora_model))
+        print(f"loading lora: {lora_model}")
+
+        lsd, meta, lisv2 = load_state_dict(lpath, torch.float, depatch=False)
+        lhash, _, cache_data = sha256_from_cache(
+            lpath, f"lora/{os.path.splitext(os.path.basename(lpath))[0]}", cache_data
+        )
+        merged_meta[lhash] = meta
+        merged_sources.append({"name": lora_model, "hash": lhash, "ratio": ratio_str})
+
+        if not decided:
+            if arch_set == "auto":
+                arch = _infer_arch_from_lora_keys(list(lsd.keys()))
+            else:
+                arch["XL"] = (arch_set == "sdxl")
+                arch["FLUX"] = (arch_set == "flux")
+                arch["ZI"] = (arch_set == "zi")
+                arch["AM"] = (arch_set == "anima")
+
+            blocknum = (
+                BLOCKIDZI if arch["ZI"] else
+                (BLOCKIDFLUX if arch["FLUX"] else
+                (BLOCKIDXLL if arch["XL"] else
+                (BLOCKIDAM if arch["AM"] else BLOCKID)))
+            )
+            decided = True
+            print(f"detected arch: isxl={arch['XL']} isflux={arch['FLUX']} iszi={arch['ZI']} (blocklen={len(blocknum)})")
+
+        g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
+
+        for down_k in tqdm(list(_iter_lora_down_keys(lsd)), desc=f"Merging factors {lora_model}..."):
+            d, u, a = _pair_from_down_key(down_k)
+            if d is None:
+                continue
+            if (u not in lsd) or (d not in lsd):
+                continue
+
+            base = _canonical_lora_base(d)
+            if base is None:
+                continue
+
+            if unet_only:
+                if ("lora_te" in base) or ("text_encoder" in base) or ("te_" in base):
+                    continue
+
+            down = lsd[d]
+            up = lsd[u]
+            if not (isinstance(down, torch.Tensor) and isinstance(up, torch.Tensor)):
+                continue
+
+            rank = int(down.size(0))
+            alpha = lsd.get(a, rank)
+            if alpha is None and isinstance(a, str) and a.endswith(".weight"):
+                alpha = lsd.get(a[:-len(".weight")], rank)
+            if isinstance(alpha, torch.Tensor):
+                alpha = float(alpha.item())
+            alpha = float(rank if alpha is None else alpha)
+
+            # ratio target key (block/elementals)
+            if arch["ZI"]:
+                tgt, _part = zimage_resolve_target(d)
+                target_key = tgt if tgt is not None else d
+            elif arch["AM"]:
+                target_key = _am_target_key_from_lora_down(d) or d
+            else:
+                full = convert_diffusers_name_to_compvis_cached(d, bool(lisv2))
+                msd = full.split(".", 1)[0]
+                if arch["XL"]:
+                    msd = msd.replace("lora_unet", "diffusion_model").replace("lora_te1_text_model", "0_transformer_text_model")
+                target_key = msd
+
+            ratio_eff = _effective_ratio_for_target(
+                target_key,
+                g=g, weights=weights, deep=deep,
+                blockids=blocknum,
+                arch=arch,
+            )
+
+            # bake scale = ratio * (alpha/rank)
+            s = global_norm * float(ratio_eff) * (float(alpha) / float(rank))
+            if s == 0.0:
+                continue
+
+            up2d, down2d, is_conv, shape_info = _to_2d_up_down(up, down)
+            if up2d.ndim != 2 or down2d.ndim != 2:
+                continue
+            out_ch = int(up2d.shape[0])
+            r_up = int(up2d.shape[1])
+            r_dn = int(down2d.shape[0])
+            if r_up != r_dn:
+                continue
+            in_flat = int(down2d.shape[1])
+
+            sign = -1.0 if s < 0 else 1.0
+            fac = math.sqrt(abs(float(s)))
+
+            U_add = up2d.to(dtype=torch.float32, device="cpu") * fac
+            V_add = down2d.to(dtype=torch.float32, device="cpu") * (fac * sign)
+
+            st = merged.get(base)
+            if st is None:
+                merged[base] = {
+                    "U": U_add,
+                    "V": V_add,
+                    "is_conv": bool(is_conv),
+                    "shape_info": shape_info,
+                    "out_ch": out_ch,
+                    "in_flat": in_flat,
+                }
+            else:
+                if int(st["out_ch"]) != out_ch or int(st["in_flat"]) != in_flat:
+                    continue
+
+                st["U"] = torch.cat([st["U"], U_add], dim=1)  # out x (k+rank)
+                st["V"] = torch.cat([st["V"], V_add], dim=0)  # (k+rank) x in
+
+                if (merge_rank > 0) and (k_soft > 0) and (int(st["U"].shape[1]) > k_soft):
+                    st["U"], st["V"] = _compress_uv_rankcap_dimstyle(st["U"], st["V"], int(k_soft))
+
+        del lsd
+
+    # finalize + save
+    out_sd = {}
+    n_modules = 0
+
+    for base, st in tqdm(list(merged.items()), desc="Finalizing merged LoRA..."):
+        U = st["U"]
+        V = st["V"]
+        is_conv = bool(st["is_conv"])
+        out_ch = int(st["out_ch"])
+        in_flat = int(st["in_flat"])
+
+        k = int(U.shape[1])
+        if k <= 0:
+            continue
+        if merge_rank > 0:
+            U, V = _compress_uv_rankcap_dimstyle(U, V, int(merge_rank))
+            r = int(U.shape[1])
+            if r < int(merge_rank):
+                pad = int(merge_rank) - r
+                U = torch.cat([U, torch.zeros((U.shape[0], pad), dtype=U.dtype, device=U.device)], dim=1)
+                V = torch.cat([V, torch.zeros((pad, V.shape[1]), dtype=V.dtype, device=V.device)], dim=0)
+                r = int(merge_rank)
+        else:
+            r = int(U.shape[1])
+
+        # clamp
+        U, V = _clamp_uv_quantile_inplace(U, V, clamp_quantile)
+
+        # reshape back to kohya style
+        if is_conv:
+            in_ch, kh, kw = st["shape_info"]
+            down_t = V.reshape(r, int(in_ch), int(kh), int(kw))
+            up_t = U.reshape(out_ch, r, 1, 1)
+        else:
+            down_t = V.reshape(r, in_flat)
+            up_t = U.reshape(out_ch, r)
+
+        # save dtype
+        up_t = up_t.contiguous().cpu().to(torch.float16)
+        down_t = down_t.contiguous().cpu().to(torch.float16)
+
+        # output keys (kohya)
+        down_k = base + ".lora_down.weight"
+        up_k = base + ".lora_up.weight"
+        alpha_k = base + ".alpha"
+
+        out_sd[down_k] = down_t
+        out_sd[up_k] = up_t
+        out_sd[alpha_k] = torch.tensor(float(r), dtype=torch.float32)
+
+        n_modules += 1
+
+    meta_new = {
+        "sd_merge_models": json.dumps({
+            "type": "lora-merge-chattiori-dim",
+            "merge_rank_target": int(merge_rank),
+            "intermediate_mult": int(intermediate_mult),
+            "clamp_quantile": float(clamp_quantile),
+            "arch": ("zi" if arch["ZI"] else ("flux" if arch["FLUX"] else ("sdxl" if arch["XL"] else "sd"))),
+            "merge_norm": str(merge_norm),
+            "merge_scale": float(merge_scale),
+            "sources": merged_sources,
+            "output_name": os.path.splitext(os.path.basename(output))[0],
+        }),
+        "lora": json.dumps(merged_meta),
+    }
+
+    print(f"Saving merged LoRA as {output}...")
+    safetensors.torch.save_file(out_sd, output, metadata=meta_new)
+
+    dump_cache(cache_data)
+    print(f"Done! {round(os.path.getsize(output)/1073741824, 3)}G")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Merge several loras to checkpoint")
     parser.add_argument("model_path", type=str, help="Path to models")
-    parser.add_argument("checkpoint", type=str, help="Name of the checkpoint")
-    parser.add_argument("loras", type=str, help="Path and alpha of LoRAs eg.)\"Path:alpha,Path:alpha, ...\"")
+    parser.add_argument("checkpoint", type=str, nargs="?", help="Name of the checkpoint", default=None)
+    parser.add_argument("loras", type=str, nargs="?", help="Path and alpha of LoRAs eg.)\"Path:alpha,Path:alpha, ...\"", default=None)
     parser.add_argument("--save_half", action="store_true", help="Save as float16", required=False)
     parser.add_argument("--save_bhalf", action="store_true", help="Save as bfloat16", required=False)
     parser.add_argument("--prune", action="store_true", help="Prune Model", required=False)
     parser.add_argument("--save_quarter", action="store_true", help="Save as float8", required=False)
     parser.add_argument("--keep_ema", action="store_true", help="Keep ema", required=False)
     parser.add_argument("--dare", action="store_true", help="Use DARE Merge")
+    parser.add_argument("--merge_loras", action="store_true",
+                        help="Merge multiple LoRAs into a single LoRA (does NOT bake into checkpoint)")
+    parser.add_argument("--merge_rank", type=int, default=64,
+                        help="Rank cap for merged LoRA. 0 means unlimited (exact concat; can get huge). Default=64")
+    parser.add_argument("--merge_arch", type=str, default="auto",
+                        choices=["auto", "sd", "sdxl", "flux", "zi", "am"],
+                        help="Architecture for ratio/block mapping in merge mode. Default=auto")
+    parser.add_argument("--merge_norm", type=str, default="none",
+                    choices=["none","sqrt","mean"],
+                    help="Global normalization for merging many LoRAs. mean=1/N, sqrt=1/sqrt(N).")
+    parser.add_argument("--merge_scale", type=float, default=1.0,
+                        help="Extra global scale multiplier applied after merge_norm.")
+    parser.add_argument("--merge_unet_only", action="store_true",
+                        help="Only merge UNet LoRA modules (skip text encoders).")
+    parser.add_argument("--bake_clip_scale", type=float, default=1.0,
+                    help="Global scale multiplier for text encoder LoRA modules when baking into checkpoint. Default=1.0 (no extra scaling).")
+    parser.add_argument("--bake_unet_only", action="store_true",
+                    help="Bake only UNet/DiT modules (skip text encoder LoRA modules).")
+    parser.add_argument("--bake_norm", type=str, default="sqrt", choices=["none","sqrt","mean"],
+                        help="Global normalization when baking many LoRAs. sqrt=1/sqrt(N), mean=1/N.")
+    parser.add_argument("--bake_scale", type=float, default=1.0,
+                        help="Extra global multiplier applied after bake_norm.")
+    parser.add_argument("--bake_rank_cap", type=int, default=0,
+                        help="Per-module rank cap before applying. 0 disables.")
+    parser.add_argument("--bake_clamp_q", type=float, default=0.0,
+                        help="Quantile clamp for up/down weights (0 disables). Suggested 0.995~0.999.")
+    parser.add_argument("--bake_delta_cap", type=float, default=0.0,
+                        help="Per-module cap: ||ΔW||_F <= cap * ||W||_F (0 disables). Suggested 0.02~0.10.")
+    parser.add_argument("--bake_fp32", action="store_true",
+                        help="Accumulate LoRA deltas in fp32 then cast back to original dtype.")
+    parser.add_argument("--bake_guard", type=str, default="auto",
+                        choices=["none", "auto", "cap"],
+                        help="Safety guard for baking. auto: enable cap when baking many LoRAs and bake_delta_cap<=0. cap: force bake_guard_cap. none: disable.")
+    parser.add_argument("--bake_guard_cap", type=float, default=0.05,
+                        help="Cap for relative update: ||ΔW||_F <= cap * ||W||_F (used by bake_guard). Suggested 0.02~0.10.")
+    parser.add_argument("--bake_guard_skip", type=float, default=0.25,
+                        help="Skip module if estimated ||ΔW||_F / ||W||_F exceeds this. 0 disables. Suggested 0.15~0.50.")
+    parser.add_argument("--bake_budget", type=str, default="",
+        help="Per-target update budget (relative). Empty disables. Examples: '0.18' (flat), '0.10:0.18' (early:late), '0.08:0.12:0.18' (early:mid:late), or ratio-spec like '0.18,[...]'.")
+
+    parser.add_argument("--bake_budget_metric", type=str, default="fro",
+        choices=["fro"],
+        help="Budget metric. (currently only frobenius upper-bound estimate)")
+
+    parser.add_argument("--bake_budget_report", action="store_true",
+        help="Print budget scaling report (top targets by shrink).")
     parser.add_argument("--no_metadata", action="store_true", help="Save without metadata")
     parser.add_argument("--memo",   type=str,   help="Additional info bake in metadata", default=None)
     parser.add_argument("--save_safetensors", action="store_true", help="Save as .safetensors", required=False)
@@ -843,7 +2066,29 @@ if __name__ == "__main__":
 
     ll  = get_loralist(args.loras)
     out = normalize_path(os.path.join(args.model_path, f"{args.output}.{'safetensors' if args.save_safetensors else 'ckpt'}"))
-
+    
+    # --- LoRA merge only mode (no checkpoint bake) ---
+    if getattr(args, "merge_loras", False):
+        out_lora = normalize_path(os.path.join(
+            args.model_path,
+            f"{args.output}.safetensors"
+        ))
+        merge_loras_only(
+            ll,
+            out_lora,
+            args.model_path,
+            args.device,
+            merge_rank=int(getattr(args, "merge_rank", 64)),
+            arch_set=str(getattr(args, "merge_arch", "auto")),
+            merge_norm=str(getattr(args, "merge_norm","none")), 
+            merge_scale=float(getattr(args, "merge_scale", 1.0)), 
+            unet_only=getattr(args, "merge_unet_only", False)
+        )
+        raise SystemExit(0)
+    else:
+        if args.checkpoint is None:
+            raise ValueError("checkpoint is None")
+        
     if args.dare:
         mainlora = normalize_path(os.path.join(args.model_path, ll[0][0]))
         darelora(mainlora, ll, args.checkpoint, out, args.model_path, args.device)

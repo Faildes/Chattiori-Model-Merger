@@ -36,6 +36,7 @@ BLOCKIDXLL = ["BASE"] + [f"IN{i:02}" for i in range(9)] + ["M00"] + [f"OUT{i:02}
 BLOCKIDXL = ["BASE"] + [f"IN{i}" for i in range(9)] + ["M"] + [f"OUT{i}" for i in range(9)] + ["VAE"]
 BLOCKIDFLUX = ["CLIP", "T5", "IN"] + ["D{:002}".format(x) for x in range(19)] + ["S{:002}".format(x) for x in range(38)] + ["OUT"] # Len: 61
 BLOCKIDZI = ["BASE","CONT","NOISE"] + [f"L{i:02}" for i in range(30)] + ["VAE"]
+BLOCKIDAM = ["BASE"] + [f"L{i:02}" for i in range(28)] + ["VAE"] # Anima Model has 28 blocks
 
 _re_inp = re.compile(r'\.input_blocks\.(\d+)\.')
 _re_mid = re.compile(r'\.middle_block\.(\d+)\.')
@@ -192,11 +193,101 @@ def make_lblocks_zi():
 
     return lblocks
 
+def make_lblocks_am():
+    """
+    Order aligns with BLOCKIDAM:
+      BASE, L00..L27, VAE
+
+    Supports checkpoint keys:
+      - official:   net.* (then normalized)
+      - unofficial: no net.
+      - AIO:        cond_stage_model.qwen3_06b.* + model.diffusion_model.* + first_stage_model.*
+
+    Supports LoRA keys (kohya-style):
+      - TE:   lora_te_layers_{n}_...
+      - UNet: lora_unet_blocks_{n}_...
+      - VAE:  lora_vae_* or lora_first_stage_model_*
+    """
+    lblocks = []
+
+    # -------------------------
+    # BASE (text + adapters/embeds)
+    # -------------------------
+    lblocks.append([
+        # ---- AIO text encoder (checkpoint) ----
+        "cond_stage_model.qwen3_06b.",
+
+        # ---- canonicalized text encoder (if you normalize AIO -> text_encoders.*) ----
+        "text_encoders.qwen3_06b.", "text_encoders.qwen3_06b_base.",
+        "qwen3_06b.", "qwen3_06b_base.",
+
+        # ---- diffusion-side adapters / time/pos ----
+        "model.diffusion_model.llm_adapter.", "llm_adapter.",
+        "model.diffusion_model.t_embedder.", "t_embedder.",
+        "model.diffusion_model.t_embedding_norm.", "t_embedding_norm.",
+        "model.diffusion_model.pos_embedder.", "pos_embedder.",
+
+        # ---- official may come as net.* ----
+        "net.llm_adapter.", "net.t_embedder.", "net.t_embedding_norm.", "net.pos_embedder.",
+
+        # ---- LoRA: TE side (all goes to BASE, like ZI) ----
+        "lora_te_",                 # generic
+        "lora_te_layers_",          # matches: lora_te_layers_7_...
+        "lora_text_encoder_",       # some trainers use this
+
+        # ---- LoRA: sometimes text is named as cond_stage_model in lora packs ----
+        "lora_cond_stage_model_",   # just in case
+    ])
+
+    # -------------------------
+    # L00..L27 (diffusion blocks)
+    # -------------------------
+    for i in range(28):
+        lblocks.append([
+            # checkpoint keys
+            f"model.diffusion_model.blocks.{i}.",
+            f"blocks.{i}.",
+            f"net.blocks.{i}.",
+
+            # LoRA keys (kohya-style)
+            f"lora_unet_blocks_{i}_",     # matches: lora_unet_blocks_0_self_attn_q_proj...
+            f"lora_unet_blocks.{i}.",     # safety (rare)
+        ])
+
+    # Add x_embedder into L00 bucket (input-like)
+    lblocks[1].extend([
+        "model.diffusion_model.x_embedder.", "x_embedder.",
+        "net.x_embedder.",
+        "lora_unet_x_embedder", "lora_unet_x_embedder_",  # just in case
+    ])
+
+    # Add final_layer into L27 bucket (output-like)
+    lblocks[28].extend([
+        "model.diffusion_model.final_layer.", "final_layer.",
+        "net.final_layer.",
+        "lora_unet_final_layer", "lora_unet_final_layer_",  # just in case
+        "lora_unet_out", "lora_unet_out_",                  # some packs use out naming
+    ])
+
+    # -------------------------
+    # VAE
+    # -------------------------
+    lblocks.append([
+        "vae.",
+        "first_stage_model.",
+
+        # LoRA (if present)
+        "lora_vae_", "lora_first_stage_model_", "lora_fs_", "lora_vae",
+    ])
+
+    return lblocks
+
 
 # Convenient ready-to-use constants
 LBLOCKS_SDXL = make_lblocks_sdxl()
 LBLOCKS_FLUX = make_lblocks_flux()
 LBLOCKS_ZI   = make_lblocks_zi()
+LBLOCKS_AM = make_lblocks_am()
 
 LBLOCKS26 = [
     "encoder",
@@ -349,8 +440,8 @@ def colorcalc(cols, isxl):
     M = COLSXL if isxl else COLS
     return [0.02 * sum(v * cols[i] for i, v in enumerate(col)) for col in zip(*M)]
 
-def fineman(fine, isxl=False, isflux=False):
-    if isflux:
+def fineman(fine, arch):
+    if arch.get("FLUX", False):
         mul = {
             "double_block": 1.0 + (fine[0] * 0.01) if len(fine) > 0 else 1.0,
             "img_in":       1.0 + (fine[1] * 0.01) if len(fine) > 1 else 1.0,
@@ -366,7 +457,7 @@ def fineman(fine, isxl=False, isflux=False):
         1 - fine[1] * 0.01,
         1 + fine[1] * 0.02,
         1 - fine[2] * 0.01,
-        [fine[3] * 0.02] + colorcalc(fine[4:8], isxl)
+        [fine[3] * 0.02] + colorcalc(fine[4:8], arch.get("XL", False))
         ]
     return r
 
@@ -414,21 +505,26 @@ def prepare_state_dict_for_save(
     theta: dict,
     args,
     *,
-    isxl: bool,
-    isflux: bool,
-    iszi: bool,
+    arch: dict,
     vae_prefix: str | None,
     prune: bool = True,
     make_cpu: bool = True,
     make_contiguous: bool = True,
 ):
     # roots
-    if isflux:
+    if arch.get("FLUX", False):
         cond_prefixes = ("clip.cond_stage_model.",)
-    elif isxl:
+    elif arch.get("XL", False):
         cond_prefixes = ("conditioner.",)
-    elif iszi:
+    elif arch.get("ZI", False):
         cond_prefixes = ("text_encoders.qwen3_4b.",)
+    elif arch.get("AM", False):
+        cond_prefixes = (
+            "text_encoders.qwen3_06b.",
+            "text_encoders.qwen3_06b_base.",
+            "cond_stage_model.qwen3_06b.",
+            "qwen3_06b.", "qwen3_06b_base.",
+        )
     else:
         cond_prefixes = ("cond_stage_model.",)
 
@@ -456,7 +552,7 @@ def prepare_state_dict_for_save(
         v = theta.get(k, None)
 
         # prune
-        if prune and (".scale" in k and iszi) or (not any(k.startswith(r) for r in roots)):
+        if prune and ((".scale" in k and arch.get("ZI", False)) or (not any(k.startswith(r) for r in roots))):
             theta.pop(k, None)
             continue
 
@@ -655,40 +751,121 @@ def to_qdtype(sd1, sd2, qd1, qd2, device):
     if qd2 in QTYPES: sd2, _ = q_dequantize(sd2, qd2, device, t2)
     return sd1, sd2
 
-def maybe_to_qdtype(a, b, qa, qb, device, isflux):
+def maybe_to_qdtype(a, b, qa, qb, device, isflux: bool = True):
     return to_qdtype(a, b, qa, qb, device) if isflux and qa != qb else (a, b)
 
 def detect_arch(theta):
-    isxl = "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta
-    isflux = any("double_block" in k for k in theta.keys())
-
     keys = list(theta.keys())
-    iszi = (
+
+    # -------------------------
+    # Anima (AM) detection
+    # -------------------------
+    def _is_am_key(k: str) -> bool:
+        # diffusion signature (DiT blocks + adaln + proj names)
+        if (".blocks." in k or k.startswith(("blocks.", "net.blocks.", "model.diffusion_model.blocks."))):
+            if ("adaln_modulation_" in k) or (".q_proj.weight" in k) or (".k_proj.weight" in k) or (".v_proj.weight" in k):
+                return True
+            if (".self_attn." in k) or (".cross_attn." in k):
+                return True
+        # diffusion head / adapters
+        if ("final_layer.linear.weight" in k) or ("llm_adapter." in k) or ("t_embedding_norm" in k):
+            return True
+        # AIO text encoder signature
+        if k.startswith("cond_stage_model.qwen3_06b."):
+            return True
+        return False
+
+    isam = any(_is_am_key(k) for k in keys)
+
+    # -------------------------
+    # Z-Image (ZI) detection (avoid x_embedder/t_embedder false positives)
+    # -------------------------
+    iszi = (not isam) and (
         ("model.diffusion_model.cap_embedder.0.weight" in theta) or
         ("cap_embedder.0.weight" in theta) or
-        any(k.startswith("model.diffusion_model.layers.") or k.startswith("diffusion_model.layers.") for k in keys) or
-        any("diffusion_model.context_refiner" in k or "context_refiner" in k for k in keys) or
-        any("diffusion_model.noise_refiner" in k or "noise_refiner" in k for k in keys) or
-        any("x_embedder." in k or "t_embedder." in k for k in keys)
+        any(k.startswith(("model.diffusion_model.layers.", "diffusion_model.layers.", "layers.")) for k in keys) or
+        any("context_refiner" in k for k in keys) or
+        any("noise_refiner" in k for k in keys)
     )
 
-    if not iszi:
-        return isxl, isflux, False, theta
+    isxl = ("conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta)
 
-    def _zi_key(k: str) -> str:
-        if k.startswith(("vae.", "text_encoders.", "model.diffusion_model.")):
+    # Flux detection (keep both keys for compatibility)
+    isflux = any(("double_blocks" in k) or ("double_block" in k) or ("single_blocks" in k) or ("single_block" in k) for k in keys)
+
+    arch = {
+        "XL":   bool(isxl),
+        "FLUX": bool(isflux),
+        "ZI":   bool(iszi),
+        "AM":   bool(isam),
+    }
+
+    # -------------------------
+    # normalize keys for ZI
+    # -------------------------
+    if iszi:
+        def _zi_key(k: str) -> str:
+            if k.startswith(("vae.", "text_encoders.", "model.diffusion_model.")):
+                return k
+
+            if k.startswith("diffusion_model."):
+                return "model." + k
+
+            if k.startswith(("layers.", "context_refiner.", "noise_refiner.", "final_layer.", "cap_embedder.")):
+                return "model.diffusion_model." + k
+
             return k
 
-        if k.startswith("diffusion_model."):
-            return "model." + k  # -> model.diffusion_model....
+        theta = {_zi_key(k): v for k, v in theta.items()}
 
-        if k.startswith(("layers.", "context_refiner.", "noise_refiner.", "final_layer.", "cap_embedder.")):
-            return "model.diffusion_model." + k
+    # -------------------------
+    # normalize keys for AM (format conversion)
+    #   official:   net.* -> model.diffusion_model.*
+    #   unofficial: blocks.* -> model.diffusion_model.blocks.*
+    #   AIO text:   cond_stage_model.qwen3_06b.* -> text_encoders.qwen3_06b.*
+    # -------------------------
+    if isam:
+        def _am_key(k: str) -> str:
+            # VAE keep
+            if k.startswith(("vae.", "first_stage_model.")):
+                return k
 
-        return k
+            # AIO text encoder -> canonical text_encoders.*
+            if k.startswith("cond_stage_model.qwen3_06b."):
+                return "text_encoders.qwen3_06b." + k[len("cond_stage_model.qwen3_06b."):]
 
-    theta = {_zi_key(k): v for k, v in theta.items()}
-    return isxl, isflux, True, theta
+            # already canonical diffusion
+            if k.startswith("model.diffusion_model."):
+                return k
+
+            # strip net. if present
+            k2 = k[4:] if k.startswith("net.") else k
+
+            # diffusion modules: map to model.diffusion_model.*
+            if k2.startswith((
+                "blocks.",
+                "x_embedder.",
+                "t_embedder.",
+                "t_embedding_norm.",
+                "pos_embedder.",
+                "final_layer.",
+                "llm_adapter.",
+            )):
+                return "model.diffusion_model." + k2
+
+            # some packs may use diffusion_model.* without model.
+            if k2.startswith("diffusion_model."):
+                return "model." + k2
+
+            # split-file style text encoders already ok
+            if k2.startswith(("text_encoders.", "qwen3_")):
+                return k2
+
+            return k
+
+        theta = {_am_key(k): v for k, v in theta.items()}
+
+    return arch, theta
 
 
 def _common_dtype(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
@@ -762,11 +939,14 @@ def _digits_concat(s: str) -> str:
     return "".join(ch for ch in s if ch.isdigit())
 
 @lru_cache(maxsize=250_000)
-def _blockfromkey_cached(key: str, isxl: bool, isflux: bool, iszi: bool):
+def _blockfromkey_cached_flags(key: str, xl: bool, flux: bool, zi: bool, am: bool) -> Tuple[str, str]:
+    # “arch dict” を中で復元（あなたの既存コードを壊さないため）
+    arch = {"XL": bool(xl), "FLUX": bool(flux), "ZI": bool(zi), "AM": bool(am)}
+
     # -------------------------
-    # SD1.5 / SD2.x (non-XL/non-Flux/non-ZI)
+    # SD1.5 / SD2.x (non-XL/non-Flux/non-ZI/non-AM)
     # -------------------------
-    if not isxl and not isflux and not iszi:
+    if not (arch["XL"] or arch["FLUX"] or arch["ZI"] or arch["AM"]):
         if "time_embed" in key:
             idx = -2
         elif ".out." in key:
@@ -791,7 +971,7 @@ def _blockfromkey_cached(key: str, isxl: bool, isflux: bool, iszi: bool):
     # -------------------------
     # Flux
     # -------------------------
-    if isflux:
+    if arch.get("FLUX", False):
         if "vae" in key:
             return "VAE", "Not Merge"
         if "t5xxl" in key:
@@ -831,7 +1011,7 @@ def _blockfromkey_cached(key: str, isxl: bool, isflux: bool, iszi: bool):
     # -------------------------
     # SDXL
     # -------------------------
-    if isxl:
+    if arch.get("XL", False):
         if not ("weight" in key or "bias" in key):
             return "Not Merge", "Not Merge"
         if "label_emb" in key or "time_embed" in key:
@@ -877,9 +1057,33 @@ def _blockfromkey_cached(key: str, isxl: bool, isflux: bool, iszi: bool):
         return "Not Merge", "Not Merge"
 
     # -------------------------
+    # Anima (AM)
+    # -------------------------
+    if arch.get("AM", False):
+        if ("qwen3_06b" in key) or key.startswith("text_encoders.") or key.startswith("cond_stage_model.qwen3_06b."):
+            return "BASE", "BASE"
+
+        if "vae" in key or key.startswith("first_stage_model."):
+            return "VAE", "VAE"
+
+        li = _parse_int_after(key, "blocks.")
+        if li is not None and 0 <= li < 28:
+            tag = f"L{li:02d}"
+            return tag, tag
+
+        if "x_embedder" in key:
+            return "L00", "L00"
+        if "final_layer" in key:
+            return "L27", "L27"
+        if any(s in key for s in ("t_embedder", "t_embedding_norm", "pos_embedder", "llm_adapter")):
+            return "BASE", "BASE"
+
+        return "Not Merge", "Not Merge"
+
+    # -------------------------
     # Z-Image
     # -------------------------
-    if iszi:
+    if arch.get("ZI", False):
         if ("qwen3_4b" in key) or ("cap_embedder" in key):
             return "BASE", "BASE"
         if not ("weight" in key or "bias" in key):
@@ -909,8 +1113,12 @@ def _blockfromkey_cached(key: str, isxl: bool, isflux: bool, iszi: bool):
     return "Not Merge", "Not Merge"
 
 
-def blockfromkey(key: str, isxl: bool = False, isflux: bool = False, iszi: bool = False) -> Tuple[str, str]:
-    return _blockfromkey_cached(key, isxl, isflux, iszi)
+def blockfromkey(key: str, arch: dict) -> Tuple[str, str]:
+    xl   = bool(arch.get("XL", False))
+    flux = bool(arch.get("FLUX", False) or arch.get("Flux", False))
+    zi   = bool(arch.get("ZI", False))
+    am   = bool(arch.get("AM", False))
+    return _blockfromkey_cached_flags(key, xl, flux, zi, am)
 
 def elementals(key: str, weight_index: int, deep: list[str], current_alpha: float, blockids=BLOCKID) -> float:
     skey = key + blockids[weight_index]
@@ -936,6 +1144,108 @@ def elementals(key: str, weight_index: int, deep: list[str], current_alpha: floa
 
     return current_alpha
 
+EXTRA_ELEM_TAGS = ("LABEL", "TIME", "OUT", "CLIP", "CLIP-L", "CLIP-G", "T5")
+
+def extra_tag_for_key(key: str, *, arch: dict) -> str | None:
+    kl = key.lower()
+
+    # --- explicit pseudo blocks ---
+    if "label_emb" in kl:
+        return "LABEL"
+    if "time_embed" in kl:
+        return "TIME"
+    if ".out." in kl or "final_layer" in kl:
+        return "OUT"
+
+    # --- CLIP grouping (for elementals targeting) ---
+    if arch.get("XL", False):
+        # SDXL: CLIP-L / CLIP-G
+        if ("conditioner.embedders.0." in kl) or ("text_encoders.encoder_l." in kl) or ("clip_l." in kl):
+            return "CLIP-L"
+        if ("conditioner.embedders.1." in kl) or ("text_encoders.encoder_g." in kl) or ("clip_g." in kl):
+            return "CLIP-G"
+        if ("conditioner.embedders." in kl) or ("text_encoders." in kl) or ("clip_l." in kl) or ("clip_g." in kl):
+            return "CLIP"
+
+    elif arch.get("FLUX", False):
+        # Flux: CLIP / T5
+        if ("t5" in kl) or ("t5xxl" in kl) or ("text_encoders.t5" in kl):
+            return "T5"
+        if ("clip" in kl) or ("text_encoder" in kl) or ("conditioner.embedders" in kl):
+            return "CLIP"
+
+    elif arch.get("ZI", False):
+        # ZI: Qwen + cap_embedder (treat as CLIP tag for elementals convenience)
+        if ("qwen3_4b" in kl) or ("cap_embedder" in kl) or ("text_encoders.qwen3_4b" in kl):
+            return "CLIP"
+        
+    elif arch.get("AM", False):
+        if ("qwen3_06b" in kl) or ("text_encoders.qwen3_06b" in kl) or ("cond_stage_model.qwen3_06b" in kl) or ("llm_adapter" in kl):
+            return "CLIP"
+
+    else:
+        # SD1.x/2.x: cond_stage_model / clip
+        if kl.startswith("cond_stage_model.") or kl.startswith("clip."):
+            return "CLIP"
+
+    return None
+
+
+def _extend_blockids_for_elementals(blockids: list[str]) -> list[str]:
+    out = list(blockids)
+    for t in EXTRA_ELEM_TAGS:
+        if t not in out:
+            out.append(t)
+    return out
+
+
+def elementals2(
+    key: str,
+    weight_index: int,
+    deep: list[str],
+    current_alpha: float,
+    *,
+    blockids=BLOCKID,
+    arch: dict,
+) -> float:
+    """
+    elementals() compatible, but:
+      - works even when weight_index < 0 ("Not Merge") if extra_tag_for_key() returns a pseudo tag.
+      - appends BOTH (block tag) and (extra tag) to the match key, so deep rules can target:
+          CLIP / CLIP-L / CLIP-G / LABEL / TIME / OUT
+    """
+    if not deep:
+        return current_alpha
+
+    block_tag = blockids[weight_index] if (0 <= weight_index < len(blockids)) else ""
+    extra_tag = extra_tag_for_key(key, arch=arch)
+
+    # matching string (case-sensitive tags are uppercase; keys are usually lowercase)
+    skey = f"{key}|{block_tag}|{extra_tag or ''}"
+
+    blockids_ex = _extend_blockids_for_elementals(list(blockids))
+
+    def _neg(tokens: list[str]):
+        return (True, tokens[1:]) if tokens and tokens[0] == "NOT" else (False, tokens)
+
+    for d in deep:
+        if d.count(":") != 2:
+            continue
+        dbs_s, dws_s, dr_s = d.split(":", 2)
+
+        # allow ranges for normal blocks; LABEL/TIME/OUT/CLIP are also accepted
+        dbs = blocker(dbs_s, blockids_ex).split()
+        dws = dws_s.split()
+        dbn, dbs = _neg(dbs)
+        dwn, dws = _neg(dws)
+
+        ok = (any(db in skey for db in dbs) ^ dbn)
+        if ok:
+            ok = (any(dw in skey for dw in dws) ^ dwn)
+        if ok:
+            current_alpha = float(dr_s)
+
+    return current_alpha
 
 def diff_inplace(dst, src, func, desc):
     for k in tqdm(dst.keys(), desc=desc, total=len(dst)):
@@ -1038,8 +1348,8 @@ def _parse_components_with_only(alpha_text: str):
 
     return comps, only
 
-def _component_prefix_map(isxl: bool, isflux: bool = False, iszi: bool = False):
-    if isflux:
+def _component_prefix_map(arch: dict) -> dict[str, list[str]]:
+    if arch.get("FLUX", False):
         return {
             "transformer": ["transformer."],
             "vae":         ["vae.", "first_stage_model."],
@@ -1051,7 +1361,7 @@ def _component_prefix_map(isxl: bool, isflux: bool = False, iszi: bool = False):
             "clip-g":      ["text_encoder_2."],
         }
 
-    if isxl:
+    if arch.get("XL", False):
         return {
             "unet":   ["model.diffusion_model."],
             "vae":    ["first_stage_model."],
@@ -1077,7 +1387,7 @@ def _component_prefix_map(isxl: bool, isflux: bool = False, iszi: bool = False):
             "transformer": ["model.diffusion_model."],
         }
 
-    if iszi:
+    if arch.get("ZI", False):
         return {
             "unet":        ["model.diffusion_model."],
             "transformer": ["model.diffusion_model."],
@@ -1087,6 +1397,18 @@ def _component_prefix_map(isxl: bool, isflux: bool = False, iszi: bool = False):
             "clip":        ["text_encoders.qwen3_4b.transformer.", "qwen3_4b.", "cap_embedder.", "model.diffusion_model.cap_embedder.", "text_encoders.qwen3_4b."],
             "clip-l":      ["qwen3_4b.", "text_encoders.qwen3_4b."],
             "clip-g":      ["cap_embedder.", "model.diffusion_model.cap_embedder."],
+        }
+        
+    if arch.get("AM", False):
+        return {
+            "unet":        ["model.diffusion_model."],
+            "transformer": ["model.diffusion_model."],
+            "vae":         ["first_stage_model.", "vae."],
+            "text":        ["text_encoders.qwen3_06b.", "text_encoders.qwen3_06b_base.", "cond_stage_model.qwen3_06b."],
+            "text2":       [],
+            "clip":        ["text_encoders.qwen3_06b.", "text_encoders.qwen3_06b_base.", "cond_stage_model.qwen3_06b."],
+            "clip-l":      ["text_encoders.qwen3_06b.", "text_encoders.qwen3_06b_base.", "cond_stage_model.qwen3_06b."],
+            "clip-g":      [],
         }
 
     # SD1.x / SD2.x (non-XL, non-Flux, non-ZI)
@@ -1133,22 +1455,86 @@ def _suffix_candidates(k: str):
             out.append(x)
     return out
 
+def normalize_external_text_encoder(theta_src: dict, arch: dict) -> dict:
+    if not isinstance(theta_src, dict) or not theta_src:
+        return theta_src
+
+    if arch.get("AM", False):
+        te_root = "text_encoders.qwen3_06b."
+        raw_model_prefix = te_root + "transformer."
+        ok_prefixes = (
+            "text_encoders.qwen3_06b.",
+            "text_encoders.qwen3_06b_base.",
+            "cond_stage_model.qwen3_06b.",
+            "qwen3_06b.",
+            "qwen3_06b_base.",
+        )
+    elif arch.get("ZI", False):
+        te_root = "text_encoders.qwen3_4b."
+        raw_model_prefix = te_root + "transformer."
+        ok_prefixes = (
+            "text_encoders.qwen3_4b.",
+            "cond_stage_model.qwen3_4b.",
+            "qwen3_4b.",
+        )
+    else:
+        return theta_src
+
+    def is_raw_qwen_key(k: str) -> bool:
+        return k.startswith((
+            "model.layers.", "model.embed_tokens.", "model.norm.", "lm_head.",
+            "transformer.model.layers.", "transformer.model.embed_tokens.", "transformer.model.norm.", "transformer.lm_head.",
+        )) or (k in ("logit_scale",))
+
+    def map_key(k: str) -> str:
+        if k.startswith("cond_stage_model.qwen3_06b.") and arch.get("AM", False):
+            return te_root + k[len("cond_stage_model.qwen3_06b."):]
+        if k.startswith("cond_stage_model.qwen3_4b.") and arch.get("ZI", False):
+            return te_root + k[len("cond_stage_model.qwen3_4b."):]
+        if k.startswith("qwen3_06b.") and arch.get("AM", False):
+            return te_root + k[len("qwen3_06b."):]
+        if k.startswith("qwen3_4b.") and arch.get("ZI", False):
+            return te_root + k[len("qwen3_4b."):]
+
+        if k.startswith(ok_prefixes):
+            return k
+
+        if k == "logit_scale":
+            return te_root + "logit_scale"
+
+        if k.startswith("transformer."):
+            return te_root + k
+
+        if k.startswith("model.") or k.startswith("lm_head."):
+            return raw_model_prefix + k
+
+        return k
+
+    has_raw = any(is_raw_qwen_key(k) for k in theta_src.keys())
+    has_any_ok = any(k.startswith(ok_prefixes) for k in theta_src.keys())
+
+    if not has_raw and has_any_ok:
+        return theta_src
+
+    out = {}
+    for k, v in theta_src.items():
+        nk = map_key(k)
+        out[nk] = v
+    return out
+
 @torch.inference_mode()
 def _swap_components_inplace(
     theta_dst: dict,
     theta_src: dict,
     components: set[str],
-    isxl: bool,
-    isflux: bool,
-    iszi: bool = False,
+    arch: dict,
     *,
     src_only: set[str] | None = None,
 ):
-    if not (isxl or isflux or iszi):
-        _, _, auto_iszi, theta_src = detect_arch(theta_src)
-        iszi = iszi or auto_iszi
+    if all(not v for v in arch.values()):
+        arch, theta_src = detect_arch(theta_src)
 
-    pref = _component_prefix_map(isxl, isflux, iszi)
+    pref = _component_prefix_map(arch)
 
     selected = {c for c in (components or set()) if c in pref and pref.get(c)}
     prefixes = [p for c in selected for p in pref.get(c, [])]
@@ -1214,13 +1600,19 @@ def _swap_components_inplace(
     return moved, created, skipped_shape, theta_dst
 
 
-def _is_clip_key(key: str, isxl: bool, isflux: bool, iszi: bool = False) -> bool:
-    if isflux:
+def _is_clip_key(key: str, arch: dict) -> bool:
+    if arch.get("FLUX", False):
         prefixes = ["text_encoder.", "text_encoder_2.", "conditioner.embedders.", "clip.", "t5."]
-    elif isxl:
+    elif arch.get("XL", False):
         prefixes = ["conditioner.embedders.", "text_encoders.", "clip_l.", "clip_g."]
-    elif iszi:
+    elif arch.get("ZI", False):
         prefixes = ["qwen3_4b.", "cap_embedder.","text_encoders.qwen3_4b.","model.diffusion_model.cap_embedder."]
+    elif arch.get("AM", False):
+        prefixes = [
+            "text_encoders.qwen3_06b.", "text_encoders.qwen3_06b_base.",
+            "cond_stage_model.qwen3_06b.",
+            "qwen3_06b.", "qwen3_06b_base.",
+        ]
     else:
         prefixes = ["cond_stage_model.", "clip."]
     return any(key.startswith(p) for p in prefixes)
@@ -1263,10 +1655,10 @@ def _is_small_or_norm_or_bias(key, tens):
 
 
 def _collect_clipxor_targets(theta_base: dict, theta_other: dict,
-                             isxl: bool, isflux: bool, iszi: bool = False):
+                             arch: dict) -> list[str]:
     targets = []
     for k, A in theta_base.items():
-        if not _is_clip_key(k, isxl, isflux, iszi):
+        if not _is_clip_key(k, arch):
             continue
         B = theta_other.get(k)
         if getattr(A, "shape", None) != getattr(B, "shape", None):
@@ -1276,31 +1668,37 @@ def _collect_clipxor_targets(theta_base: dict, theta_other: dict,
         targets.append(k)
     return targets
 
-def _clip_roots_for_arch(isxl: bool, isflux: bool, iszi: bool = False):
-    if isflux:
+def _clip_roots_for_arch(arch: dict) -> list[str]:
+    if arch.get("FLUX", False):
         # Flux: T5 / text encoders
         return [
             "text_encoder.", "text_encoder_2.", "conditioner.embedders.", "clip.", "t5."
         ]
-    if isxl:
+    if arch.get("XL", False):
         # SDXL: CLIP-L / CLIP-G
         return [
             "conditioner.embedders.0.", "conditioner.embedders.1.",
             "text_encoders.encoder_l.", "text_encoders.encoder_g.",
             "clip_l.", "clip_g."
         ]
-    if iszi:
+    if arch.get("ZI", False):
         # Z-Image: Qwen + caption embedder
         return [
             "qwen3_4b.",
             "cap_embedder.",
         ]
+    if arch.get("AM", False):
+        return [
+            "text_encoders.qwen3_06b.", "text_encoders.qwen3_06b_base.",
+            "cond_stage_model.qwen3_06b.",
+            "qwen3_06b.", "qwen3_06b_base.",
+        ]
     # SD1.x / SD2.x (non-XL)
     return ["cond_stage_model.", "clip."]
 
 
-def _iter_clip_items(sd: dict, isxl: bool, isflux: bool, iszi: bool = False):
-    roots = _clip_roots_for_arch(isxl, isflux, iszi)
+def _iter_clip_items(sd: dict, arch: dict):
+    roots = _clip_roots_for_arch(arch)
     for k, v in sd.items():
         for r in roots:
             if k.startswith(r):
@@ -1310,14 +1708,13 @@ def _iter_clip_items(sd: dict, isxl: bool, isflux: bool, iszi: bool = False):
                 break
 
 def _collect_clip_pairs_by_suffix(sd_a: dict, sd_b: dict,
-                                  isxl_a: bool, isflux_a: bool, iszi_a: bool,
-                                  isxl_b: bool, isflux_b: bool, iszi_b: bool):
+                                  arch_a: dict, arch_b: dict):
     # map suffix -> (orig_key, tensor) for A and B separately
     map_a = {}
-    for k, _, suf, v in _iter_clip_items(sd_a, isxl_a, isflux_a, iszi_a):
+    for k, _, suf, v in _iter_clip_items(sd_a, arch_a):
         map_a[suf] = (k, v)
     map_b = {}
-    for k, _, suf, v in _iter_clip_items(sd_b, isxl_b, isflux_b, iszi_b):
+    for k, _, suf, v in _iter_clip_items(sd_b, arch_b):
         map_b[suf] = (k, v)
 
     # intersect by suffix and by matching shape
@@ -1425,8 +1822,43 @@ def _clipxor_semi_hard_blend(
 
     return out
 
-def _finetune_inplace(key, tens, fine):
-    if ("first_stage_model" in key or "vae" in key) or fine == "":
+import torch
+import torch.nn.functional as F
+
+def _hp_kernel_inplace(w: torch.Tensor, strength: float) -> torch.Tensor:
+    if w.ndim != 4:
+        return w
+    kh, kw = w.shape[-2], w.shape[-1]
+    if kh < 3 or kw < 3:
+        return w
+    x = w.float()
+    C = x.shape[0] * x.shape[1]
+    x2 = x.reshape(1, C, kh, kw)
+    blur = F.avg_pool2d(x2, kernel_size=3, stride=1, padding=1)
+    hp = x2 - blur
+    x3 = x2 + (strength * hp)
+    return x3.reshape_as(x).to(dtype=w.dtype)
+
+def _is_conv_weight(key: str, tens: torch.Tensor) -> bool:
+    return tens.ndim == 4 and (key.endswith(".weight") or ".weight" in key)
+
+def _is_bias(key: str, tens: torch.Tensor) -> bool:
+    return tens.ndim == 1 and (key.endswith(".bias") or ".bias" in key)
+
+def _is_resnetish(key: str) -> bool:
+    return ("resnets" in key) or ("in_layers" in key) or ("out_layers" in key) or (".conv1." in key) or (".conv2." in key)
+
+def _is_proj_ff(key: str) -> bool:
+    return ("proj_in" in key) or ("proj_out" in key) or ("ff.net" in key)
+
+def _is_unet_out(key: str) -> bool:
+    return ("model.diffusion_model.out.0." in key) or ("model.diffusion_model.out.2." in key)
+
+def _is_vae_rgb(key: str) -> bool:
+    return ("first_stage_model.decoder.conv_out." in key)
+
+def _finetune_inplace(key, tens, fine, arch: dict):
+    if fine == "" or fine is None:
         return tens
 
     if isinstance(fine, dict):
@@ -1453,7 +1885,69 @@ def _finetune_inplace(key, tens, fine):
 
         return tens
 
+    # ---- list mode ----
     if isinstance(fine, list):
+        # ===== NEW: 8 sliders for SDXL/SD15 =====
+        if len(fine) >= 8:
+            dn1, dn2, dn3, ct, br, rr, gg, bb = [float(x) for x in fine[:8]]
+            
+            dn1_k = dn1 * 0.12
+            dn2_k = dn2 * 0.10
+            dn3_k = dn3 * 0.08
+            ct_k  = 1.0 + ct * 0.06
+            br_k  = br * 0.02
+            r_k, g_k, b_k = (1.0 + rr * 0.05, 1.0 + gg * 0.05, 1.0 + bb * 0.05)
+
+            # --- VAE: Brightness / RGB ---
+            if _is_vae_rgb(key):
+                if _is_conv_weight(key, tens) and tens.shape[0] >= 3:
+                    w = tens.float()
+                    w[0] *= r_k
+                    w[1] *= g_k
+                    w[2] *= b_k
+                    return w.to(dtype=tens.dtype)
+                if _is_bias(key, tens) and tens.shape[0] >= 3:
+                    b = tens.float()
+                    b[0] = b[0] * r_k + br_k
+                    b[1] = b[1] * g_k + br_k
+                    b[2] = b[2] * b_k + br_k
+                    return b.to(dtype=tens.dtype)
+                return tens
+
+            # --- UNet Contrast / Brightness ---
+            if _is_unet_out(key):
+                if _is_conv_weight(key, tens):
+                    return (tens.float() * ct_k).to(dtype=tens.dtype)
+                if _is_bias(key, tens):
+                    return (tens.float() + br_k).to(dtype=tens.dtype)
+
+            # --- Detail/Noise ---
+            left, right = blockfromkey(key, arch)
+            blk = right
+
+            if not _is_conv_weight(key, tens):
+                return tens
+
+            if not (_is_resnetish(key) or _is_proj_ff(key)):
+                return tens
+
+            strength = 0.0
+            # DN1: OUT07-OUT08
+            if blk in ("OUT07", "OUT08"):
+                strength = dn1_k
+            # DN2: OUT05-OUT07
+            elif blk in ("OUT05", "OUT06", "OUT07"):
+                strength = dn2_k
+            # DN3: OUT03-OUT05 + IN00
+            elif blk in ("OUT03", "OUT04", "OUT05", "IN00"):
+                strength = dn3_k
+
+            if strength != 0.0:
+                return _hp_kernel_inplace(tens, strength)
+
+            return tens
+
+        # ===== OLD: keep existing behavior (FINETUNES 6 keys) =====
         idx = next((i for i, pat in enumerate(FINETUNES) if pat in key), -1)
         if idx == -1:
             return tens
@@ -1472,6 +1966,7 @@ def _finetune_inplace(key, tens, fine):
                     add = torch.as_tensor(float(fine[5]) if fine[5] is not None else 0.0,
                                           device=tens.device, dtype=tens.dtype)
                     return tens + add
+
     return tens
 
 def trim_delta(delta: torch.Tensor, percentile: float = 0.5) -> torch.Tensor:
@@ -1766,8 +2261,8 @@ def weight_matching(
     return perm, average
 
 
-def _filter_state_dict_by_components(theta: dict, components: set[str], isxl: bool, isflux: bool, iszi: bool):
-    pref = _component_prefix_map(isxl, isflux, iszi)
+def _filter_state_dict_by_components(theta: dict, components: set[str], arch: dict):
+    pref = _component_prefix_map(arch)
     prefixes = [p for c in components for p in pref.get(c, []) if p]
 
     total = len(theta)
@@ -1950,3 +2445,59 @@ def turbo_convert_inplace(
         A[k] = v
 
     return A
+
+def _rgb_sat_matrix(s: float, device, dtype):
+    s = float(s)
+    m = (1.0 - s) / 3.0
+    A = torch.tensor([
+        [s + m,     m,     m],
+        [    m, s + m,     m],
+        [    m,     m, s + m],
+    ], device=device, dtype=dtype)
+    return A
+
+@torch.inference_mode()
+def apply_vae_saturation_inplace(sd: dict, vae_key: str, sat: float):
+    if abs(float(sat) - 1.0) < 1e-12:
+        return sd
+
+    weight_suffixes = (
+        "decoder.conv_out.weight",
+        "decoder.conv_out.0.weight",
+    )
+    bias_suffixes = (
+        "decoder.conv_out.bias",
+        "decoder.conv_out.0.bias",
+    )
+
+    w_keys = [k for k in sd.keys() if any(k.endswith(suf) for suf in weight_suffixes)]
+    b_keys = [k for k in sd.keys() if any(k.endswith(suf) for suf in bias_suffixes)]
+
+    nW = nB = 0
+    for k in w_keys:
+        W = sd.get(k, None)
+        if not isinstance(W, torch.Tensor) or (not W.is_floating_point()):
+            continue
+        if W.dim() != 4 or W.shape[0] != 3:  # out_ch must be RGB=3
+            continue
+        A = _rgb_sat_matrix(sat, W.device, torch.float32)
+        W32 = W.detach().to(torch.float32)
+        # W' = A @ W   (mix output RGB channels)
+        W2 = torch.einsum("ij,jchw->ichw", A, W32)
+        sd[k] = W2.to(W.dtype)
+        nW += 1
+
+    for k in b_keys:
+        b = sd.get(k, None)
+        if not isinstance(b, torch.Tensor) or (not b.is_floating_point()):
+            continue
+        if b.dim() != 1 or b.shape[0] != 3:
+            continue
+        A = _rgb_sat_matrix(sat, b.device, torch.float32)
+        b32 = b.detach().to(torch.float32)
+        b2 = torch.einsum("ij,j->i", A, b32)
+        sd[k] = b2.to(b.dtype)
+        nB += 1
+
+    print(f"[vae_sat] applied sat={sat} to VAE conv_out: weights={nW}, bias={nB}")
+    return sd
