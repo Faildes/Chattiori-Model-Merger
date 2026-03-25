@@ -9,10 +9,7 @@ import safetensors
 from tqdm.auto import tqdm
 import math
 
-from Utils import (
-    load_model,
-    read_metadata_from_safetensors,
-    sha256_from_cache,
+from .Utils import (
     LBLOCKS26,
     LBLOCKS_FLUX,
     LBLOCKS_ZI,
@@ -23,18 +20,15 @@ from Utils import (
     BLOCKIDZI,
     BLOCKIDXLL,
     BLOCKIDAM,
-    cache,
-    dump_cache,
     normalize_path,
-    detect_arch,
-    upcast_fp8_state_dict,
-    prepare_state_dict_for_save,
-    set_cache_filename,
     base_path,
     merge_cache_json,
     blockfromkey,
     elementals2,
+    _load_umodel,
 )
+
+from .model import UnifiedModel, ModelInfo
 
 _re_digits = re.compile(r"\d+")
 _re_cache  = {}
@@ -56,8 +50,96 @@ def _m(rx, key, buf):
     buf[:] = [int(x) if _re_digits.fullmatch((x or "")) else x for x in s.groups()]
     return True
 
+_TE2_QKV_DOWN_RE = re.compile(
+    r"^lora_te2_text_model_encoder_layers_(\d+)_self_attn_([qkv])_proj\.lora_(?:A|down)\.weight$"
+)
+_TE2_OUT_DOWN_RE = re.compile(
+    r"^lora_te2_text_model_encoder_layers_(\d+)_self_attn_out_proj\.lora_(?:A|down)\.weight$"
+)
+
+
+def resolve_sdxl_te2_target_any(down_k: str, keymap: dict):
+    m = _TE2_QKV_DOWN_RE.match(down_k)
+    if m:
+        li = int(m.group(1))
+        part = m.group(2)
+        tgt = keymap.get(f"1_model_transformer_resblocks_{li}_attn_in_proj")
+        if tgt is not None:
+            return tgt, part
+        return None, None
+
+    m = _TE2_OUT_DOWN_RE.match(down_k)
+    if m:
+        li = int(m.group(1))
+        tgt = keymap.get(f"1_model_transformer_resblocks_{li}_attn_out_proj")
+        if tgt is not None:
+            return tgt, None
+        return None, None
+
+    return None, None
+
+_DIRECT_LORA_DOWN_SUFFIXES = (
+    ".lora_down.weight",
+    ".lora_A.weight",
+)
+
+def _strip_direct_lora_down_suffix(key: str) -> str | None:
+    for suf in _DIRECT_LORA_DOWN_SUFFIXES:
+        if key.endswith(suf):
+            return key[:-len(suf)]
+    return None
+
+def _strip_lora_runtime_suffix(key: str) -> str:
+    for suf in (
+        ".lora_down.weight",
+        ".lora_up.weight",
+        ".lora_A.weight",
+        ".lora_B.weight",
+        ".alpha",
+    ):
+        if key.endswith(suf):
+            return key[:-len(suf)]
+    return key
+
+def _normalize_direct_lora_base_for_keymap(base: str) -> str:
+    sk = base.replace(".", "_")
+
+    if "conditioner_embedders_" in sk:
+        return sk.split("conditioner_embedders_", 1)[1]
+
+    if "text_encoders_" in sk:
+        return sk.split("text_encoders_", 1)[1]
+
+    if "wrapped_" in sk:
+        return sk.split("wrapped_", 1)[1]
+
+    if sk.startswith("model_"):
+        return sk.split("model_", 1)[1]
+
+    return sk
+
 def convert_diffusers_name_to_compvis(key: str, is_sd2: bool) -> str:
     g: list = []
+    direct_base = _strip_direct_lora_down_suffix(key)
+    if direct_base is not None and not direct_base.startswith((
+        "lora_unet_",
+        "lora_te_",
+        "lora_te1_",
+        "lora_te2_",
+        "lora_diffusion_model_",
+    )):
+        return _normalize_direct_lora_base_for_keymap(direct_base)
+    
+    key = _strip_lora_runtime_suffix(key)
+    
+    if _m(r"lora_unet_input_blocks_(\d+)_(\d+)_(.+)", key, g):
+        return f"diffusion_model_input_blocks_{g[0]}_{g[1]}_{g[2]}"
+    if _m(r"lora_unet_middle_block_(\d+)_(.+)", key, g):
+        return f"diffusion_model_middle_block_{g[0]}_{g[1]}"
+    if _m(r"lora_unet_output_blocks_(\d+)_(\d+)_(.+)", key, g):
+        return f"diffusion_model_output_blocks_{g[0]}_{g[1]}_{g[2]}"
+    if _m(r"lora_unet_out_(\d+)_(.+)", key, g):
+        return f"diffusion_model_out_{g[0]}_{g[1]}"
     if _m(r"lora_unet_conv_in(.*)", key, g):
         return f"diffusion_model_input_blocks_0_0{g[0]}"
     if _m(r"lora_unet_conv_out(.*)", key, g):
@@ -96,6 +178,269 @@ def convert_diffusers_name_to_compvis(key: str, is_sd2: bool) -> str:
         r = g[1].replace("mlp_fc1","mlp_c_fc").replace("mlp_fc2","mlp_c_proj").replace("self_attn","attn")
         return f"1_model_transformer_resblocks_{g[0]}_{r}"
     return key
+
+_SDXL_TEXTENC_DIRECT_QKV_RE = re.compile(
+    r"^text_encoders\.(clip_l|clip_g)\.transformer\.text_model\.encoder\.layers\.(\d+)\.self_attn\.([qkv])_proj\.lora_(?:A|down)\.weight$"
+)
+_SDXL_TEXTENC_DIRECT_OUT_RE = re.compile(
+    r"^text_encoders\.(clip_l|clip_g)\.transformer\.text_model\.encoder\.layers\.(\d+)\.self_attn\.out_proj\.lora_(?:A|down)\.weight$"
+)
+_SDXL_TEXTENC_DIRECT_MLP_RE = re.compile(
+    r"^text_encoders\.(clip_l|clip_g)\.transformer\.text_model\.encoder\.layers\.(\d+)\.mlp\.fc([12])\.lora_(?:A|down)\.weight$"
+)
+_SDXL_TEXTENC_DIRECT_LN_RE = re.compile(
+    r"^text_encoders\.(clip_l|clip_g)\.transformer\.text_model\.encoder\.layers\.(\d+)\.layer_norm([12])\.lora_(?:A|down)\.weight$"
+)
+_SDXL_TEXTENC_DIRECT_POS_RE = re.compile(
+    r"^text_encoders\.(clip_l|clip_g)\.transformer\.text_model\.embeddings\.position_embedding\.lora_(?:A|down)\.weight$"
+)
+_SDXL_TEXTENC_DIRECT_TOKEN_RE = re.compile(
+    r"^text_encoders\.(clip_l|clip_g)\.transformer\.text_model\.embeddings\.token_embedding\.lora_(?:A|down)\.weight$"
+)
+_SDXL_TEXTENC_DIRECT_FINAL_RE = re.compile(
+    r"^text_encoders\.(clip_l|clip_g)\.transformer\.text_model\.final_layer_norm\.lora_(?:A|down)\.weight$"
+)
+_SDXL_TEXTENC_DIRECT_TPROJ_RE = re.compile(
+    r"^text_encoders\.(clip_l|clip_g)\.text_projection\.lora_(?:A|down)\.weight$"
+)
+
+_SDXL_ADD_EMB_RE = re.compile(r"^lora_unet_add_embedding_linear_(\d+)\.lora_(?:A|down)\.weight$")
+_SDXL_UPSAMPLE_RE = re.compile(r"^lora_unet_up_blocks_(\d+)_upsamplers_0_conv\.lora_(?:A|down)\.weight$")
+
+def _first_keymap_hit(keymap: dict, *cands: str):
+    for c in cands:
+        tgt = keymap.get(c)
+        if tgt is not None:
+            return tgt
+    return None
+
+def resolve_sdxl_special_unet_target_any(down_k: str, keymap: dict):
+    """
+    returns (target_key, part)
+    part is always None here
+    """
+    m = _SDXL_ADD_EMB_RE.match(down_k)
+    if m:
+        idx = int(m.group(1))
+        if idx == 1:
+            # checkpoints differ here, so try multiple canonical candidates
+            tgt = _first_keymap_hit(keymap,
+                "diffusion_model_label_emb_0_0",
+                "diffusion_model_label_emb_0",
+                "diffusion_model_add_embedding_linear_1",
+            )
+            return tgt, None
+        if idx == 2:
+            tgt = _first_keymap_hit(keymap, 
+                "diffusion_model_label_emb_0_2",
+                "diffusion_model_label_emb_2",
+                "diffusion_model_add_embedding_linear_2",
+            )
+            return tgt, None
+
+    m = _SDXL_UPSAMPLE_RE.match(down_k)
+    if m:
+        bi = int(m.group(1))
+        # SDXL / checkpoint variants differ in this sub-index, so try both
+        tgt = _first_keymap_hit(keymap, 
+            f"diffusion_model_output_blocks_{2 + bi*3}_2_conv",
+            f"diffusion_model_output_blocks_{2 + bi*3}_1_conv",
+            f"diffusion_model_output_blocks_{2 + bi*3}_conv",
+        )
+        return tgt, None
+
+    return None, None
+
+def resolve_sdxl_textenc_direct_target_any(down_k: str, keymap: dict):
+    """
+    Support direct diffusers-style SDXL text encoder LoRA keys:
+      text_encoders.clip_l.transformer.text_model...
+      text_encoders.clip_g.transformer.text_model...
+    Returns (target_key, part) where part in {None,'q','k','v'}
+    """
+
+    m = _SDXL_TEXTENC_DIRECT_QKV_RE.match(down_k)
+    if m:
+        enc = m.group(1)
+        li = int(m.group(2))
+        part = m.group(3)
+
+        if enc == "clip_l":
+            tgt = _first_keymap_hit(
+                keymap,
+                f"clip_l_transformer_text_model_encoder_layers_{li}_self_attn_{part}_proj",
+                f"0_transformer_text_model_encoder_layers_{li}_self_attn_{part}_proj",
+            )
+            return (tgt, None) if tgt is not None else (None, None)
+
+        # clip_g
+        tgt = _first_keymap_hit(
+            keymap,
+            f"clip_g_transformer_text_model_encoder_layers_{li}_self_attn_{part}_proj",
+            f"1_model_text_model_encoder_layers_{li}_self_attn_{part}_proj",
+        )
+        if tgt is not None:
+            return tgt, None
+
+        tgt = _first_keymap_hit(
+            keymap,
+            f"1_model_transformer_resblocks_{li}_attn_in_proj",
+        )
+        if tgt is not None:
+            return tgt, part
+
+        return None, None
+
+    m = _SDXL_TEXTENC_DIRECT_OUT_RE.match(down_k)
+    if m:
+        enc = m.group(1)
+        li = int(m.group(2))
+
+        if enc == "clip_l":
+            tgt = _first_keymap_hit(
+                keymap,
+                f"clip_l_transformer_text_model_encoder_layers_{li}_self_attn_out_proj",
+                f"0_transformer_text_model_encoder_layers_{li}_self_attn_out_proj",
+            )
+            return (tgt, None) if tgt is not None else (None, None)
+
+        tgt = _first_keymap_hit(
+            keymap,
+            f"clip_g_transformer_text_model_encoder_layers_{li}_self_attn_out_proj",
+            f"1_model_text_model_encoder_layers_{li}_self_attn_out_proj",
+            f"1_model_transformer_resblocks_{li}_attn_out_proj",
+        )
+        return (tgt, None) if tgt is not None else (None, None)
+
+    m = _SDXL_TEXTENC_DIRECT_MLP_RE.match(down_k)
+    if m:
+        enc = m.group(1)
+        li = int(m.group(2))
+        which = m.group(3)
+
+        if enc == "clip_l":
+            tgt = _first_keymap_hit(
+                keymap,
+                f"clip_l_transformer_text_model_encoder_layers_{li}_mlp_fc{which}",
+                f"0_transformer_text_model_encoder_layers_{li}_mlp_fc{which}",
+            )
+            return (tgt, None) if tgt is not None else (None, None)
+
+        # clip_g
+        if which == "1":
+            tgt = _first_keymap_hit(
+                keymap,
+                f"clip_g_transformer_text_model_encoder_layers_{li}_mlp_fc1",
+                f"1_model_text_model_encoder_layers_{li}_mlp_fc1",
+                f"1_model_transformer_resblocks_{li}_mlp_c_fc",
+            )
+        else:
+            tgt = _first_keymap_hit(
+                keymap,
+                f"clip_g_transformer_text_model_encoder_layers_{li}_mlp_fc2",
+                f"1_model_text_model_encoder_layers_{li}_mlp_fc2",
+                f"1_model_transformer_resblocks_{li}_mlp_c_proj",
+            )
+        return (tgt, None) if tgt is not None else (None, None)
+
+    m = _SDXL_TEXTENC_DIRECT_LN_RE.match(down_k)
+    if m:
+        enc = m.group(1)
+        li = int(m.group(2))
+        which = m.group(3)
+
+        if enc == "clip_l":
+            tgt = _first_keymap_hit(
+                keymap,
+                f"clip_l_transformer_text_model_encoder_layers_{li}_layer_norm{which}",
+                f"0_transformer_text_model_encoder_layers_{li}_layer_norm{which}",
+            )
+            return (tgt, None) if tgt is not None else (None, None)
+
+        tgt = _first_keymap_hit(
+            keymap,
+            f"clip_g_transformer_text_model_encoder_layers_{li}_layer_norm{which}",
+            f"1_model_text_model_encoder_layers_{li}_layer_norm{which}",
+            f"1_model_transformer_resblocks_{li}_ln_{which}",
+        )
+        return (tgt, None) if tgt is not None else (None, None)
+
+    m = _SDXL_TEXTENC_DIRECT_POS_RE.match(down_k)
+    if m:
+        enc = m.group(1)
+        if enc == "clip_l":
+            tgt = _first_keymap_hit(
+                keymap,
+                "clip_l_transformer_text_model_embeddings_position_embedding",
+                "0_transformer_text_model_embeddings_position_embedding",
+            )
+            return (tgt, None) if tgt is not None else (None, None)
+
+        tgt = _first_keymap_hit(
+            keymap,
+            "clip_g_transformer_text_model_embeddings_position_embedding",
+            "1_model_text_model_embeddings_position_embedding",
+            "1_model_positional_embedding",
+        )
+        return (tgt, None) if tgt is not None else (None, None)
+
+    m = _SDXL_TEXTENC_DIRECT_TOKEN_RE.match(down_k)
+    if m:
+        enc = m.group(1)
+        if enc == "clip_l":
+            tgt = _first_keymap_hit(
+                keymap,
+                "clip_l_transformer_text_model_embeddings_token_embedding",
+                "0_transformer_text_model_embeddings_token_embedding",
+            )
+            return (tgt, None) if tgt is not None else (None, None)
+
+        tgt = _first_keymap_hit(
+            keymap,
+            "clip_g_transformer_text_model_embeddings_token_embedding",
+            "1_model_text_model_embeddings_token_embedding",
+            "1_model_token_embedding",
+        )
+        return (tgt, None) if tgt is not None else (None, None)
+
+    m = _SDXL_TEXTENC_DIRECT_FINAL_RE.match(down_k)
+    if m:
+        enc = m.group(1)
+        if enc == "clip_l":
+            tgt = _first_keymap_hit(
+                keymap,
+                "clip_l_transformer_text_model_final_layer_norm",
+                "0_transformer_text_model_final_layer_norm",
+            )
+            return (tgt, None) if tgt is not None else (None, None)
+
+        tgt = _first_keymap_hit(
+            keymap,
+            "clip_g_transformer_text_model_final_layer_norm",
+            "1_model_text_model_final_layer_norm",
+            "1_model_ln_final",
+        )
+        return (tgt, None) if tgt is not None else (None, None)
+
+    m = _SDXL_TEXTENC_DIRECT_TPROJ_RE.match(down_k)
+    if m:
+        enc = m.group(1)
+        if enc == "clip_l":
+            tgt = _first_keymap_hit(
+                keymap,
+                "clip_l_text_projection",
+                "0_text_projection",
+            )
+            return (tgt, None) if tgt is not None else (None, None)
+
+        tgt = _first_keymap_hit(
+            keymap,
+            "clip_g_text_projection",
+            "1_model_text_projection",
+        )
+        return (tgt, None) if tgt is not None else (None, None)
+
+    return None, None
 
 _AM_UNET_BASE_RE = re.compile(r"^lora_unet_blocks_(\d+)_(.+)$")
 _AM_TE_BASE_RE   = re.compile(r"^lora_te_layers_(\d+)_(.+)$")
@@ -209,8 +554,8 @@ def anima_resolve_target_any(down_k: str, theta_0: dict) -> str | None:
             paths = _am_tail_to_path(tail)
 
         prefixes = [
-            "text_encoders.qwen3_06b.transformer.model.layers.",
-            "text_encoders.qwen3_06b_base.transformer.model.layers.",
+            "cond_stage_model.qwen3_06b.transformer.model.layers.",
+            "cond_stage_model.qwen3_06b_base.transformer.model.layers.",
         ]
         for pref in prefixes:
             for path in paths:
@@ -218,7 +563,7 @@ def anima_resolve_target_any(down_k: str, theta_0: dict) -> str | None:
                 if cand in theta_0:
                     return cand
         # fallback
-        return f"text_encoders.qwen3_06b.transformer.model.layers.{li}.{paths[0]}.weight"
+        return f"cond_stage_model.qwen3_06b.transformer.model.layers.{li}.{paths[0]}.weight"
 
     # --- VAE side (optional) ---
     mv = _AM_VAE_BASE_RE.match(base)
@@ -358,7 +703,7 @@ def _am_target_key_from_lora_down(down_k: str) -> str | None:
         li = int(m.group(1))
         tail = m.group(2)
         path = tail if tail in {"input_layernorm","post_attention_layernorm","final_layernorm"} else _am_tail_to_path(tail)[0]
-        return f"text_encoders.qwen3_06b.transformer.model.layers.{li}.{path}.weight"
+        return f"cond_stage_model.qwen3_06b.transformer.model.layers.{li}.{path}.weight"
     mv = _AM_VAE_BASE_RE.match(base)
     if mv:
         return "first_stage_model." + mv.group(1).replace("_",".") + ".weight"
@@ -469,52 +814,64 @@ def apply_zimage_lora_to_weight(
     return Wc
 
 
+def _load_lora(path: str, *, device: str = "cpu", cache_path: str | None = None) -> tuple[UnifiedModel, dict, bool]:
+    lm = _load_umodel(path, device=device, model_type="lora", verify_hash=True, cache_path=cache_path)
+    meta = dict(lm.metadata)
+    keys = list(lm.theta.keys())
+    isv2 = any("resblocks" in k for k in keys)
+    return lm, meta, isv2
 
-def load_state_dict(path: str, dtype=torch.float, device="cpu", depatch=True):
-    if path.endswith(".safetensors"):
-        sd = safetensors.torch.load_file(path, device=device)
-        meta = _safe_meta(path)
-    else:
-        sd = torch.load(path, map_location=device)
-        meta = {}
-    isv2 = any("resblocks" in k for k in sd.keys())
+
+def _make_checkpoint_model(theta: dict[str, torch.Tensor], base: UnifiedModel, *, output: str, metadata: dict) -> UnifiedModel:
+    info = base.info.clone()
+    info.path = output
+    info.name = os.path.splitext(os.path.basename(output))[0]
+    info.model_type = "checkpoint"
+    info.metadata = dict(metadata)
+    info.arch = dict(base.arch)
+    out = UnifiedModel.from_theta(theta, info=info, clone_tensors=False)
+    out.register_parent(base, role="base_checkpoint")
+    return out
+
+
+def _make_lora_model(theta: dict[str, torch.Tensor], *, output: str, metadata: dict, arch: dict | None = None) -> UnifiedModel:
+    info = ModelInfo(
+        path=output,
+        name=os.path.splitext(os.path.basename(output))[0],
+        format="safetensors",
+        model_type="lora",
+        metadata=dict(metadata),
+        arch=dict(arch or {}),
+    )
+    return UnifiedModel.from_theta(theta, info=info, clone_tensors=False)
+
+
+def _save_umodel(model: UnifiedModel, output: str, *, args) -> None:
+    model.save(
+        output,
+        no_metadata=bool(args.no_metadata),
+        save_half=bool(getattr(args, "save_half", False)),
+        save_quarter=bool(getattr(args, "save_quarter", False)),
+        save_bhalf=bool(getattr(args, "save_bhalf", False)),
+        prune=bool(getattr(args, "prune", False)),
+        args=args,
+    )
+
+
+def _load_state_dict_umodel(path: str, dtype=torch.float, device="cpu", depatch=True, *, model_type: str | None = None):
+    um = _load_umodel(path, device=device, model_type=model_type, verify_hash=False)
+    sd = um.theta
     if depatch:
         for k, v in list(sd.items()):
             if isinstance(v, torch.Tensor):
                 sd[k] = v.to(dtype=dtype, device=device)
+    isv2 = any("resblocks" in k for k in sd.keys())
+    return um, sd, dict(um.metadata), isv2
+
+
+def load_state_dict(path: str, dtype=torch.float, device="cpu", depatch=True, *, model_type: str | None = None):
+    _um, sd, meta, isv2 = _load_state_dict_umodel(path, dtype=dtype, device=device, depatch=depatch, model_type=model_type)
     return sd, meta, isv2
-
-def _safe_meta(st_path: str) -> dict:
-    try:
-        with safetensors.safe_open(st_path, framework="pt", device="cpu") as f:
-            return f.metadata() or {}
-    except Exception:
-        return {}
-
-def apply_dare(delta: torch.Tensor, p: float):
-    m = torch.bernoulli(torch.full(delta.shape, p, device=delta.device, dtype=delta.dtype))
-    return (m * delta) / (1 - p)
-
-def _l2(x, eps=1e-12): return x / (x.norm() + eps)
-
-def spectral_norm(W: torch.Tensor, it=10):
-    u = torch.randn(1, W.size(0), device=W.device, dtype=torch.float32)
-    w = W.to(u.device, dtype=torch.float32)
-    for _ in range(max(1, it)):
-        v = _l2(u @ w.view(u.shape[-1], -1))
-        u = _l2(v @ w.view(u.shape[-1], -1).t())
-    return (u @ w.view(u.shape[-1], -1) @ v.t()).sum().item()
-
-def apply_spectral_norm(lora_sd: dict, scale: float):
-    lips = [spectral_norm(t) for k, t in lora_sd.items() if "alpha" not in k]
-    if not lips: return lora_sd
-    s = max(lips)
-    if s <= 0:   return lora_sd
-    fac = scale / s
-    for k, t in lora_sd.items():
-        if "alpha" not in k:
-            lora_sd[k] = t * fac
-    return lora_sd
 
 @torch.inference_mode()
 def merge_weights_inplace(
@@ -587,6 +944,18 @@ def build_apply_plan(main_keys, *, arch: dict, mlv2: bool, keymap: dict, theta_0
         down_k, up_k, alpha_k = parse_lora_key(k)
         if down_k is None:
             continue
+
+        if arch.get("XL", False):
+            tgt, part = resolve_sdxl_textenc_direct_target_any(down_k, keymap)
+            if tgt is not None:
+                kind = "fused" if part in ("q", "k", "v") else "std"
+                plan.append((kind, down_k, up_k, alpha_k, tgt, part))
+                continue
+
+            tgt, part = resolve_sdxl_te2_target_any(down_k, keymap)
+            if tgt is not None:
+                plan.append(("fused", down_k, up_k, alpha_k, tgt, part))
+                continue
 
         if arch.get("ZI", False):
             tgt, part = zimage_resolve_target(down_k)
@@ -821,18 +1190,25 @@ def _effective_ratio_for_target(
 def _build_keymap(sd: dict):
     km = {}
     for k in sd.keys():
-        if ("model" not in k) and ("text_encoders" not in k) and ("vae" not in k) and ("first_stage_model" not in k): 
+        if ("model" not in k) and ("text_encoders" not in k) and ("vae" not in k) and ("first_stage_model" not in k):
             continue
+
         sk = k.replace(".", "_").replace("_weight", "")
+
         if "conditioner_embedders_" in sk:
             km[sk.split("conditioner_embedders_", 1)[1]] = k
+
         elif "wrapped_" in sk:
             km[sk.split("wrapped_", 1)[1]] = k
-        elif "clip_l" in sk or "t5xxl" in sk:
+
+        elif "text_encoders_" in sk:
             parts = sk.split("text_encoders_", 1)
-            if len(parts) == 2: km[parts[1]] = k
+            if len(parts) == 2:
+                km[parts[1]] = k
+
         elif "model_" in sk:
             km[sk.split("model_", 1)[1]] = k
+
     return km
 
 
@@ -1086,9 +1462,8 @@ def _estimate_rel_delta_bound(
 
 @torch.inference_mode()
 def pluslora(lora_list, model, output, model_path, device="cpu"):
-    set_cache_filename(os.path.join(base_path(), "cache.json"))
-    merge_cache_json(model_path)
-    cache_data = cache("hashes", None)
+    cache_path = os.path.join(base_path(), "cache.json")
+    merge_cache_json(cache_path, model_path)
     model_path = normalize_path(model_path)
     if not model:     return "ERROR: No model Selected"
     if not lora_list: return "ERROR: No LoRA Selected"
@@ -1097,18 +1472,14 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
 
     # checkpoint
     mpath = normalize_path(os.path.join(model_path, model))
-    theta_0, *_ = load_model(mpath, device)
-    theta_0 = upcast_fp8_state_dict(theta_0)
-    model_name  = os.path.splitext(os.path.basename(mpath))[0]
+    base_model = _load_umodel(mpath, device=device, model_type="checkpoint", verify_hash=True, cache_path=cache_path)
 
-    arch, theta_0 = detect_arch(theta_0)
-    
     zi_index = None
-    if arch.get("ZI", False):
-        zi_index = _build_zi_layer_index(theta_0)
+    if base_model.arch.get("ZI", False):
+        zi_index = _build_zi_layer_index(base_model.theta)
         
     Wn_cache = {}
-    for k, W in theta_0.items():
+    for k, W in base_model.theta.items():
         if isinstance(W, torch.Tensor) and W.is_floating_point():
             Wn_cache[k] = float(torch.linalg.norm(W.detach().float()).item())
         else:
@@ -1119,7 +1490,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
         
     # ---- W0 norms (fixed) for order-independent budget ----
     W0_norm: dict[str, float] = {}
-    for k, W in theta_0.items():
+    for k, W in base_model.theta.items():
         if isinstance(W, torch.Tensor) and W.is_floating_point():
             W0_norm[k] = float(torch.linalg.norm(W.detach().float()).item())
         else:
@@ -1129,22 +1500,20 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
         return float(W0_norm.get(key, 0.0))
 
     blocks = (
-        LBLOCKS_ZI if arch.get("ZI", False) else
-        (LBLOCKS_FLUX if arch.get("FLUX", False) else
-        (LBLOCKS_SDXL if arch.get("XL", False) else
-        (LBLOCKS_AM if arch.get("AM", False) else LBLOCKS26)))
+        LBLOCKS_ZI if base_model.arch.get("ZI", False) else
+        (LBLOCKS_FLUX if base_model.arch.get("FLUX", False) else
+        (LBLOCKS_SDXL if base_model.arch.get("XL", False) else
+        (LBLOCKS_AM if base_model.arch.get("AM", False) else LBLOCKS26)))
     )
-    blocksN = _normalize_blocks(blocks)
 
     blocknum = (
-        BLOCKIDZI if arch.get("ZI", False) else
-        (BLOCKIDFLUX if arch.get("FLUX", False) else
-        (BLOCKIDXLL if arch.get("XL", False) else
-        (BLOCKIDAM if arch.get("AM", False) else BLOCKID)))
+        BLOCKIDZI if base_model.arch.get("ZI", False) else
+        (BLOCKIDFLUX if base_model.arch.get("FLUX", False) else
+        (BLOCKIDXLL if base_model.arch.get("XL", False) else
+        (BLOCKIDAM if base_model.arch.get("AM", False) else BLOCKID)))
     )
-    vae_key  = "first_stage_model" if not (arch.get("FLUX", False) or arch.get("ZI", False)) else "vae"
 
-    keymap   = _build_keymap(theta_0)
+    keymap   = _build_keymap(base_model.theta)
 
     lr_strs   = []
     lora_meta = {}
@@ -1188,15 +1557,15 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
         print("Budget pass-1: collecting per-target update sums...")
 
         for lora_model, ratio_str in lora_list:
-            lpath = normalize_path(os.path.join(model_path, lora_model))
-            lsd, _meta, lisv2 = load_state_dict(lpath, torch.float, depatch=False)
+            lora_path = normalize_path(os.path.join(model_path, lora_model))
+            lora_model_obj, meta, lisv2 = _load_lora(lora_path, device=device, cache_path=cache_path)
 
             g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
 
-            for down_k in tqdm(list(_iter_lora_down_keys(lsd)), desc=f"Budget scan {lora_model}...", leave=False):
+            for down_k in tqdm(list(_iter_lora_down_keys(lora_model_obj.theta)), desc=f"Budget scan {lora_model}...", leave=False):
                 bake_norm_use = bake_norm
                 d, u, a = _pair_from_down_key(down_k)
-                if d is None or (u not in lsd) or (d not in lsd):
+                if d is None or (u not in lora_model_obj.theta) or (d not in lora_model_obj.theta):
                     continue
                 if bake_unet_only and _is_text_encoder_lora_key(d):
                     continue
@@ -1204,18 +1573,33 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                 if _is_text_encoder_lora_key(d):
                     bake_norm_use *= bake_clip_scale
 
-                # resolve target_key (std path only for SDXL; iszi ignored per your requirement)
-                if arch.get("AM", False):
-                    target_key = anima_resolve_target_any(d, theta_0)
-                    if target_key is None or (target_key not in theta_0):
+                direct_te_target, direct_te_part = (None, None)
+                te2_target, te2_part = (None, None)
+                special_target, special_part = (None, None)
+
+                if base_model.arch.get("XL", False):
+                    direct_te_target, direct_te_part = resolve_sdxl_textenc_direct_target_any(d, keymap)
+                    if direct_te_target is None:
+                        te2_target, te2_part = resolve_sdxl_te2_target_any(d, keymap)
+                        special_target, special_part = resolve_sdxl_special_unet_target_any(d, keymap)
+
+                if direct_te_target is not None:
+                    target_key = direct_te_target
+                elif te2_target is not None:
+                    target_key = te2_target
+                elif special_target is not None:
+                    target_key = special_target
+                elif base_model.arch.get("AM", False):
+                    target_key = anima_resolve_target_any(d, base_model.theta)
+                    if target_key is None or (target_key not in base_model.theta):
                         continue
                 else:
                     full = convert_diffusers_name_to_compvis_cached(d, bool(lisv2))
                     msd  = full.split(".", 1)[0]
-                    if arch.get("XL", False):
+                    if base_model.arch.get("XL", False):
                         msd = msd.replace("lora_unet","diffusion_model").replace("lora_te1_text_model","0_transformer_text_model")
                     target_key = keymap.get(msd)
-                    if target_key is None or (target_key not in theta_0):
+                    if target_key is None or (target_key not in base_model.theta):
                         continue
 
                 # ratio (include bake_norm)
@@ -1223,18 +1607,18 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                     target_key,
                     g=g, weights=weights, deep=deep,
                     blockids=blocknum,
-                    arch=arch,
+                    arch=base_model.arch,
                 )
                 ratio_eff = float(ratio_eff) * float(bake_norm_use)
 
-                down = lsd[d]
-                up   = lsd[u]
+                down = lora_model_obj.theta[d]
+                up   = lora_model_obj.theta[u]
                 if not (isinstance(down, torch.Tensor) and isinstance(up, torch.Tensor)):
                     continue
                 dim = int(down.size(0))
-                alpha = lsd.get(a, dim)
+                alpha = lora_model_obj.theta.get(a, dim)
                 if alpha is None and isinstance(a, str) and a.endswith(".weight"):
-                    alpha = lsd.get(a[:-len(".weight")], dim)
+                    alpha = lora_model_obj.theta.get(a[:-len(".weight")], dim)
                 if isinstance(alpha, torch.Tensor):
                     alpha = float(alpha.item())
                 sc = float(alpha) / float(dim)
@@ -1247,26 +1631,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                 if rho > 0.0:
                     sum_rho[target_key] += float(rho)
 
-            del lsd
-            
-        budget_factor = {}  # target_key -> multiplier in (0,1]
-        for tk, sr in sum_rho.items():
-            if not (sr > 0.0):
-                continue
-            b = _budget_for_target(tk, spec=budget_spec, blockids=blocknum, arch=arch)
-            if b <= 0.0:
-                continue
-            f = min(1.0, float(b) / float(sr))
-            budget_factor[tk] = float(f)
-
-        if getattr(args, "bake_budget_report", False):
-            xs = sorted(((v, k, sum_rho[k], _budget_for_target(k, spec=budget_spec, blockids=blocknum, arch=arch))
-                         for k, v in budget_factor.items()), key=lambda x: x[0])
-            print("Budget report (most shrunk targets):")
-            for f, k, sr, b in xs[:30]:
-                print(f"  f={f:.3f}  sum_rho={sr:.3f}  budget={b:.3f}  key={k}")
-    else:
-        budget_factor = None
+            del lora_model_obj.theta
 
     for lora_model, ratio_str in lora_list:
         print(f"loading: {lora_model}")
@@ -1274,28 +1639,27 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
         g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
         lr_strs.append(ratio_str)
 
-        lpath = normalize_path(os.path.join(model_path, lora_model))
-        lsd, meta, lisv2 = load_state_dict(lpath, torch.float, depatch=False)
-        lhash, _, cache_data = sha256_from_cache(
-            lpath, f"lora/{os.path.splitext(os.path.basename(lpath))[0]}", cache_data
-        )
-        lora_meta[lhash] = meta
+        lora_path = normalize_path(os.path.join(model_path, lora_model))
+        lora_model_obj, meta, lisv2 = _load_lora(lora_path, device=device, cache_path=cache_path)
+        lora_meta[lora_model_obj.sha256] = meta
 
         # --- apply plan build ---
         plan = []  # (kind, target_key, part, down_k, up_k, alpha_k, ratio)
-        for down_k in tqdm(list(_iter_lora_down_keys(lsd)), desc=f"Planning {lora_model}..."):
+        unresolved = 0
+        unresolved_examples = []
+        for down_k in tqdm(list(_iter_lora_down_keys(lora_model_obj.theta)), desc=f"Planning {lora_model}..."):
             bake_norm_use = bake_norm
             d, u, a = _pair_from_down_key(down_k)
             if d is None:
                 continue
-            if (u not in lsd) or (d not in lsd):
+            if (u not in lora_model_obj.theta) or (d not in lora_model_obj.theta):
                 continue
             if bake_unet_only and _is_text_encoder_lora_key(d):
                 continue
             if _is_text_encoder_lora_key(d):
                 bake_norm_use *= bake_clip_scale
             
-            if arch.get("ZI", False):
+            if base_model.arch.get("ZI", False):
                 target_key, part = zimage_resolve_target_any(d, zi_index)
                 if target_key is None:
                     continue
@@ -1303,42 +1667,89 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                     target_key,
                     g=g, weights=weights, deep=deep,
                     blockids=blocknum,
-                    arch=arch,
+                    arch=base_model.arch,
                 )
                 plan.append(("zi", target_key, part, d, u, a, float(ratio)))
                 continue
+            
+            if base_model.arch.get("XL", False):
+                direct_te_target, direct_te_part = resolve_sdxl_textenc_direct_target_any(d, keymap)
+                if direct_te_target is not None:
+                    ratio = _effective_ratio_for_target(
+                        direct_te_target,
+                        g=g, weights=weights, deep=deep,
+                        blockids=blocknum,
+                        arch=base_model.arch,
+                    )
+                    ratio = float(ratio) * float(bake_norm_use)
+                    kind = "fused" if direct_te_part in ("q", "k", "v") else "std"
+                    plan.append((kind, direct_te_target, direct_te_part, d, u, a, float(ratio)))
+                    continue
+
+                te2_target, te2_part = resolve_sdxl_te2_target_any(d, keymap)
+                if te2_target is not None:
+                    ratio = _effective_ratio_for_target(
+                        te2_target,
+                        g=g, weights=weights, deep=deep,
+                        blockids=blocknum,
+                        arch=base_model.arch,
+                    )
+                    ratio = float(ratio) * float(bake_norm_use)
+                    plan.append(("fused", te2_target, te2_part, d, u, a, float(ratio)))
+                    continue
+                
+                special_target, special_part = resolve_sdxl_special_unet_target_any(d, keymap)
+                if special_target is not None:
+                    ratio = _effective_ratio_for_target(
+                        special_target,
+                        g=g, weights=weights, deep=deep,
+                        blockids=blocknum,
+                        arch=base_model.arch,
+                    )
+                    ratio = float(ratio) * float(bake_norm_use)
+                    plan.append(("std", special_target, special_part, d, u, a, float(ratio)))
+                    continue
 
             # standard (SD/SDXL/Flux)
             full = convert_diffusers_name_to_compvis_cached(d, lisv2)
             msd  = full.split(".", 1)[0]
-            if arch.get("XL", False):
+            if base_model.arch.get("XL", False):
                 msd = msd.replace("lora_unet","diffusion_model").replace("lora_te1_text_model","0_transformer_text_model")
 
             target = keymap.get(msd)
             if target is None:
+                unresolved += 1
+                if len(unresolved_examples) < 12:
+                    unresolved_examples.append(d)
                 continue
 
             ratio = _effective_ratio_for_target(
                 target,
                 g=g, weights=weights, deep=deep,
                 blockids=blocknum,
-                arch=arch,
+                arch=base_model.arch,
             )
             ratio = float(ratio) * float(bake_norm_use)
             plan.append(("std", target, None, d, u, a, float(ratio)))
 
+        print(f"[plan] {lora_model}: resolved={len(plan)} unresolved={unresolved}")
+        if unresolved_examples:
+            print("[plan] unresolved samples:")
+            for s in unresolved_examples:
+                print("  -", s)
+
         # --- apply ---
         for kind, target_key, part, down_k, up_k, alpha_k, ratio in tqdm(plan, desc=f"Merging {lora_model}...", leave=False):
-            if target_key not in theta_0:
+            if target_key not in base_model.theta:
                 continue
 
             # alpha / scale
-            down = lsd[down_k]
-            up   = lsd[up_k]
+            down = lora_model_obj.theta[down_k]
+            up   = lora_model_obj.theta[up_k]
             dim  = int(down.size(0))
-            alpha = lsd.get(alpha_k, dim)
+            alpha = lora_model_obj.theta.get(alpha_k, dim)
             if alpha is None and isinstance(alpha_k, str) and alpha_k.endswith(".weight"):
-                alpha = lsd.get(alpha_k[:-len(".weight")], dim)
+                alpha = lora_model_obj.theta.get(alpha_k[:-len(".weight")], dim)
 
             sc = float(alpha) / float(dim)
             
@@ -1367,15 +1778,15 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
             # delta cap (adjust ratio downward if too strong for this module)
             if bake_delta_cap > 0.0:
                 # for zi we cap vs the actual target weight
-                W_ref = theta_0.get(target_key)
+                W_ref = base_model.theta.get(target_key)
                 if isinstance(W_ref, torch.Tensor):
                     ratio = _apply_delta_cap_to_ratio(W_ref, up_p, down_p, sc=sc, ratio=ratio, cap=bake_delta_cap)
 
             # overwrite local up/down used below
             up, down = up_p, down_p
-
-            if kind == "zi":
-                W = theta_0.get(target_key)
+            
+            if kind == "fused":
+                W = base_model.theta.get(target_key)
                 if not isinstance(W, torch.Tensor):
                     continue
 
@@ -1386,10 +1797,25 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                     ratio=ratio,
                 )
                 if out is not None:
-                    theta_0[target_key] = out
+                    base_model.theta[target_key] = out
                 continue
 
-            W = theta_0[target_key]
+            if kind == "zi":
+                W = base_model.theta.get(target_key)
+                if not isinstance(W, torch.Tensor):
+                    continue
+
+                out = apply_zimage_lora_to_weight(
+                    W, part=part,
+                    up=up, down=down,
+                    alpha=alpha,
+                    ratio=ratio,
+                )
+                if out is not None:
+                    base_model.theta[target_key] = out
+                continue
+
+            W = base_model.theta[target_key]
             dev = W.device
 
             if bake_fp32 and isinstance(W, torch.Tensor) and W.is_floating_point():
@@ -1397,86 +1823,76 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                 u = up.to(device=dev, dtype=torch.float32, non_blocking=False)
                 d = down.to(device=dev, dtype=torch.float32, non_blocking=False)
                 W_out = apply_lora_to_weight_inplace(W_work, u, d, sc, ratio)
-                theta_0[target_key] = W_out.to(dtype=W.dtype)
+                base_model.theta[target_key] = W_out.to(dtype=W.dtype)
             else:
                 dt = W.dtype if (isinstance(W, torch.Tensor) and W.is_floating_point()) else torch.float32
                 u = up.to(device=dev, dtype=dt, non_blocking=False)
                 d = down.to(device=dev, dtype=dt, non_blocking=False)
-                theta_0[target_key] = apply_lora_to_weight_inplace(W, u, d, sc, ratio)
+                base_model.theta[target_key] = apply_lora_to_weight_inplace(W, u, d, sc, ratio)
             
-        del lsd
-        
-    prepare_state_dict_for_save(
-        theta_0, args,
-        arch=arch,
-        vae_prefix=vae_key,
-        prune=bool(getattr(args, "prune", False)),
-        make_cpu=True,
-        make_contiguous=True,
-    )
+        del lora_model_obj.theta
 
     out_name = os.path.splitext(os.path.basename(output))[0]
     meta_new = {
         "sd_merge_models": json.dumps({
             "type": "pluslora-chattiori",
-            "checkpoint_hash": sha256_from_cache(mpath, f"checkpoint/{model_name}", cache_data)[0],
+            "checkpoint_hash": base_model.sha256 or "",
             "lora_hash": ",".join([k for k in lora_meta.keys() if k]),
             "alpha_info": ",".join(lr_strs),
             "output_name": out_name,
         }),
-        "checkpoint": json.dumps(read_metadata_from_safetensors(mpath)) if mpath.endswith(".safetensors") else "{}",
+        "checkpoint": json.dumps(base_model.metadata),
         "lora": json.dumps(lora_meta),
     }
     if args.memo is not None:
         meta_new["memo"] = args.memo
 
+    baked = _make_checkpoint_model(base_model.theta, base_model, output=output, metadata=meta_new)
     print(f"Saving as {output}...")
-    if output.endswith(".safetensors"):
-        safetensors.torch.save_file(theta_0, output, metadata=None if args.no_metadata else meta_new)
-    else:
-        torch.save({"state_dict": theta_0}, output)
-
-    del theta_0
-    dump_cache(cache_data)
+    _save_umodel(baked, output, args=args)
+    del base_model, baked
     print(f"Done! ({round(os.path.getsize(output)/1073741824, 2)}G)")
 
 
 @torch.inference_mode()
 def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
-    set_cache_filename(os.path.join(base_path(), "cache.json"))
-    merge_cache_json(model_path)
-    cache_data = cache("hashes", None)
+    cache_path = os.path.join(base_path(), "cache.json")
     model_path = normalize_path(model_path)
-    if not model:     return "ERROR: No model Selected"
-    if not lora_list: return "ERROR: No LoRA Selected"
+    if not model:
+        return "ERROR: No model Selected"
+    if not lora_list:
+        return "ERROR: No LoRA Selected"
 
     print("Plus LoRA DARE start")
 
-    # checkpoint
     mpath = normalize_path(os.path.join(model_path, model))
-    theta_0, *_ = load_model(mpath, device)
-    theta_0 = upcast_fp8_state_dict(theta_0)
-    model_name  = os.path.splitext(os.path.basename(mpath))[0]
+    base_model = _load_umodel(
+        mpath,
+        device=device,
+        model_type="checkpoint",
+        verify_hash=True,
+        cache_path=cache_path,
+    )
 
-    arch, theta_0 = detect_arch(theta_0)
-    
     zi_index = None
-    if arch.get("ZI", False):
-        zi_index = _build_zi_layer_index(theta_0)
+    if base_model.arch.get("ZI", False):
+        zi_index = _build_zi_layer_index(base_model.theta)
 
-    blocks  = LBLOCKS_ZI if arch.get("ZI", False) else (LBLOCKS_FLUX if arch.get("FLUX", False) else (LBLOCKS_SDXL if arch.get("XL", False) else LBLOCKS26))
-    blocknum = BLOCKIDZI if arch.get("ZI", False) else (BLOCKIDFLUX if arch.get("FLUX", False) else (BLOCKIDXLL if arch.get("XL", False) else BLOCKID))
-    blocksN = _normalize_blocks(blocks)
-    vae_key = "first_stage_model" if not (arch.get("FLUX", False) or arch.get("ZI", False)) else "vae"
+    blocks = (
+        LBLOCKS_ZI if base_model.arch.get("ZI", False) else
+        (LBLOCKS_FLUX if base_model.arch.get("FLUX", False) else
+         (LBLOCKS_SDXL if base_model.arch.get("XL", False) else
+          (LBLOCKS_AM if base_model.arch.get("AM", False) else LBLOCKS26)))
+    )
+    blocknum = (
+        BLOCKIDZI if base_model.arch.get("ZI", False) else
+        (BLOCKIDFLUX if base_model.arch.get("FLUX", False) else
+         (BLOCKIDXLL if base_model.arch.get("XL", False) else
+          (BLOCKIDAM if base_model.arch.get("AM", False) else BLOCKID)))
+    )
 
-    keymap = _build_keymap(theta_0)
+    keymap = _build_keymap(base_model.theta)
 
-    # mainlora
-    main_sd, _, mlv2 = load_state_dict(mainlora, torch.float, depatch=False)
-    plan = build_apply_plan(main_sd.keys(), arch=arch, mlv2=mlv2, keymap=keymap, theta_0=theta_0)
-    del main_sd
-
-    # DARE params
     lam, p, scale = 1.5, 0.13, 0.2
     torch.manual_seed(0)
 
@@ -1487,105 +1903,145 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
 
         g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
         lr_strs.append(ratio_str)
-        
-        lpath = normalize_path(os.path.join(model_path, lora_model))
-        lsd, meta, lisv2 = load_state_dict(lpath, torch.float, depatch=False)
-        lhash, _, cache_data = sha256_from_cache(lpath, f"lora/{os.path.splitext(os.path.basename(lpath))[0]}", cache_data)
-        lora_meta[lhash] = meta
 
-        lw = merge_weights_inplace(lsd, lisv2, arch.get("XL", False), blocks, p, lam, scale, [1.0])
+        lora_path = normalize_path(os.path.join(model_path, lora_model))
+        lora_model_obj, meta, lisv2 = _load_lora(lora_path, device=device, cache_path=cache_path)
+        lora_meta[lora_model_obj.sha256] = meta
+
+        lw = merge_weights_inplace(
+            lora_model_obj.theta,
+            lisv2,
+            base_model.arch.get("XL", False),
+            blocks,
+            p,
+            lam,
+            scale,
+            [1.0],
+        )
+        
+        plan = build_apply_plan(
+            lw.keys(),
+            arch=base_model.arch,
+            mlv2=lisv2,
+            keymap=keymap,
+            theta_0=base_model.theta,
+        )
+        print(f"[dare-plan] {lora_model}: resolved={len(plan)}")
 
         for kind, down_k, up_k, alpha_k, tgt, part in tqdm(plan, desc=f"Applying {lora_model}...", leave=False):
-            d, u, a = _pair_from_down_key(down_k)
-            if d is None:
+            if down_k not in lw or up_k not in lw:
                 continue
-            if (u not in lsd) or (d not in lsd):
-                continue
-            
-            if arch.get("ZI", False):
-                target_key, part = zimage_resolve_target_any(d, zi_index)
-                if target_key is None:
-                    continue
-                full = convert_diffusers_name_to_compvis_cached(d, lisv2)
-                msd  = full.split(".", 1)[0]
-                bi   = _find_block_index(full, msd, blocksN)
-                ratio = _effective_ratio_for_target(
-                    tgt,
-                    g=g, weights=weights, deep=deep,
-                    blockids=blocknum,
-                    arch=arch,
-                )
-                plan.append(("zi", target_key, part, d, u, a, float(ratio)))
-                continue
-            
-            if arch.get("AM", False):
-                tgt = anima_resolve_target_any(down_k, keymap)
 
-            # alpha / scale
-            down = lw[down_k]
-            up   = lw[up_k]
-            dim  = int(down.size(0))
-            alpha = lw.get(alpha_k, dim)
-            sc = float(alpha) / float(dim)
-
-            if kind == "zi":
-                W = theta_0.get(target_key)
+            target_key = tgt
+            target_part = part
+            
+            if kind == "fused":
+                W = base_model.theta.get(target_key)
                 if not isinstance(W, torch.Tensor):
                     continue
 
                 out = apply_zimage_lora_to_weight(
-                    W, part=part,
-                    up=up, down=down,
+                    W,
+                    part=target_part,
+                    up=up,
+                    down=down,
                     alpha=alpha,
                     ratio=ratio,
                 )
                 if out is not None:
-                    theta_0[target_key] = out
+                    base_model.theta[target_key] = out
                 continue
 
-            if tgt not in theta_0:
+            if kind == "zi":
+                if (target_key is None) or (target_key not in base_model.theta):
+                    target_key, target_part = zimage_resolve_target_any(down_k, zi_index)
+                if target_key is None or target_key not in base_model.theta:
+                    continue
+
+            elif base_model.arch.get("AM", False):
+                if (target_key is None) or (target_key not in base_model.theta):
+                    target_key = anima_resolve_target_any(down_k, base_model.theta)
+                if target_key is None or target_key not in base_model.theta:
+                    continue
+
+            else:
+                if target_key is None or target_key not in base_model.theta:
+                    continue
+
+            ratio = _effective_ratio_for_target(
+                target_key,
+                g=g,
+                weights=weights,
+                deep=deep,
+                blockids=blocknum,
+                arch=base_model.arch,
+            )
+
+            down = lw[down_k]
+            up = lw[up_k]
+            dim = int(down.size(0))
+
+            alpha = lw.get(alpha_k, dim)
+            if alpha is None and isinstance(alpha_k, str) and alpha_k.endswith(".weight"):
+                alpha = lw.get(alpha_k[:-len(".weight")], dim)
+            if isinstance(alpha, torch.Tensor):
+                alpha = float(alpha.item())
+            alpha = float(dim if alpha is None else alpha)
+
+            sc = float(alpha) / float(dim)
+
+            if kind == "zi":
+                W = base_model.theta.get(target_key)
+                if not isinstance(W, torch.Tensor):
+                    continue
+
+                out = apply_zimage_lora_to_weight(
+                    W,
+                    part=target_part,
+                    up=up,
+                    down=down,
+                    alpha=alpha,
+                    ratio=ratio,
+                )
+                if out is not None:
+                    base_model.theta[target_key] = out
                 continue
-            W = theta_0[tgt]
+
+            W = base_model.theta.get(target_key)
+            if not isinstance(W, torch.Tensor):
+                continue
 
             dev = W.device
             W32 = W.float()
-            out = apply_lora_to_weight_inplace(W32, up.to(dev).float(), down.to(dev).float(), sc, ratio=ratio)
-            theta_0[tgt] = out.to(W.dtype)
+            out = apply_lora_to_weight_inplace(
+                W32,
+                up.to(dev).float(),
+                down.to(dev).float(),
+                sc,
+                ratio=ratio,
+            )
+            base_model.theta[target_key] = out.to(W.dtype)
 
-        del lw, lsd
-        
-    prepare_state_dict_for_save(
-        theta_0, args,
-        arch=arch,
-        vae_prefix=vae_key,
-        prune=bool(getattr(args, "prune", False)),
-        make_cpu=True,
-        make_contiguous=True,
-    )
+        del lw, lora_model_obj.theta
 
     out_name = os.path.splitext(os.path.basename(output))[0]
     meta_new = {
         "sd_merge_models": json.dumps({
             "type": "pluslora-chattiori",
-            "checkpoint_hash": sha256_from_cache(mpath, f"checkpoint/{model_name}", cache_data)[0],
+            "checkpoint_hash": base_model.sha256,
             "lora_hash": ",".join([k for k in lora_meta.keys() if k]),
             "alpha_info": "DARE:" + ",".join(lr_strs),
             "output_name": out_name,
         }),
-        "checkpoint": json.dumps(read_metadata_from_safetensors(mpath)) if mpath.endswith(".safetensors") else "{}",
+        "checkpoint": json.dumps(base_model.metadata),
         "lora": json.dumps(lora_meta),
     }
     if args.memo is not None:
         meta_new["memo"] = args.memo
 
+    baked = _make_checkpoint_model(base_model.theta, base_model, output=output, metadata=meta_new)
     print(f"Saving as {output}...")
-    if output.endswith(".safetensors"):
-        safetensors.torch.save_file(theta_0, output, metadata=None if args.no_metadata else meta_new)
-    else:
-        torch.save({"state_dict": theta_0}, output)
-
-    del theta_0
-    dump_cache(cache_data)
+    _save_umodel(baked, output, args=args)
     print(f"Done! ({round(os.path.getsize(output)/1073741824, 2)}G)")
     
 def _infer_arch_from_lora_keys(keys: list[str]) -> tuple[bool, bool, bool]:
@@ -1666,35 +2122,6 @@ def _to_2d_up_down(up: torch.Tensor, down: torch.Tensor) -> tuple[torch.Tensor, 
     return up2d, down2d, is_conv, shape_info
 
 
-def _compress_uv_rankcap(U: torch.Tensor, V: torch.Tensor, r_cap: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compress factorization (U [out,k], V [k,in]) into rank r_cap using:
-      U = Qu Ru, V^T = Qv Rv  => UV = Qu (Ru Rv^T) Qv^T
-      SVD on (Ru Rv^T) which is k x k
-    """
-    k = int(U.shape[1])
-    if (r_cap <= 0) or (k <= r_cap):
-        return U, V
-
-    Uc = U.to(dtype=torch.float32)
-    Vc = V.to(dtype=torch.float32)
-
-    Qu, Ru = torch.linalg.qr(Uc, mode="reduced")       # Qu: [out,k], Ru: [k,k]
-    Qv, Rv = torch.linalg.qr(Vc.t(), mode="reduced")   # Qv: [in,k],  Rv: [k,k]
-
-    M = Ru @ Rv.t()  # [k,k]
-    P, S, Vh = torch.linalg.svd(M, full_matrices=False)  # M = P diag(S) Vh
-
-    r = min(int(r_cap), int(S.numel()))
-    A = Qu @ P[:, :r]              # [out,r]
-    B = Qv @ Vh.t()[:, :r]         # [in,r]
-
-    sqrtS = torch.sqrt(S[:r].clamp_min(0.0))
-    U_new = A * sqrtS              # [out,r]
-    V_new = (sqrtS[:, None] * B.t())  # [r,in]
-
-    return U_new, V_new
-
 CLAMP_QUANTILE_DEFAULT = 0.99
 
 @torch.inference_mode()
@@ -1749,6 +2176,108 @@ def _clamp_uv_quantile_inplace(up: torch.Tensor, down: torch.Tensor, q: float) -
     return up, down
 
 
+_SDXL_TE1_DIRECT_PREFIXES = (
+    "text_encoders.clip_l.transformer.text_model.",
+    "conditioner.embedders.0.model.transformer.text_model.",
+)
+_SDXL_TE2_DIRECT_PREFIXES = (
+    "text_encoders.clip_g.transformer.text_model.",
+    "conditioner.embedders.1.model.transformer.text_model.",
+)
+
+def _strip_any_model_prefix(s: str, prefixes: tuple[str, ...]) -> str | None:
+    for p in prefixes:
+        if s.startswith(p):
+            return s[len(p):]
+    return None
+
+def _direct_unet_base_to_kohya(base: str) -> str | None:
+    b = base
+    if b.startswith("model.diffusion_model."):
+        b = b[len("model.diffusion_model."):]
+    elif b.startswith("diffusion_model."):
+        b = b[len("diffusion_model."):]
+    else:
+        return None
+    return "lora_unet_" + b.replace(".", "_")
+
+def _direct_sdxl_textenc_base_to_kohya(base: str) -> str | None:
+    rest = _strip_any_model_prefix(base, _SDXL_TE1_DIRECT_PREFIXES)
+    if rest is not None:
+        if rest.startswith("encoder.layers."):
+            m = re.match(r"^encoder\.layers\.(\d+)\.(.+)$", rest)
+            if m:
+                return f"lora_te1_text_model_encoder_layers_{m.group(1)}_{m.group(2).replace('.', '_')}"
+        if rest.startswith("embeddings."):
+            return "lora_te1_text_model_" + rest.replace(".", "_")
+        if rest == "final_layer_norm":
+            return "lora_te1_text_model_final_layer_norm"
+
+    rest = _strip_any_model_prefix(base, _SDXL_TE2_DIRECT_PREFIXES)
+    if rest is not None:
+        if rest.startswith("encoder.layers."):
+            m = re.match(r"^encoder\.layers\.(\d+)\.(.+)$", rest)
+            if m:
+                return f"lora_te2_text_model_encoder_layers_{m.group(1)}_{m.group(2).replace('.', '_')}"
+        if rest.startswith("embeddings."):
+            return "lora_te2_text_model_" + rest.replace(".", "_")
+        if rest == "final_layer_norm":
+            return "lora_te2_text_model_final_layer_norm"
+
+    if base in ("text_encoders.clip_l.text_projection", "conditioner.embedders.0.model.text_projection"):
+        return "lora_te1_text_projection"
+    if base in ("text_encoders.clip_g.text_projection", "conditioner.embedders.1.model.text_projection"):
+        return "lora_te2_text_projection"
+
+    return None
+
+def _normalized_compvis_to_kohya_base(full: str) -> str | None:
+    if full.startswith("diffusion_model_input_blocks_"):
+        return "lora_unet_" + full[len("diffusion_model_"):]
+    if full.startswith("diffusion_model_middle_block_"):
+        return "lora_unet_" + full[len("diffusion_model_"):]
+    if full.startswith("diffusion_model_output_blocks_"):
+        return "lora_unet_" + full[len("diffusion_model_"):]
+    if full.startswith("diffusion_model_out_"):
+        return "lora_unet_" + full[len("diffusion_model_"):]
+
+    if full.startswith("0_transformer_text_model_"):
+        return "lora_te1_" + full[len("0_transformer_"):]
+    if full.startswith("transformer_text_model_"):
+        return "lora_te1_" + full[len("transformer_"):]
+
+    return None
+
+def canonical_kohya_base_from_down_key(down_k: str, *, arch: dict, lisv2: bool) -> str | None:
+    base = _canonical_lora_base(down_k)
+    if base is None:
+        return None
+
+    # already kohya-style
+    if base.startswith(("lora_unet_", "lora_te_", "lora_te1_", "lora_te2_", "lora_vae_", "lora_first_stage_model_")):
+        return base
+
+    # direct unet
+    k = _direct_unet_base_to_kohya(base)
+    if k is not None:
+        return k
+
+    # direct sdxl text encoder
+    if arch.get("XL", False):
+        k = _direct_sdxl_textenc_base_to_kohya(base)
+        if k is not None:
+            return k
+
+    # fallback through normalized converted name
+    full = convert_diffusers_name_to_compvis_cached(down_k, bool(lisv2))
+    k = _normalized_compvis_to_kohya_base(full)
+    if k is not None:
+        return k
+
+    # last resort: keep original stripped base
+    return base
+
+
 @torch.inference_mode()
 def merge_loras_only(
     lora_list: list[list[str]],
@@ -1764,9 +2293,7 @@ def merge_loras_only(
     clamp_quantile: float = CLAMP_QUANTILE_DEFAULT,
     intermediate_mult: int = 4,
 ):
-    set_cache_filename(os.path.join(base_path(), "cache.json"))
-    merge_cache_json(model_path)
-    cache_data = cache("hashes", None)
+    cache_path = os.path.join(base_path(), "cache.json")
 
     model_path = normalize_path(model_path)
     if not lora_list:
@@ -1775,7 +2302,7 @@ def merge_loras_only(
     print("Merge LoRAs start")
     print(f"Output: {output}")
     print(f"merge_rank(target): {merge_rank}  (0=keep as-is per module)")
-    print(f"arch: {arch}")
+    print(f"arch: {arch_set}")
     print(f"merge_norm: {merge_norm}  merge_scale: {merge_scale}")
     print(f"clamp_quantile: {clamp_quantile}  intermediate_mult: {intermediate_mult}")
 
@@ -1808,21 +2335,18 @@ def merge_loras_only(
         lpath = normalize_path(os.path.join(model_path, lora_model))
         print(f"loading lora: {lora_model}")
 
-        lsd, meta, lisv2 = load_state_dict(lpath, torch.float, depatch=False)
-        lhash, _, cache_data = sha256_from_cache(
-            lpath, f"lora/{os.path.splitext(os.path.basename(lpath))[0]}", cache_data
-        )
-        merged_meta[lhash] = meta
-        merged_sources.append({"name": lora_model, "hash": lhash, "ratio": ratio_str})
+        lora_obj, meta, lisv2 = _load_lora(lpath, device=device, cache_path=cache_path)
+        merged_meta[lora_obj.sha256] = meta
+        merged_sources.append({"name": lora_model, "hash": lora_obj.sha256, "ratio": ratio_str})
 
         if not decided:
             if arch_set == "auto":
-                arch = _infer_arch_from_lora_keys(list(lsd.keys()))
+                arch = _infer_arch_from_lora_keys(list(lora_obj.theta.keys()))
             else:
                 arch["XL"] = (arch_set == "sdxl")
                 arch["FLUX"] = (arch_set == "flux")
                 arch["ZI"] = (arch_set == "zi")
-                arch["AM"] = (arch_set == "anima")
+                arch["AM"] = (arch_set == "am")
 
             blocknum = (
                 BLOCKIDZI if arch["ZI"] else
@@ -1835,30 +2359,34 @@ def merge_loras_only(
 
         g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
 
-        for down_k in tqdm(list(_iter_lora_down_keys(lsd)), desc=f"Merging factors {lora_model}..."):
+        for down_k in tqdm(list(_iter_lora_down_keys(lora_obj.theta)), desc=f"Merging factors {lora_model}..."):
             d, u, a = _pair_from_down_key(down_k)
             if d is None:
                 continue
-            if (u not in lsd) or (d not in lsd):
+            if (u not in lora_obj.theta) or (d not in lora_obj.theta):
                 continue
 
-            base = _canonical_lora_base(d)
-            if base is None:
-                continue
+            base = canonical_kohya_base_from_down_key(
+            d,
+            arch=arch,
+            lisv2=bool(lisv2),
+        )
+        if base is None:
+            continue
 
             if unet_only:
                 if ("lora_te" in base) or ("text_encoder" in base) or ("te_" in base):
                     continue
 
-            down = lsd[d]
-            up = lsd[u]
+            down = lora_obj.theta[d]
+            up = lora_obj.theta[u]
             if not (isinstance(down, torch.Tensor) and isinstance(up, torch.Tensor)):
                 continue
 
             rank = int(down.size(0))
-            alpha = lsd.get(a, rank)
+            alpha = lora_obj.theta.get(a, rank)
             if alpha is None and isinstance(a, str) and a.endswith(".weight"):
-                alpha = lsd.get(a[:-len(".weight")], rank)
+                alpha = lora_obj.theta.get(a[:-len(".weight")], rank)
             if isinstance(alpha, torch.Tensor):
                 alpha = float(alpha.item())
             alpha = float(rank if alpha is None else alpha)
@@ -1924,11 +2452,10 @@ def merge_loras_only(
                 if (merge_rank > 0) and (k_soft > 0) and (int(st["U"].shape[1]) > k_soft):
                     st["U"], st["V"] = _compress_uv_rankcap_dimstyle(st["U"], st["V"], int(k_soft))
 
-        del lsd
+        del lora_obj
 
     # finalize + save
     out_sd = {}
-    n_modules = 0
 
     for base, st in tqdm(list(merged.items()), desc="Finalizing merged LoRA..."):
         U = st["U"]
@@ -1976,15 +2503,13 @@ def merge_loras_only(
         out_sd[up_k] = up_t
         out_sd[alpha_k] = torch.tensor(float(r), dtype=torch.float32)
 
-        n_modules += 1
-
     meta_new = {
         "sd_merge_models": json.dumps({
             "type": "lora-merge-chattiori-dim",
             "merge_rank_target": int(merge_rank),
             "intermediate_mult": int(intermediate_mult),
             "clamp_quantile": float(clamp_quantile),
-            "arch": ("zi" if arch["ZI"] else ("flux" if arch["FLUX"] else ("sdxl" if arch["XL"] else "sd"))),
+            "arch": ("zi" if arch["ZI"] else ("flux" if arch["FLUX"] else ("sdxl" if arch["XL"] else ("am" if arch["AM"] else "sd")))),
             "merge_norm": str(merge_norm),
             "merge_scale": float(merge_scale),
             "sources": merged_sources,
@@ -1992,11 +2517,11 @@ def merge_loras_only(
         }),
         "lora": json.dumps(merged_meta),
     }
-
+    
+    merged_lora_model = _make_lora_model(out_sd, output=output, metadata=meta_new, arch=arch)
     print(f"Saving merged LoRA as {output}...")
-    safetensors.torch.save_file(out_sd, output, metadata=meta_new)
+    _save_umodel(merged_lora_model, output, args=args)
 
-    dump_cache(cache_data)
     print(f"Done! {round(os.path.getsize(output)/1073741824, 3)}G")
 
 if __name__ == "__main__":
@@ -2047,13 +2572,6 @@ if __name__ == "__main__":
                         help="Cap for relative update: ||ΔW||_F <= cap * ||W||_F (used by bake_guard). Suggested 0.02~0.10.")
     parser.add_argument("--bake_guard_skip", type=float, default=0.25,
                         help="Skip module if estimated ||ΔW||_F / ||W||_F exceeds this. 0 disables. Suggested 0.15~0.50.")
-    parser.add_argument("--bake_budget", type=str, default="",
-        help="Per-target update budget (relative). Empty disables. Examples: '0.18' (flat), '0.10:0.18' (early:late), '0.08:0.12:0.18' (early:mid:late), or ratio-spec like '0.18,[...]'.")
-
-    parser.add_argument("--bake_budget_metric", type=str, default="fro",
-        choices=["fro"],
-        help="Budget metric. (currently only frobenius upper-bound estimate)")
-
     parser.add_argument("--bake_budget_report", action="store_true",
         help="Print budget scaling report (top targets by shrink).")
     parser.add_argument("--no_metadata", action="store_true", help="Save without metadata")

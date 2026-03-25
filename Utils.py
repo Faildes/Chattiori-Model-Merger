@@ -33,7 +33,6 @@ NUM_TOTAL_BLOCKS = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + NUM_OUTPUT_BLOCKS
 
 BLOCKID = ["BASE"] + [f"IN{i:02}" for i in range(12)] + ["M00"] + [f"OUT{i:02}" for i in range(12)]
 BLOCKIDXLL = ["BASE"] + [f"IN{i:02}" for i in range(9)] + ["M00"] + [f"OUT{i:02}" for i in range(9)] + ["VAE"]
-BLOCKIDXL = ["BASE"] + [f"IN{i}" for i in range(9)] + ["M"] + [f"OUT{i}" for i in range(9)] + ["VAE"]
 BLOCKIDFLUX = ["CLIP", "T5", "IN"] + ["D{:002}".format(x) for x in range(19)] + ["S{:002}".format(x) for x in range(38)] + ["OUT"] # Len: 61
 BLOCKIDZI = ["BASE","CONT","NOISE"] + [f"L{i:02}" for i in range(30)] + ["VAE"]
 BLOCKIDAM = ["BASE"] + [f"L{i:02}" for i in range(28)] + ["VAE"] # Anima Model has 28 blocks
@@ -45,12 +44,9 @@ _re_out = re.compile(r'\.output_blocks\.(\d+)\.')
 _re_flux_any_num = re.compile(r'\.(\d+)\.')
 _re_xl_tf = re.compile(r'transformer_blocks\.(\d+)\.')
 
-FINETUNEX = ["IN", "OUT", "OUT2", "CONT", "BRI", "COL1", "COL2", "COL3"]
 COLS = [[-1, 1/3, 2/3], [1, 1, 0], [0, -1, -1], [1, 0, 1]]
 COLSXL = [[0, 0, 1], [1, 0, 0], [-1, -1, 0], [-1, 1, 0]]
 
-PREFIXFIX = ("double_blocks","single_blocks","time_in","vector_in","txt_in")
-PREFIX_M = "model.diffusion_model."
 BNB = ".quant_state.bitsandbytes__"
 QTYPES = ["fp4", "nf4"]
 
@@ -310,7 +306,6 @@ checkpoint_dict_replacements = {
 }
 
 checkpoint_dict_skip_on_merge = set(["cond_stage_model.transformer.text_model.embeddings.position_ids"])
-vae_ignore_keys = {"model_ema.decay", "model_ema.num_updates"}
 
 def normalize_path(path: str) -> str:
     path = os.path.abspath(path)
@@ -451,6 +446,20 @@ def fineman(fine, arch):
         }
         add = (fine[5] * 0.02) if len(fine) > 5 else 0.0
         return {"mul": mul, "add": add}
+    
+    if isinstance(fine, (list, tuple, np.ndarray)) and len(fine) >= 8:
+        return {
+            "mode": "image_tone_v2",
+            "noise1": float(fine[0]),
+            "noise2": float(fine[1]),
+            "noise3": float(fine[2]),
+            "contrast": float(fine[3]),
+            "brightness": float(fine[4]),
+            "r": float(fine[5]),
+            "g": float(fine[6]),
+            "b": float(fine[7]),
+        }
+
     r = [
         1 - fine[0] * 0.01,
         1 + fine[0] * 0.02,
@@ -552,7 +561,7 @@ def prepare_state_dict_for_save(
         v = theta.get(k, None)
 
         # prune
-        if prune and ((".scale" in k and arch.get("ZI", False)) or (not any(k.startswith(r) for r in roots))):
+        if prune and ((".scale" in k and arch.get("ZI", False)) or ("pos_embedder" in k and arch.get("AM", False)) or (not any(k.startswith(r) for r in roots))):
             theta.pop(k, None)
             continue
 
@@ -594,10 +603,6 @@ def prepare_state_dict_for_save(
 
     return theta
 
-def set_cache_filename(path: str):
-    global cache_filename
-    cache_filename = normalize_path(path)
-
 def _safe_load_json(path: str):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -607,9 +612,9 @@ def _safe_load_json(path: str):
     except json.JSONDecodeError:
         return {}
 
-def merge_cache_json(model_path):
-    base = _safe_load_json(cache_filename)
+def merge_cache_json(cache_path, model_path):
     model_cache_path = os.path.join(model_path, "cache.json")
+    base = _safe_load_json(cache_path if os.path.exists(cache_path) else model_cache_path)
     update = _safe_load_json(model_cache_path) if os.path.exists(model_cache_path) else {}
 
     if isinstance(base, dict) and isinstance(update, dict):
@@ -617,22 +622,22 @@ def merge_cache_json(model_path):
     elif isinstance(base, list) and isinstance(update, list):
         base.extend(update)
 
-    with filelock.FileLock(f"{cache_filename}.lock"):
-        with open(cache_filename, "w", encoding="utf-8") as f:
+    with filelock.FileLock(f"{cache_path}.lock"):
+        with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(base, f, ensure_ascii=False, indent=2)
     
-def dump_cache(cache_data):
-    with filelock.FileLock(f"{cache_filename}.lock"):
-        with open(cache_filename, "w", encoding="utf8") as f:
+def dump_cache(cache_data, cache_path=None):
+    with filelock.FileLock(f"{cache_path}.lock"):
+        with open(cache_path, "w", encoding="utf8") as f:
             json.dump(cache_data or {}, f, indent=4)
 
-def cache(subsection, cache_data):
+def cache(subsection, cache_data, cache_path=None):
     if cache_data is None:
-        with filelock.FileLock(f"{cache_filename}.lock"):
-            cache_data = _safe_load_json(cache_filename)
+        with filelock.FileLock(f"{cache_path}.lock"):
+            cache_data = _safe_load_json(cache_path)
     if subsection not in cache_data or not isinstance(cache_data.get(subsection), dict):
         cache_data[subsection] = {}
-        dump_cache(cache_data)
+        dump_cache(cache_data, cache_path)
     return cache_data
 
 def model_hash(filename: str) -> str:
@@ -643,12 +648,17 @@ def model_hash(filename: str) -> str:
     except FileNotFoundError:
         return "NOFILE"
 
-def sha256_from_cache(filename: str, title: str, cache_data):
-    cache_data = cache("hashes", cache_data)
+def sha256_from_cache(filename: str, title: str, cache_data, cache_path=None):
+    cache_data = cache("hashes", cache_data, cache_path)
     hsect = cache_data.get("hashes", {})
     h = hsect.get(title)
     if not h:
         return None, None, cache_data
+
+    cur_mtime = os.path.getmtime(filename) if os.path.exists(filename) else None
+    if h.get("mtime") != cur_mtime:
+        return None, None, cache_data
+
     return h.get("sha256"), h.get("model_hash"), cache_data
 
 def calculate_sha256(filename: str, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -658,7 +668,8 @@ def calculate_sha256(filename: str, chunk_size: int = 8 * 1024 * 1024) -> str:
             hasher.update(chunk)
     return hasher.hexdigest()
 
-def sha256(filename: str, title: str, cache_data=None) -> str:
+def sha256(filename: str, title: str, cache_path: str | None) -> str:
+    cache_data = cache("hashes", None, cache_path)
     s256_cached, _, cache_data = sha256_from_cache(filename, title, cache_data)
     if s256_cached:
         return s256_cached
@@ -668,22 +679,13 @@ def sha256(filename: str, title: str, cache_data=None) -> str:
     mhash = model_hash(filename)
     print(sha_val)
 
-    cache_data = cache("hashes", cache_data)
-    if "hashes" not in cache_data or not isinstance(cache_data["hashes"], dict):
-        cache_data["hashes"] = {}
-
     cache_data["hashes"][title] = {
         "mtime": os.path.getmtime(filename) if os.path.exists(filename) else None,
         "sha256": sha_val,
         "model_hash": mhash,
     }
-    dump_cache(cache_data)
+    dump_cache(cache_data, cache_path)
     return sha_val
-
-def calculate_shorthash(filename: str):
-    title = f"checkpoint/{os.path.splitext(os.path.basename(filename))[0]}"
-    val = sha256(filename, title, None)
-    return None if val is None else val[:10]
 
 def read_metadata_from_safetensors(filename):
     with open(filename, "rb") as f:
@@ -700,43 +702,6 @@ def read_metadata_from_safetensors(filename):
         res[k] = v
     return res
 
-
-def transform_checkpoint_dict_key(k: str):
-    for src, rep in checkpoint_dict_replacements.items():
-        if k.startswith(src):
-            k = rep + k[len(src):]
-    return k
-
-def get_state_dict_from_checkpoint(pl_sd: dict) -> dict:
-    d = pl_sd.pop("state_dict", pl_sd)
-    d.pop("state_dict", None)
-    out = {}
-    for k, v in d.items():
-        nk = transform_checkpoint_dict_key(k)
-        if nk is not None and "model_sampling.sigmas" not in nk:
-            out[nk] = v
-    return out
-
-def load_model(path: str, device, cache_data = None, verify_hash: bool = True):
-    if path.endswith(".safetensors"):
-        weights  = safetensors.torch.load_file(path, device=device)
-        metadata = read_metadata_from_safetensors(path)
-    else:
-        weights  = torch.load(path, map_location=device)
-        metadata = {}
-
-    s256 = hashed = None
-    if verify_hash:
-        title = f"checkpoint/{Path(path).stem}"
-        s256, hashed, cache_data = sha256_from_cache(path, title, cache_data)
-        if not (s256 or hashed):
-            sha256(path, title, cache_data)
-            s256, hashed, cache_data = sha256_from_cache(path, title, cache_data)
-
-    weights = get_state_dict_from_checkpoint(weights)
-    if not verify_hash:
-        metadata = None
-    return weights, s256, hashed, metadata, cache_data
 
 def qdtyper(sd):
     if any("fp4" in k for k in sd): return "fp4"
@@ -831,8 +796,8 @@ def detect_arch(theta):
                 return k
 
             # AIO text encoder -> canonical text_encoders.*
-            if k.startswith("cond_stage_model.qwen3_06b."):
-                return "text_encoders.qwen3_06b." + k[len("cond_stage_model.qwen3_06b."):]
+            if k.startswith("text_encoders.qwen3_06b."):
+                return "cond_stage_model.qwen3_06b." + k[len("text_encoders.qwen3_06b."):]
 
             # already canonical diffusion
             if k.startswith("model.diffusion_model."):
@@ -858,7 +823,7 @@ def detect_arch(theta):
                 return "model." + k2
 
             # split-file style text encoders already ok
-            if k2.startswith(("text_encoders.", "qwen3_")):
+            if k2.startswith(("cond_stage_model.", "qwen3_")):
                 return k2
 
             return k
@@ -940,7 +905,6 @@ def _digits_concat(s: str) -> str:
 
 @lru_cache(maxsize=250_000)
 def _blockfromkey_cached_flags(key: str, xl: bool, flux: bool, zi: bool, am: bool) -> Tuple[str, str]:
-    # “arch dict” を中で復元（あなたの既存コードを壊さないため）
     arch = {"XL": bool(xl), "FLUX": bool(flux), "ZI": bool(zi), "AM": bool(am)}
 
     # -------------------------
@@ -1120,30 +1084,6 @@ def blockfromkey(key: str, arch: dict) -> Tuple[str, str]:
     am   = bool(arch.get("AM", False))
     return _blockfromkey_cached_flags(key, xl, flux, zi, am)
 
-def elementals(key: str, weight_index: int, deep: list[str], current_alpha: float, blockids=BLOCKID) -> float:
-    skey = key + blockids[weight_index]
-
-    def _neg(tokens: list[str]):
-        return (True, tokens[1:]) if tokens and tokens[0] == "NOT" else (False, tokens)
-
-    for d in deep:
-        if d.count(":") != 2:
-            continue
-        dbs_s, dws_s, dr_s = d.split(":", 2)
-
-        dbs = blocker(dbs_s, blockids).split()
-        dws = dws_s.split()
-        dbn, dbs = _neg(dbs)
-        dwn, dws = _neg(dws)
-
-        ok = (any(db in skey for db in dbs) ^ dbn)
-        if ok:
-            ok = (any(dw in skey for dw in dws) ^ dwn)
-        if ok:
-            current_alpha = float(dr_s)
-
-    return current_alpha
-
 EXTRA_ELEM_TAGS = ("LABEL", "TIME", "OUT", "CLIP", "CLIP-L", "CLIP-G", "T5")
 
 def extra_tag_for_key(key: str, *, arch: dict) -> str | None:
@@ -1258,13 +1198,6 @@ def diff_inplace(dst, src, func, desc):
             dst[k] = func(dst[k], v2)
 
 
-def np_trim_percentiles(arr, lo=1, hi=99):
-    arr = arr[~np.isnan(arr)]
-    if arr.size == 0:
-        return arr
-    lo_v, hi_v = np.percentile(arr, lo, method='midpoint'), np.percentile(arr, hi, method='midpoint')
-    return arr[(arr >= lo_v) & (arr <= hi_v)]
-
 def _normalize_components_list(alpha_text: str):
     # "UNet, CLIP-L, VAE" -> {'unet','clip-l','vae'}
     if not alpha_text:
@@ -1297,8 +1230,6 @@ def _normalize_components_list(alpha_text: str):
         return {"unet", "vae", "clip-l", "clip-g", "clip", "transformer", "text", "text2"}
 
     return set(mapped)
-
-_SPLIT = re.compile(r"[,\n]+")
 
 def _parse_components_with_only(alpha_text: str):
     if not alpha_text:
@@ -1752,11 +1683,13 @@ def _clip_tier_for_zi(key: str) -> str:
         return "cap_embedder"
     return "other"
 
-def _norm_stats(t: torch.Tensor):
-    v = t.detach().float().view(-1)
+def _norm_stats(t: torch.Tensor, eps: float = 1e-6):
+    v = t.detach().float().reshape(-1)
     if v.numel() == 0:
-        return t.new_tensor(0.0), t.new_tensor(1.0)
-    return v.mean(), v.std().clamp_min(1e-6)
+        return v.new_tensor(0.0), v.new_tensor(1.0)
+
+    std, mean = torch.std_mean(v, correction=0)  # PyTorch 2.x
+    return mean, std.clamp_min(eps)
 
 def _apply_stat_alignment(out: torch.Tensor, ref: torch.Tensor, strength: float = 0.5):
     m_ref, s_ref = _norm_stats(ref)
@@ -1822,9 +1755,6 @@ def _clipxor_semi_hard_blend(
 
     return out
 
-import torch
-import torch.nn.functional as F
-
 def _hp_kernel_inplace(w: torch.Tensor, strength: float) -> torch.Tensor:
     if w.ndim != 4:
         return w
@@ -1839,11 +1769,51 @@ def _hp_kernel_inplace(w: torch.Tensor, strength: float) -> torch.Tensor:
     x3 = x2 + (strength * hp)
     return x3.reshape_as(x).to(dtype=w.dtype)
 
+
+def _detail_kernel_inplace(w: torch.Tensor, strength: float) -> torch.Tensor:
+    if w.ndim != 4:
+        return w
+    kh, kw = w.shape[-2], w.shape[-1]
+    if kh < 3 or kw < 3:
+        return w
+
+    x = w.float()
+    C = x.shape[0] * x.shape[1]
+    x2 = x.reshape(1, C, kh, kw)
+    blur = F.avg_pool2d(x2, kernel_size=3, stride=1, padding=1)
+    hp = x2 - blur
+
+    if strength >= 0:
+        y = x2 + strength * hp
+    else:
+        amt = min(abs(float(strength)), 1.0) * 0.22
+        y = torch.lerp(x2, blur, amt)
+
+    return y.reshape_as(x).to(dtype=w.dtype)
+
 def _is_conv_weight(key: str, tens: torch.Tensor) -> bool:
     return tens.ndim == 4 and (key.endswith(".weight") or ".weight" in key)
 
 def _is_bias(key: str, tens: torch.Tensor) -> bool:
     return tens.ndim == 1 and (key.endswith(".bias") or ".bias" in key)
+
+def _is_weight_like(key: str, tens: torch.Tensor) -> bool:
+    return tens.ndim >= 2 and (key.endswith(".weight") or ".weight" in key)
+
+def _is_norm_key(key: str) -> bool:
+    kl = key.lower()
+    if not (key.endswith(".weight") or key.endswith(".bias") or ".weight" in key or ".bias" in key):
+        return False
+    return ("norm" in kl) or (".ln" in kl) or (".bn" in kl)
+
+def _is_attn1_vout(key: str) -> bool:
+    kl = key.lower()
+    return (
+        "attn1.to_v" in kl or
+        "attn1.to_out" in kl or
+        "self_attn.v_proj" in kl or
+        "self_attn.out_proj" in kl
+    )
 
 def _is_resnetish(key: str) -> bool:
     return ("resnets" in key) or ("in_layers" in key) or ("out_layers" in key) or (".conv1." in key) or (".conv2." in key)
@@ -1860,8 +1830,134 @@ def _is_vae_rgb(key: str) -> bool:
 def _finetune_inplace(key, tens, fine, arch: dict):
     if fine == "" or fine is None:
         return tens
+    
+    if isinstance(fine, (list, tuple)) and len(fine) >= 8:
+        fine = {
+            "mode": "image_tone_v2",
+            "noise1": float(fine[0]),
+            "noise2": float(fine[1]),
+            "noise3": float(fine[2]),
+            "contrast": float(fine[3]),
+            "brightness": float(fine[4]),
+            "r": float(fine[5]),
+            "g": float(fine[6]),
+            "b": float(fine[7]),
+        }
 
     if isinstance(fine, dict):
+        if fine.get("mode") == "image_tone_v2":
+            dn1 = float(fine.get("noise1", 0.0))
+            dn2 = float(fine.get("noise2", 0.0))
+            dn3 = float(fine.get("noise3", 0.0))
+            ct  = float(fine.get("contrast", 0.0))
+            br  = float(fine.get("brightness", 0.0))
+            rr  = float(fine.get("r", 0.0))
+            gg  = float(fine.get("g", 0.0))
+            bb  = float(fine.get("b", 0.0))
+
+            # detail / clarity band controls
+            dn1_k = dn1 * 0.06
+            dn2_k = dn2 * 0.05
+            dn3_k = dn3 * 0.04
+
+            # signed tone controls
+            soft = max(-ct, 0.0)   # contrast down / black lift up
+            hard = max(ct, 0.0)    # contrast up / black deepen
+
+            ct_scale_out   = 1.0 - soft * 0.018 + hard * 0.03
+            ct_scale_out08 = 1.0 - soft * 0.015 + hard * 0.025
+            bright_add     = br * 0.008
+            black_lift     = soft * (4.0 / 255.0) - hard * (3.0 / 255.0)
+            gamma_soft     = 1.0 + soft * 0.018 - hard * 0.02
+
+            r_k = 1.0 + rr * 0.05
+            g_k = 1.0 + gg * 0.05
+            b_k = 1.0 + bb * 0.05
+
+            left, right = blockfromkey(key, arch)
+            blk = right
+
+            # --- VAE RGB / small brightness carry ---
+            if _is_vae_rgb(key):
+                if _is_conv_weight(key, tens) and tens.shape[0] >= 3:
+                    w = tens.float()
+                    w[0] *= r_k
+                    w[1] *= g_k
+                    w[2] *= b_k
+                    # w *= (1.0 + ct * 0.01)
+                    return w.to(dtype=tens.dtype)
+
+                if _is_bias(key, tens) and tens.shape[0] >= 3:
+                    b = tens.float()
+                    base_add = bright_add + black_lift
+                    b[0] = b[0] * r_k + base_add
+                    b[1] = b[1] * g_k + base_add
+                    b[2] = b[2] * b_k + base_add
+                    return b.to(dtype=tens.dtype)
+
+                return tens
+
+            # --- UNet final out: primary global contrast / black point ---
+            if _is_unet_out(key):
+                if _is_weight_like(key, tens):
+                    scale = ct_scale_out * gamma_soft
+                    return (tens.float() * scale).to(dtype=tens.dtype)
+                if _is_bias(key, tens):
+                    # add = bright_add + black_lift + shadow_lift * 0.5
+                    # return (tens.float() + add).to(dtype=tens.dtype)
+                    return tens
+
+            # --- tone shaping on norm blocks ---
+            if _is_norm_key(key) and blk in ("IN00", "OUT00", "OUT01", "OUT02", "OUT08"):
+                if key.endswith(".weight") or ".weight" in key:
+                    scale = 1.0 - soft * 0.015 + hard * 0.02
+                    if blk == "OUT08":
+                        scale += (-soft * 0.01 + hard * 0.01)
+                    return (tens.float() * scale).to(dtype=tens.dtype)
+
+                if key.endswith(".bias") or ".bias" in key:
+                    # add = bright_add * 0.35
+                    # add += shadow_lift * (0.35 if blk in ("OUT00", "OUT01", "OUT02") else 0.2)
+                    # if blk == "OUT08":
+                    #     add += black_lift * 0.5
+                    # elif blk == "IN00":
+                    #     add += black_lift * 0.2
+                    # return (tens.float() + add).to(dtype=tens.dtype)
+                    return tens
+
+            # --- OUT08 proj/ff: gamma / black rolloff ---
+            if blk == "OUT08" and _is_proj_ff(key) and _is_weight_like(key, tens):
+                scale = ct_scale_out08
+                return (tens.float() * scale).to(dtype=tens.dtype)
+
+            # --- OUT07/OUT08 attn1 v/out: lighting / perceived contrast ---
+            if blk == "OUT07" and hard > 0 and _is_attn1_vout(key) and _is_weight_like(key, tens):
+                scale = 1.0 + hard * 0.01
+                return (tens.float() * scale).to(dtype=tens.dtype)
+
+            # --- detail / local contrast / clarity ---
+            if not _is_conv_weight(key, tens):
+                return tens
+
+            if not _is_resnetish(key):
+                return tens
+
+            strength = 0.0
+            # NOISE1: OUT07-OUT08
+            if blk == "OUT08":
+                strength = dn1_k
+            # NOISE2: OUT05-OUT07
+            elif blk in ("OUT05", "OUT06"):
+                strength = dn2_k
+            # NOISE3: OUT03-OUT05 + IN00
+            elif blk in ("OUT03", "OUT04", "IN00"):
+                strength = dn3_k
+
+            if strength != 0.0:
+                return _detail_kernel_inplace(tens, strength)
+
+            return tens
+
         mul = fine.get("mul", {}) or {}
         m = 1.0
 
@@ -2105,17 +2201,6 @@ def apply_permutation(ps: PermutationSpec, perm: dict, params: dict) -> dict:
     return {k: get_permuted_param(ps, perm, k, params) for k in params}
 
 
-def update_model_a(ps: PermutationSpec, perm: dict, model_a: dict, new_alpha: float):
-    for k in list(model_a.keys()):
-        if k not in ps.axes_to_perm:
-            continue
-        try:
-            perm_params = get_permuted_param(ps, perm, k, model_a)
-            model_a[k] = model_a[k] * (1.0 - new_alpha) + new_alpha * perm_params
-        except RuntimeError:
-            continue
-    return model_a
-
 def inner_matching(
     n: int,
     ps: PermutationSpec,
@@ -2272,45 +2357,6 @@ def _filter_state_dict_by_components(theta: dict, components: set[str], arch: di
     kept = {k: v for k, v in theta.items() if _key_belongs_to_component(k, prefixes)}
     return kept, len(kept), total
 
-def finalize_and_pack_for_save(theta, *, save_half, save_bhalf, save_quarter, vae_key, make_cpu=True, prefer_fp8="e4m3"):
-    want_fp8 = bool(save_quarter)
-    want_fp16 = bool(save_half) and not want_fp8
-    want_bf16 = bool(save_bhalf) and not want_fp8
-
-    if want_fp8:
-        if prefer_fp8 == "e5m2" and FP8_E5M2 is not None:
-            fp8 = FP8_E5M2
-        else:
-            fp8 = FP8_E4M3 or FP8_E5M2
-        if fp8 is None:
-            want_fp8 = False
-            want_fp16 = want_fp16 or save_half
-
-    out = {}
-    for k, v in theta.items():
-        if not isinstance(v, torch.Tensor):
-            continue
-        if k.startswith(vae_key):
-            out[k] = v
-            continue
-        t = v.detach()
-
-        if want_fp8 and ("model" in k or "text_encoders" in k) and t.is_floating_point():
-            if not (vae_key and k.startswith(vae_key)):
-                if t.dtype != fp8:
-                    t = t.to(fp8)
-        elif want_fp16 and t.dtype in DTYPES and t.dtype != torch.float16:
-            t = t.to(torch.float16)
-        elif want_bf16 and t.dtype in DTYPES and t.dtype != torch.bfloat16:
-            t = t.to(torch.bfloat16)
-
-        if make_cpu and t.device.type != "cpu":
-            t = t.to("cpu")
-        if not t.is_contiguous():
-            t = t.contiguous()
-
-        out[k] = t
-    return out
 
 def _turbo_force_copy_key(k: str) -> bool:
     kl = k.lower()
@@ -2501,3 +2547,70 @@ def apply_vae_saturation_inplace(sd: dict, vae_key: str, sat: float):
 
     print(f"[vae_sat] applied sat={sat} to VAE conv_out: weights={nW}, bias={nB}")
     return sd
+
+def _model_path(root: str, name: str | None) -> str | None:
+    return None if name is None else normalize_path(os.path.join(root, name))
+
+
+def _model_stem(path: str) -> str:
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _load_umodel(path: str, *, name: str | None = None, device: str = "cpu", model_type: str = "checkpoint", verify_hash: bool = True, cache_path: str | None = None) -> UnifiedModel:
+    from model import UnifiedModel
+    return UnifiedModel.from_file(path, name=name, device=device, model_type=model_type, verify_hash=verify_hash, cache_path=cache_path)
+
+
+def _clone_info(src: UnifiedModel | None, *, name: str | None = None, path: str | None = None) -> ModelInfo:
+    from model import ModelInfo
+    info = src.info.clone() if src is not None else ModelInfo(model_type="checkpoint")
+    if name is not None:
+        info.name = name
+    if path is not None:
+        info.path = path
+    return info
+
+
+def _build_output_path(args) -> tuple[str, str, str]:
+    fmt = "safetensors" if args.save_safetensors else "ckpt"
+    output_name = args.output
+    output_file = f"{output_name}.{fmt}"
+    output_path = normalize_path(os.path.join(args.model_path, output_file))
+
+    if os.path.isfile(output_path):
+        if args.force:
+            print(f"[force] Overwriting existing file: {output_path}")
+            try:
+                os.remove(output_path)
+            except Exception as e:
+                print(f"[force] Failed to remove existing file: {e}")
+        else:
+            i = 0
+            while os.path.isfile(output_path):
+                output_name = f"{args.output}_{i:02}"
+                output_file = f"{output_name}.{fmt}"
+                output_path = normalize_path(os.path.join(args.model_path, output_file))
+                i += 1
+            print(f"Assigned result checkpoint name as {output_file}\n")
+
+    return output_name, output_file, output_path
+
+
+def _save_umodel(model: UnifiedModel, path: str, *, args, metadata: dict | None = None) -> None:
+    if metadata:
+        model.info.metadata.update(metadata)
+    model.save(
+        path,
+        no_metadata=bool(args.no_metadata),
+        save_half=bool(args.save_half),
+        save_quarter=bool(args.save_quarter),
+        save_bhalf=bool(args.save_bhalf),
+        prune=bool(args.prune),
+        args=args,
+    )
+
+
+def _register_merge_parents(dst: UnifiedModel, *parents: UnifiedModel | None) -> None:
+    for i, p in enumerate(parents):
+        if p is not None:
+            dst.register_parent(p, role=f"model_{i}")
