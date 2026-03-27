@@ -9,7 +9,7 @@ import safetensors
 from tqdm.auto import tqdm
 import math
 
-from .Utils import (
+from Utils import (
     LBLOCKS26,
     LBLOCKS_FLUX,
     LBLOCKS_ZI,
@@ -28,7 +28,7 @@ from .Utils import (
     _load_umodel,
 )
 
-from .model import UnifiedModel, ModelInfo
+from model import UnifiedModel, ModelInfo
 
 _re_digits = re.compile(r"\d+")
 _re_cache  = {}

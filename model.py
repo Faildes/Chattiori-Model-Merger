@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
 # -----------------------------------------------------------------------------
 
 try:
-    from .Utils import (
+    from Utils import (
         detect_arch as _detect_arch_impl,
         normalize_path as _normalize_path_impl,
         prepare_state_dict_for_save as _prepare_state_dict_for_save_impl,
