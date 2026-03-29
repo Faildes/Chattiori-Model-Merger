@@ -26,7 +26,7 @@ from Utils import (
 
 from model import UnifiedModel
 
-from merge_modes import theta_funcs, modes_need_m2, modes_need_beta
+from merge_modes import theta_funcs, modes_need_m2, modes_need_beta, dare_merge, _match_mean_std_like_a, weighted_sum, get_difference
 
 # Mode Functions
 
@@ -675,6 +675,7 @@ def main():
                     return None
 
             cur_a = alpha
+            print(weights_a, wi)
             if weights_a is not None and wi > 0:
                 cur_a = weights_a[wi - 1]
             if deep_a:
@@ -1129,7 +1130,7 @@ def main():
                 model0.theta = remerge_model(model0.theta, model1.theta, "Remerging...", mode, resolver)
         del model1.theta
         try:
-            if model2:
+            if mode != "AD" and model2:
                 model0.theta = remerge_model(model0.theta, model2.theta, desc="Remerging...", mode=mode, resolver=resolver)
                 del model2.theta
         except NameError:

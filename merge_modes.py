@@ -362,4 +362,4 @@ theta_funcs = {
     "TF":  (None,            None,                       "Trim and Fill"),
 }
 modes_need_m2   = {"sAD", "AD", "TRS", "ST",  "TD", "SIM", "MD", "HUB"}
-modes_need_beta = {"TRS", "ST", "TS",  "SIM", "MD", "DARE", "CHAN", "FREQ", "SPRSE"}
+modes_need_beta = {"TRS", "ST", "TS",  "SIM", "MD", "DARE", "XDARE", "CHAN", "FREQ", "SPRSE"}
