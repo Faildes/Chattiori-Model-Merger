@@ -1124,13 +1124,13 @@ def main():
                 model0.theta[key] = _finetune_inplace(key, out, fine, arch=arch) if do_fine else out
 
         if mode != "DARE":
-            if mode != "AD" and model2:
+            if mode not in ["AD","sAD"] and model2:
                 model0.theta = remerge_model(model0.theta, model1.theta, "Remerging...", mode, resolver, theta=model2.theta)
             else:
                 model0.theta = remerge_model(model0.theta, model1.theta, "Remerging...", mode, resolver)
         del model1.theta
         try:
-            if mode != "AD" and model2:
+            if mode not in ["AD","sAD"] and model2:
                 model0.theta = remerge_model(model0.theta, model2.theta, desc="Remerging...", mode=mode, resolver=resolver)
                 del model2.theta
         except NameError:
