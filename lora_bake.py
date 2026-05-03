@@ -984,12 +984,28 @@ def build_apply_plan(main_keys, *, arch: dict, mlv2: bool, keymap: dict, theta_0
     return plan
 
 def _split_top_level(s: str, sep: str = ",") -> list[str]:
-    # split by sep, but ignore seps inside (), [], {}
+    # split by sep, but ignore seps inside (), [], {}, and quotes
     opens = {"(": ")", "[": "]", "{": "}"}
     stack = []
     out = []
     buf = []
+    quote = None
+    escape = False
     for ch in s:
+        if quote is not None:
+            buf.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = None
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            continue
         if ch in opens:
             stack.append(opens[ch])
         elif stack and ch == stack[-1]:
@@ -1006,15 +1022,142 @@ def _split_top_level(s: str, sep: str = ",") -> list[str]:
         out.append(part)
     return out
 
-def get_loralist(arg: str):
-    parts = _split_top_level(arg, ",")
+_WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_UNC_PATH_RE = re.compile(r"^(?:\\\\|//)[^\\/]+[\\/][^\\/]+")
+_LORA_FILE_EXTS = (
+    ".safetensors",
+    ".ckpt",
+    ".pt",
+    ".pth",
+    ".bin",
+)
+
+def _strip_outer_quotes(s: str) -> str:
+    s = str(s or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1].strip()
+    return s
+
+def _is_windows_drive_colon(s: str, i: int) -> bool:
+    return (
+        i == 1
+        and len(s) >= 3
+        and s[0].isalpha()
+        and s[1] == ":"
+        and s[2] in ("/", "\\")
+    )
+
+def _is_absish_path(path: str) -> bool:
+    p = _strip_outer_quotes(path)
+    return bool(os.path.isabs(p) or _WINDOWS_DRIVE_PATH_RE.match(p) or _UNC_PATH_RE.match(p))
+
+def _has_lora_file_ext(path: str) -> bool:
+    return _strip_outer_quotes(path).lower().endswith(_LORA_FILE_EXTS)
+
+def _resolve_lora_path(path: str, model_path: str) -> str:
+    """
+    Resolve LoRA path while preserving absolute Windows paths such as X:/... and X:\\...
+    even when this script is executed from a non-Windows-compatible pathlib/os.path context.
+    """
+    p = _strip_outer_quotes(path)
+    if _is_absish_path(p):
+        return normalize_path(p)
+    return normalize_path(os.path.join(model_path, p))
+
+def _top_level_colon_positions(s: str) -> list[int]:
+    opens = {"(": ")", "[": "]", "{": "}"}
+    stack = []
+    positions = []
+    quote = None
+    escape = False
+    for i, ch in enumerate(s):
+        if quote is not None:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = None
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch in opens:
+            stack.append(opens[ch])
+            continue
+        if stack and ch == stack[-1]:
+            stack.pop()
+            continue
+        if ch == ":" and not stack:
+            if _is_windows_drive_colon(s, i):
+                continue
+            positions.append(i)
+    return positions
+
+def _candidate_lora_path_exists(path: str, model_path: str | None) -> bool:
+    p = _strip_outer_quotes(path)
+    candidates = []
+    if _is_absish_path(p):
+        candidates.append(normalize_path(p))
+    elif model_path:
+        candidates.append(normalize_path(os.path.join(model_path, p)))
+    else:
+        candidates.append(normalize_path(p))
+
+    expanded = []
+    for c in candidates:
+        expanded.append(c)
+        if not os.path.splitext(c)[1]:
+            expanded.extend(c + ext for ext in _LORA_FILE_EXTS)
+    return any(os.path.exists(c) for c in expanded)
+
+def _split_lora_spec(item: str, *, model_path: str | None = None) -> tuple[str, str]:
+    """
+    Split one LoRA spec into (path, ratio) without confusing:
+      - Windows drive prefixes: X:/foo/bar.safetensors
+      - Elemental/deep ratio expressions that contain ':'
+
+    Preferred delimiter is the first top-level ':' immediately after a known LoRA
+    file extension, e.g. X:/a/b.safetensors:[IN04:attn:0.5].
+    If no extension boundary is present, fall back to an existing resolved path,
+    then finally to the first non-drive top-level colon for legacy name:ratio.
+    """
+    s = _strip_outer_quotes(item)
+    if not s:
+        return "", "1.0"
+
+    positions = _top_level_colon_positions(s)
+    if not positions:
+        return s.strip(), "1.0"
+
+    # Strongest signal: path with a LoRA/checkpoint extension before delimiter.
+    for pos in positions:
+        left = s[:pos].strip()
+        right = s[pos + 1:].strip()
+        if left and right and _has_lora_file_ext(left):
+            return _strip_outer_quotes(left), right
+
+    # Next: choose the delimiter where left resolves to an existing file.
+    for pos in positions:
+        left = s[:pos].strip()
+        right = s[pos + 1:].strip()
+        if left and right and _candidate_lora_path_exists(left, model_path):
+            return _strip_outer_quotes(left), right
+
+    # Legacy fallback: name:ratio.  This intentionally keeps additional ':' in ratio.
+    pos = positions[0]
+    left = s[:pos].strip()
+    right = s[pos + 1:].strip()
+    return _strip_outer_quotes(left), (right or "1.0")
+
+def get_loralist(arg: str, model_path: str | None = None):
+    parts = _split_top_level(str(arg or ""), ",")
     out = []
     for x in parts:
-        if ":" in x:
-            p, r = x.split(":", 1)
-            out.append([p.strip(), r.strip()])
-        else:
-            out.append([x.strip(), "1.0"])
+        p, r = _split_lora_spec(x, model_path=model_path)
+        if p:
+            out.append([p.strip(), (r or "1.0").strip()])
     return out
 
 def _is_float(s: str) -> bool:
@@ -1557,7 +1700,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
         print("Budget pass-1: collecting per-target update sums...")
 
         for lora_model, ratio_str in lora_list:
-            lora_path = normalize_path(os.path.join(model_path, lora_model))
+            lora_path = _resolve_lora_path(lora_model, model_path)
             lora_model_obj, meta, lisv2 = _load_lora(lora_path, device=device, cache_path=cache_path)
 
             g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
@@ -1639,7 +1782,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
         g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
         lr_strs.append(ratio_str)
 
-        lora_path = normalize_path(os.path.join(model_path, lora_model))
+        lora_path = _resolve_lora_path(lora_model, model_path)
         lora_model_obj, meta, lisv2 = _load_lora(lora_path, device=device, cache_path=cache_path)
         lora_meta[lora_model_obj.sha256] = meta
 
@@ -1904,7 +2047,7 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
         g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
         lr_strs.append(ratio_str)
 
-        lora_path = normalize_path(os.path.join(model_path, lora_model))
+        lora_path = _resolve_lora_path(lora_model, model_path)
         lora_model_obj, meta, lisv2 = _load_lora(lora_path, device=device, cache_path=cache_path)
         lora_meta[lora_model_obj.sha256] = meta
 
@@ -2332,7 +2475,7 @@ def merge_loras_only(
         k_soft = max(int(merge_rank), 1) * max(int(intermediate_mult), 1)
 
     for lora_model, ratio_str in lora_list:
-        lpath = normalize_path(os.path.join(model_path, lora_model))
+        lpath = _resolve_lora_path(lora_model, model_path)
         print(f"loading lora: {lora_model}")
 
         lora_obj, meta, lisv2 = _load_lora(lpath, device=device, cache_path=cache_path)
@@ -2582,7 +2725,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.model_path = normalize_path(args.model_path)
 
-    ll  = get_loralist(args.loras)
+    ll  = get_loralist(args.loras, model_path=args.model_path)
     out = normalize_path(os.path.join(args.model_path, f"{args.output}.{'safetensors' if args.save_safetensors else 'ckpt'}"))
     
     # --- LoRA merge only mode (no checkpoint bake) ---
@@ -2608,7 +2751,7 @@ if __name__ == "__main__":
             raise ValueError("checkpoint is None")
         
     if args.dare:
-        mainlora = normalize_path(os.path.join(args.model_path, ll[0][0]))
+        mainlora = _resolve_lora_path(ll[0][0], args.model_path)
         darelora(mainlora, ll, args.checkpoint, out, args.model_path, args.device)
     else:
         pluslora(ll, args.checkpoint, out, args.model_path, args.device)
