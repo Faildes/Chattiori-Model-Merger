@@ -72,6 +72,8 @@ def main():
     parser.add_argument("--vae",    type=str,   help="Path of VAE", default=None, required=False)
     parser.add_argument("--memo",   type=str,   help="Additional info bake in metadata", default=None)
     parser.add_argument("--fine",   type=str,   help="Finetune the given keys on model 0", default=None, required=False)
+    parser.add_argument("--fine_sat", type=float, default=1.0,
+        help="Direct saturation factor for finetune/tone pass. 1.0=off, 0.75=desaturate 25%%. Works with Anima/AM; also used for VAE conv_out when --vae_sat is 1.0.")
     parser.add_argument("--output",             help="Output file name without extension", default="merged", required=False)
     parser.add_argument("--device", type=str,   help="Device to use, defaults to cpu", default="cpu", required=False)
     parser.add_argument("--cfg_sens", type=float, default=1.0,
@@ -102,9 +104,35 @@ def main():
         help="Clamp boosted strengths for unstable modes. auto clamps for WS/TRS/ST/TS/DARE/CHAN/FREQ/SPRSE/MD/SIM etc.")
 
     parser.add_argument("--vae_sat", type=float, default=1.0,
-        help="Apply RGB saturation scaling inside VAE output (decoder.conv_out). 1.0=off. >1 more saturation, <1 less.")
+        help="Apply RGB saturation scaling inside VAE output (decoder.conv_out). 1.0=off. >1 more saturation, <1 less. Does not require --vae if checkpoint already contains VAE.")
 
     args = parser.parse_args()
+
+    def _fine_sat_active() -> bool:
+        return abs(float(getattr(args, "fine_sat", 1.0)) - 1.0) >= 1e-6
+
+    def _with_fine_sat(fine_obj):
+        """Attach direct saturation factor to image_tone_v2 fine dict."""
+        if not _fine_sat_active():
+            return fine_obj
+        sat = float(args.fine_sat)
+        if isinstance(fine_obj, dict):
+            out = dict(fine_obj)
+        else:
+            out = {
+                "mode": "image_tone_v2",
+                "noise1": 0.0,
+                "noise2": 0.0,
+                "noise3": 0.0,
+                "contrast": 0.0,
+                "brightness": 0.0,
+                "r": 0.0,
+                "g": 0.0,
+                "b": 0.0,
+            }
+        out["saturation"] = sat
+        return out
+
     if args.mode not in {"NoIn", "RM", "SWAP", "CLIPXOR", "COMP"} and args.model_1 is None:
         raise SystemExit(f"mode '{args.mode}' needs model_1")
 
@@ -188,8 +216,8 @@ def main():
         model1 = _load_umodel(model_1_path, name=model_1_name, device=device, verify_hash=True, cache_path=cache_path)
         if mode == "SWAP":
             model1.theta = normalize_external_text_encoder(model1.theta, arch)
-        if args.fine and not arch.get("ZI", False):
-            fine = fineman([float(t) for t in args.fine.split(",")], arch)
+        if (args.fine or _fine_sat_active()) and not arch.get("ZI", False):
+            fine = _with_fine_sat(fineman([float(t) for t in args.fine.split(",")], arch) if args.fine else "")
         else:
             fine = ""
             
@@ -1124,13 +1152,13 @@ def main():
                 model0.theta[key] = _finetune_inplace(key, out, fine, arch=arch) if do_fine else out
 
         if mode != "DARE":
-            if mode not in ["AD","sAD"] and model2:
+            if mode != "AD" and model2:
                 model0.theta = remerge_model(model0.theta, model1.theta, "Remerging...", mode, resolver, theta=model2.theta)
             else:
                 model0.theta = remerge_model(model0.theta, model1.theta, "Remerging...", mode, resolver)
         del model1.theta
         try:
-            if mode not in ["AD","sAD"] and model2:
+            if mode != "AD" and model2:
                 model0.theta = remerge_model(model0.theta, model2.theta, desc="Remerging...", mode=mode, resolver=resolver)
                 del model2.theta
         except NameError:
@@ -1143,9 +1171,11 @@ def main():
             model0.theta = remerge_model(model0.theta, model1.theta, desc="Remerging...", mode=mode, resolver=resolver, theta=model2.theta)
         arch, model0.theta = detect_arch(model0.theta)
         vae_key = "first_stage_model" if not (arch.get("FLUX", False) or arch.get("ZI", False)) else "vae"
-        if (not cosine_applied) and args.fine and not arch.get("ZI", False):
-            fine = fineman([float(t) for t in args.fine.split(",")], arch=arch)
+        if (not cosine_applied) and (args.fine or _fine_sat_active()) and not arch.get("ZI", False):
+            fine = _with_fine_sat(fineman([float(t) for t in args.fine.split(",")], arch=arch) if args.fine else "")
             for key in tqdm(model0.theta.keys(), desc="Fine Tuning ..."):
+                # VAE saturation is handled after optional VAE bake so it also works
+                # for embedded Anima/AM VAEs without requiring --vae.
                 if args.vae is None and vae_key in key:
                     continue
                 model0.theta[key] = _finetune_inplace(key, model0.theta[key], fine, arch=arch)
@@ -1163,9 +1193,15 @@ def main():
             tk = vae_key + "." + _strip_vae_root(k)
             model0.theta[tk] = to_half(vae_model.theta[k], args.save_half)
         del vae_model.theta
-        
-        if float(args.vae_sat) != 1.0:
-            model0.theta = apply_vae_saturation_inplace(model0.theta, vae_key=vae_key, sat=float(args.vae_sat))
+
+    # Apply VAE saturation to the current checkpoint as well, not only when
+    # an external --vae is baked. This is the safest direct saturation control
+    # for Anima/AM because it mixes the RGB output channels in decoder.conv_out.
+    _vae_sat_value = float(args.vae_sat)
+    if abs(_vae_sat_value - 1.0) < 1e-6 and _fine_sat_active():
+        _vae_sat_value = float(args.fine_sat)
+    if abs(_vae_sat_value - 1.0) >= 1e-6:
+        model0.theta = apply_vae_saturation_inplace(model0.theta, vae_key=vae_key, sat=_vae_sat_value)
 
     arch, model0.theta = detect_arch(model0.theta)
 
@@ -1194,6 +1230,10 @@ def main():
     ]
     if args.fine:
         calcs.append(f"fine[{fine}]")
+    if _fine_sat_active():
+        calcs.append(f"fine_sat[{args.fine_sat}]")
+    if float(args.vae_sat) != 1.0:
+        calcs.append(f"vae_sat[{args.vae_sat}]")
     calcl = ",".join(calcs) or None
 
     fp = "fp8" if args.save_quarter else ("fp16" if args.save_half else ("bf16" if args.save_bhalf else "fp32"))

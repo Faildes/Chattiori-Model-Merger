@@ -443,6 +443,24 @@ def resolve_sdxl_textenc_direct_target_any(down_k: str, keymap: dict):
     return None, None
 
 _AM_UNET_BASE_RE = re.compile(r"^lora_unet_blocks_(\d+)_(.+)$")
+_AM_UNET_DOT_BASE_RE = re.compile(
+    r"^(?:(?:model\.)?diffusion_model\.|net\.)?blocks\.(\d+)\.(.+)$"
+)
+_AM_FINAL_LAYER_DOT_BASE_RE = re.compile(
+    r"^(?:(?:model\.)?diffusion_model\.|net\.)?final_layer\.(.+)$"
+)
+_AM_LLM_ADAPTER_DOT_BASE_RE = re.compile(
+    r"^(?:(?:model\.)?diffusion_model\.|net\.)?llm_adapter\.blocks\.(\d+)\.(.+)$"
+)
+_AM_LLM_ADAPTER_ROOT_DOT_BASE_RE = re.compile(
+    r"^(?:(?:model\.)?diffusion_model\.|net\.)?llm_adapter\.(?!blocks\.)(.+)$"
+)
+_AM_T_EMBEDDER_DOT_BASE_RE = re.compile(
+    r"^(?:(?:model\.)?diffusion_model\.|net\.)?t_embedder\.(.+)$"
+)
+_AM_X_EMBEDDER_DOT_BASE_RE = re.compile(
+    r"^(?:(?:model\.)?diffusion_model\.|net\.)?x_embedder\.(.+)$"
+)
 _AM_TE_BASE_RE   = re.compile(r"^lora_te_layers_(\d+)_(.+)$")
 _AM_VAE_BASE_RE  = re.compile(r"^(?:lora_vae|lora_first_stage_model)_(.+)$")
 
@@ -470,12 +488,47 @@ def _am_merge_pairs(tokens: list[str]) -> list[str]:
 
 def _am_tail_to_path(tail: str) -> list[str]:
     """
-    tail eg.):
-      self_attn_q_proj            -> self_attn.q_proj
-      cross_attn_k_norm           -> cross_attn.k_norm
-      adaln_modulation_mlp_1      -> adaln_modulation_mlp.1
-      adaln_modulation_cross_attn_2 -> adaln_modulation_cross_attn.2
+    Convert Anima kohya-style LoRA tail names to likely checkpoint module paths.
+
+    Examples:
+      self_attn_q_proj              -> self_attn.q_proj
+      cross_attn_output_proj        -> cross_attn.output_proj / cross_attn.o_proj / cross_attn.out_proj
+      mlp_layer1                    -> mlp.layer1
+      lora_te_layers_*_mlp_gate_proj -> mlp.gate_proj
     """
+    tail = str(tail or "").strip().strip("_")
+    if not tail:
+        return []
+
+    # Explicit aliases for the exact Anima key families seen in CR.txt / GS.txt.
+    explicit: dict[str, list[str]] = {}
+    for attn in ("self_attn", "cross_attn"):
+        explicit[f"{attn}_q_proj"] = [f"{attn}.q_proj", f"{attn}.to_q"]
+        explicit[f"{attn}_k_proj"] = [f"{attn}.k_proj", f"{attn}.to_k"]
+        explicit[f"{attn}_v_proj"] = [f"{attn}.v_proj", f"{attn}.to_v"]
+        explicit[f"{attn}_o_proj"] = [
+            f"{attn}.o_proj", f"{attn}.output_proj", f"{attn}.out_proj", f"{attn}.to_out.0", f"{attn}.to_out"
+        ]
+        explicit[f"{attn}_out_proj"] = [
+            f"{attn}.out_proj", f"{attn}.o_proj", f"{attn}.output_proj", f"{attn}.to_out.0", f"{attn}.to_out"
+        ]
+        explicit[f"{attn}_output_proj"] = [
+            f"{attn}.output_proj", f"{attn}.o_proj", f"{attn}.out_proj", f"{attn}.to_out.0", f"{attn}.to_out"
+        ]
+
+    explicit.update({
+        "mlp_layer1": ["mlp.layer1", "mlp.fc1", "mlp.w1", "mlp.gate_proj"],
+        "mlp_layer2": ["mlp.layer2", "mlp.fc2", "mlp.w2", "mlp.down_proj"],
+        "mlp_gate_proj": ["mlp.gate_proj", "mlp.w1", "mlp.layer1"],
+        "mlp_up_proj":   ["mlp.up_proj", "mlp.w3", "mlp.layer1"],
+        "mlp_down_proj": ["mlp.down_proj", "mlp.w2", "mlp.layer2"],
+        "input_layernorm": ["input_layernorm"],
+        "post_attention_layernorm": ["post_attention_layernorm"],
+        "final_layernorm": ["final_layernorm"],
+    })
+
+    paths = list(explicit.get(tail, []))
+
     groups = [
         "adaln_modulation_cross_attn",
         "adaln_modulation_self_attn",
@@ -485,96 +538,261 @@ def _am_tail_to_path(tail: str) -> list[str]:
         "mlp",
     ]
     grp = None
+    rest = None
     for g in sorted(groups, key=len, reverse=True):
         if tail.startswith(g + "_"):
             grp = g
             rest = tail[len(g) + 1:]
             break
+
     if grp is None:
-        # fallback
-        return [tail.replace("_", ".")]
+        paths.append(tail.replace("_", "."))
+    elif rest and rest.isdigit():
+        paths.append(f"{grp}.{rest}")
+    elif rest:
+        toks = _am_merge_pairs(rest.split("_"))
+        sub = ".".join(toks)
+        paths.append(f"{grp}.{sub}")
 
-    # index-only (Sequential)
-    if rest.isdigit():
-        return [f"{grp}.{rest}"]
+        if sub.endswith("o_proj"):
+            base = sub[:-len("o_proj")]
+            paths.extend([f"{grp}.{base}output_proj", f"{grp}.{base}out_proj"])
+        if sub.endswith("output_proj"):
+            base = sub[:-len("output_proj")]
+            paths.extend([f"{grp}.{base}o_proj", f"{grp}.{base}out_proj"])
+        if sub.endswith("out_proj"):
+            base = sub[:-len("out_proj")]
+            paths.extend([f"{grp}.{base}o_proj", f"{grp}.{base}output_proj"])
 
-    toks = _am_merge_pairs(rest.split("_"))
-    sub = ".".join(toks)
-
-    paths = [f"{grp}.{sub}"]
-
-    if sub.endswith("o_proj"):
-        paths.append(f"{grp}.{sub[:-len('o_proj')] + 'output_proj'}")
-        paths.append(f"{grp}.{sub[:-len('o_proj')] + 'out_proj'}")
-    if sub.endswith("output_proj"):
-        paths.append(f"{grp}.{sub[:-len('output_proj')] + 'o_proj'}")
-        paths.append(f"{grp}.{sub[:-len('output_proj')] + 'out_proj'}")
-    if sub.endswith("out_proj"):
-        paths.append(f"{grp}.{sub[:-len('out_proj')] + 'o_proj'}")
-        paths.append(f"{grp}.{sub[:-len('out_proj')] + 'output_proj'}")
-
-    # Delete duplicates while preserving order
+    # Delete duplicates while preserving order.
     seen = set()
     out = []
     for p in paths:
-        if p not in seen:
+        if p and p not in seen:
             seen.add(p)
             out.append(p)
     return out
 
-def anima_resolve_target_any(down_k: str, theta_0: dict) -> str | None:
+
+def _am_existing_or_first(theta_0: dict, candidates: list[str]) -> str | None:
+    for cand in candidates:
+        if cand in theta_0:
+            return cand
+    return candidates[0] if candidates else None
+
+
+def _am_weight_candidates(prefixes: list[str], idx: int, paths: list[str]) -> list[str]:
+    out = []
+    for pref in prefixes:
+        for path in paths:
+            out.append(f"{pref}{idx}.{path}.weight")
+    return out
+
+
+def _am_prefixed_weight_candidates(prefixes: list[str], paths: list[str]) -> list[str]:
+    out = []
+    for pref in prefixes:
+        for path in paths:
+            out.append(f"{pref}{path}.weight")
+    return out
+
+
+def _am_expand_numeric_mlp_tail(tail: str) -> list[str]:
+    """Add common aliases for direct MLP numeric modules such as mlp.0 / mlp.2."""
+    tail = str(tail or "").strip().strip(".")
+    if tail == "mlp.0":
+        return ["mlp.0", "mlp.layer1", "mlp.fc1", "mlp.gate_proj"]
+    if tail == "mlp.2":
+        return ["mlp.2", "mlp.layer2", "mlp.fc2", "mlp.down_proj"]
+    if tail == "mlp.1":
+        return ["mlp.1", "mlp.up_proj"]
+    return [tail] if tail else []
+
+
+def _am_dot_tail_to_paths(tail: str) -> list[str]:
     """
-    AM LoRA down key -> checkpoint weight key
+    Convert direct dotted Anima LoRA tails to checkpoint module paths.
+
+    Examples from AB-style LoRAs:
+      cross_attn.k_proj                  -> cross_attn.k_proj
+      mlp.layer1                         -> mlp.layer1
+      adaln_modulation_self_attn.1       -> adaln_modulation_self_attn.1
     """
+    tail = str(tail or "").strip().strip(".")
+    if not tail:
+        return []
+
+    paths = _am_expand_numeric_mlp_tail(tail)
+
+    # Some Anima checkpoints/trainers differ only in output projection naming.
+    # Handle both nested tails (cross_attn.o_proj) and root tails (out_proj).
+    if tail in {"o_proj", "out_proj", "output_proj"}:
+        paths.extend(["o_proj", "out_proj", "output_proj"])
+    if tail.endswith(".o_proj"):
+        root = tail[:-len(".o_proj")]
+        paths.extend([root + ".output_proj", root + ".out_proj"])
+    if tail.endswith(".output_proj"):
+        root = tail[:-len(".output_proj")]
+        paths.extend([root + ".o_proj", root + ".out_proj"])
+    if tail.endswith(".out_proj"):
+        root = tail[:-len(".out_proj")]
+        paths.extend([root + ".o_proj", root + ".output_proj"])
+
+    # Direct files may include a shortened diffusion root in the LoRA key,
+    # but the actual checkpoint usually stores model.diffusion_model.*.
+    seen = set()
+    out = []
+    for p in paths:
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def anima_target_candidates_from_lora_down(down_k: str) -> list[str]:
+    """Return candidate checkpoint weight keys for an Anima LoRA down key."""
     base = _am_strip_lora_suffix(down_k)
     if base is None:
-        return None
+        return []
 
-    # --- UNet/DiT side ---
+    # --- DiT side: kohya-style Anima keys ---
+    #   lora_unet_blocks_0_cross_attn_k_proj.lora_A.weight
     m = _AM_UNET_BASE_RE.match(base)
     if m:
         bi = int(m.group(1))
         tail = m.group(2)
-        for path in _am_tail_to_path(tail):
-            cand = f"model.diffusion_model.blocks.{bi}.{path}.weight"
-            if cand in theta_0:
-                return cand
-        return f"model.diffusion_model.blocks.{bi}.{_am_tail_to_path(tail)[0]}.weight"
+        paths = _am_tail_to_path(tail)
+        return _am_weight_candidates([
+            "model.diffusion_model.blocks.",
+            "net.blocks.",
+            "blocks.",
+            "diffusion_model.blocks.",
+        ], bi, paths)
+
+    # --- DiT side: direct module-path Anima keys ---
+    #   diffusion_model.blocks.0.cross_attn.k_proj.lora_A.weight
+    #   model.diffusion_model.blocks.0.adaln_modulation_mlp.1.lora_down.weight
+    m = _AM_UNET_DOT_BASE_RE.match(base)
+    if m:
+        bi = int(m.group(1))
+        tail = m.group(2)
+        paths = _am_dot_tail_to_paths(tail)
+        return _am_weight_candidates([
+            "model.diffusion_model.blocks.",
+            "net.blocks.",
+            "blocks.",
+            "diffusion_model.blocks.",
+        ], bi, paths)
+
+    # --- DiT final layer: direct module-path Anima keys ---
+    #   diffusion_model.final_layer.linear.lora_down.weight
+    #   diffusion_model.final_layer.adaln_modulation.1.lora_down.weight
+    m = _AM_FINAL_LAYER_DOT_BASE_RE.match(base)
+    if m:
+        tail = m.group(1)
+        paths = _am_dot_tail_to_paths(tail)
+        return _am_prefixed_weight_candidates([
+            "model.diffusion_model.final_layer.",
+            "net.final_layer.",
+            "final_layer.",
+            "diffusion_model.final_layer.",
+        ], paths)
+
+    # --- LLM adapter blocks: direct module-path Anima keys ---
+    #   diffusion_model.llm_adapter.blocks.0.cross_attn.q_proj.lora_down.weight
+    #   diffusion_model.llm_adapter.blocks.0.mlp.0.lora_down.weight
+    m = _AM_LLM_ADAPTER_DOT_BASE_RE.match(base)
+    if m:
+        bi = int(m.group(1))
+        tail = m.group(2)
+        paths = _am_dot_tail_to_paths(tail)
+        return _am_weight_candidates([
+            "model.diffusion_model.llm_adapter.blocks.",
+            "net.llm_adapter.blocks.",
+            "llm_adapter.blocks.",
+            "diffusion_model.llm_adapter.blocks.",
+        ], bi, paths)
+
+    # --- LLM adapter root: direct module-path Anima keys ---
+    #   diffusion_model.llm_adapter.embed.lora_down.weight
+    #   diffusion_model.llm_adapter.out_proj.lora_down.weight
+    m = _AM_LLM_ADAPTER_ROOT_DOT_BASE_RE.match(base)
+    if m:
+        tail = m.group(1)
+        paths = _am_dot_tail_to_paths(tail)
+        return _am_prefixed_weight_candidates([
+            "model.diffusion_model.llm_adapter.",
+            "net.llm_adapter.",
+            "llm_adapter.",
+            "diffusion_model.llm_adapter.",
+        ], paths)
+
+    # --- Time embedder: direct module-path Anima keys ---
+    #   diffusion_model.t_embedder.1.linear_1.lora_down.weight
+    #   diffusion_model.t_embedder.1.linear_2.lora_down.weight
+    m = _AM_T_EMBEDDER_DOT_BASE_RE.match(base)
+    if m:
+        tail = m.group(1)
+        paths = _am_dot_tail_to_paths(tail)
+        return _am_prefixed_weight_candidates([
+            "model.diffusion_model.t_embedder.",
+            "net.t_embedder.",
+            "t_embedder.",
+            "diffusion_model.t_embedder.",
+        ], paths)
+
+    # --- Input embedder: direct module-path Anima keys ---
+    #   diffusion_model.x_embedder.proj.1.lora_down.weight
+    m = _AM_X_EMBEDDER_DOT_BASE_RE.match(base)
+    if m:
+        tail = m.group(1)
+        paths = _am_dot_tail_to_paths(tail)
+        return _am_prefixed_weight_candidates([
+            "model.diffusion_model.x_embedder.",
+            "net.x_embedder.",
+            "x_embedder.",
+            "diffusion_model.x_embedder.",
+        ], paths)
 
     # --- Text encoder side (Qwen3-0.6B) ---
     m = _AM_TE_BASE_RE.match(base)
     if m:
         li = int(m.group(1))
         tail = m.group(2)
-
-        keep = {"input_layernorm", "post_attention_layernorm", "final_layernorm"}
-        if tail in keep:
-            paths = [tail]
-        else:
-            paths = _am_tail_to_path(tail)
-
-        prefixes = [
+        paths = _am_tail_to_path(tail)
+        return _am_weight_candidates([
             "cond_stage_model.qwen3_06b.transformer.model.layers.",
             "cond_stage_model.qwen3_06b_base.transformer.model.layers.",
-        ]
-        for pref in prefixes:
-            for path in paths:
-                cand = f"{pref}{li}.{path}.weight"
-                if cand in theta_0:
-                    return cand
-        # fallback
-        return f"cond_stage_model.qwen3_06b.transformer.model.layers.{li}.{paths[0]}.weight"
+            "cond_stage_model.qwen3_06b.model.layers.",
+            "cond_stage_model.qwen3_06b_base.model.layers.",
+            "text_encoders.qwen3_06b.transformer.model.layers.",
+            "text_encoders.qwen3_06b_base.transformer.model.layers.",
+            "text_encoders.qwen3_06b.model.layers.",
+            "text_encoders.qwen3_06b_base.model.layers.",
+            "qwen3_06b.transformer.model.layers.",
+            "qwen3_06b_base.transformer.model.layers.",
+            "qwen3_06b.model.layers.",
+            "qwen3_06b_base.model.layers.",
+        ], li, paths)
 
     # --- VAE side (optional) ---
     mv = _AM_VAE_BASE_RE.match(base)
     if mv:
         tail = mv.group(1)
-        cand = "first_stage_model." + tail.replace("_", ".") + ".weight"
-        if cand in theta_0:
-            return cand
-        return cand
+        dotted = tail.replace("_", ".")
+        return [
+            f"first_stage_model.{dotted}.weight",
+            f"vae.{dotted}.weight",
+            f"model.first_stage_model.{dotted}.weight",
+        ]
 
-    return None
+    return []
+
+
+def anima_resolve_target_any(down_k: str, theta_0: dict) -> str | None:
+    """AM LoRA down key -> existing checkpoint weight key when possible."""
+    return _am_existing_or_first(theta_0, anima_target_candidates_from_lora_down(down_k))
+
 
 _ZI_LAYER_RE = re.compile(
     r"^(?:model\.)?diffusion_model\.layers\.(\d+)\.(.+)\.lora_(A|down)\.weight$"
@@ -689,25 +907,8 @@ def zimage_resolve_target_any(down_k: str, zi_index: dict):
     return None, None
 
 def _am_target_key_from_lora_down(down_k: str) -> str | None:
-    base = _am_strip_lora_suffix(down_k)
-    if base is None:
-        return None
-    m = _AM_UNET_BASE_RE.match(base)
-    if m:
-        bi = int(m.group(1))
-        tail = m.group(2)
-        path = _am_tail_to_path(tail)[0]
-        return f"model.diffusion_model.blocks.{bi}.{path}.weight"
-    m = _AM_TE_BASE_RE.match(base)
-    if m:
-        li = int(m.group(1))
-        tail = m.group(2)
-        path = tail if tail in {"input_layernorm","post_attention_layernorm","final_layernorm"} else _am_tail_to_path(tail)[0]
-        return f"cond_stage_model.qwen3_06b.transformer.model.layers.{li}.{path}.weight"
-    mv = _AM_VAE_BASE_RE.match(base)
-    if mv:
-        return "first_stage_model." + mv.group(1).replace("_",".") + ".weight"
-    return None
+    cands = anima_target_candidates_from_lora_down(down_k)
+    return cands[0] if cands else None
 
 @torch.inference_mode()
 def apply_lora_to_weight_inplace(W: torch.Tensor, up: torch.Tensor, down: torch.Tensor, scale: float, ratio: float):
@@ -1853,6 +2054,24 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                     plan.append(("std", special_target, special_part, d, u, a, float(ratio)))
                     continue
 
+            if base_model.arch.get("AM", False):
+                target = anima_resolve_target_any(d, base_model.theta)
+                if target is None or target not in base_model.theta:
+                    unresolved += 1
+                    if len(unresolved_examples) < 12:
+                        unresolved_examples.append(d)
+                    continue
+
+                ratio = _effective_ratio_for_target(
+                    target,
+                    g=g, weights=weights, deep=deep,
+                    blockids=blocknum,
+                    arch=base_model.arch,
+                )
+                ratio = float(ratio) * float(bake_norm_use)
+                plan.append(("std", target, None, d, u, a, float(ratio)))
+                continue
+
             # standard (SD/SDXL/Flux)
             full = convert_diffusers_name_to_compvis_cached(d, lisv2)
             msd  = full.split(".", 1)[0]
@@ -2195,7 +2414,13 @@ def _infer_arch_from_lora_keys(keys: list[str]) -> tuple[bool, bool, bool]:
 
     # AM (Anima)
     for k in keys:
-        if "lora_unet_blocks_" in k or "lora_te_layers_" in k:
+        if (
+            "lora_unet_blocks_" in k
+            or "lora_te_layers_" in k
+            or re.match(r"^(?:model\.)?diffusion_model\.blocks\.\d+\..*\.lora_(?:A|B|down|up)\.weight$", k)
+            or re.match(r"^(?:model\.)?diffusion_model\.final_layer\..*\.lora_(?:A|B|down|up)\.weight$", k)
+            or re.match(r"^(?:model\.)?diffusion_model\.llm_adapter\.blocks\.\d+\..*\.lora_(?:A|B|down|up)\.weight$", k)
+        ):
             arch["AM"] = True
             return arch
         
@@ -2498,7 +2723,7 @@ def merge_loras_only(
                 (BLOCKIDAM if arch["AM"] else BLOCKID)))
             )
             decided = True
-            print(f"detected arch: isxl={arch['XL']} isflux={arch['FLUX']} iszi={arch['ZI']} (blocklen={len(blocknum)})")
+            print(f"detected arch: isxl={arch['XL']} isflux={arch['FLUX']} iszi={arch['ZI']} isam={arch['AM']} (blocklen={len(blocknum)})")
 
         g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
 
@@ -2510,12 +2735,12 @@ def merge_loras_only(
                 continue
 
             base = canonical_kohya_base_from_down_key(
-            d,
-            arch=arch,
-            lisv2=bool(lisv2),
-        )
-        if base is None:
-            continue
+                d,
+                arch=arch,
+                lisv2=bool(lisv2),
+            )
+            if base is None:
+                continue
 
             if unet_only:
                 if ("lora_te" in base) or ("text_encoder" in base) or ("te_" in base):

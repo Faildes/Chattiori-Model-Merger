@@ -738,8 +738,44 @@ def _fallback_arch(theta: dict[str, torch.Tensor], *, model_type: Optional[str])
     if any("cap_embedder" in k for k in keys):
         arch["ZI"] = True
 
-    # Anima detection should stay conservative because false positives hurt block mapping.
+    # Anima detection.  Keep the checkpoint-side checks structure-specific, and
+    # recognize the kohya-style Anima LoRA families used by Anima trainers.
     if any("anima" in k.lower() for k in keys):
+        arch["AM"] = True
+
+    if any(
+        (
+            k.startswith(("blocks.", "net.blocks.", "diffusion_model.blocks.", "model.diffusion_model.blocks."))
+            and (
+                ".self_attn." in k
+                or ".cross_attn." in k
+                or ".q_proj.weight" in k
+                or ".k_proj.weight" in k
+                or ".v_proj.weight" in k
+                or "adaln_modulation" in k
+            )
+        )
+        or k.startswith("cond_stage_model.qwen3_06b.")
+        or k.startswith((
+            "model.diffusion_model.final_layer",
+            "diffusion_model.final_layer",
+            "net.final_layer",
+            "final_layer",
+            "model.diffusion_model.llm_adapter",
+            "diffusion_model.llm_adapter",
+            "net.llm_adapter",
+            "llm_adapter",
+            "model.diffusion_model.t_embedder",
+            "diffusion_model.t_embedder",
+            "net.t_embedder",
+            "t_embedder",
+            "model.diffusion_model.x_embedder",
+            "diffusion_model.x_embedder",
+            "net.x_embedder",
+            "x_embedder",
+        ))
+        for k in keys
+    ):
         arch["AM"] = True
 
     if model_type == "lora":
@@ -747,6 +783,33 @@ def _fallback_arch(theta: dict[str, torch.Tensor], *, model_type: Optional[str])
             arch["XL"] = True
         if any("double_blocks" in k or "single_blocks" in k for k in keys):
             arch["FLUX"] = True
+        if any(
+            (
+                "lora_unet_blocks_" in k
+                or "lora_te_layers_" in k
+                or (
+                    k.startswith(("blocks.", "net.blocks.", "diffusion_model.blocks.", "model.diffusion_model.blocks."))
+                    and (".lora_A.weight" in k or ".lora_B.weight" in k or ".lora_down.weight" in k or ".lora_up.weight" in k)
+                )
+                or (
+                    k.startswith((
+                        "diffusion_model.final_layer.", "model.diffusion_model.final_layer.",
+                        "net.final_layer.", "final_layer.",
+                        "diffusion_model.llm_adapter.blocks.", "model.diffusion_model.llm_adapter.blocks.",
+                        "net.llm_adapter.blocks.", "llm_adapter.blocks.",
+                        "diffusion_model.llm_adapter.", "model.diffusion_model.llm_adapter.",
+                        "net.llm_adapter.", "llm_adapter.",
+                        "diffusion_model.t_embedder.", "model.diffusion_model.t_embedder.",
+                        "net.t_embedder.", "t_embedder.",
+                        "diffusion_model.x_embedder.", "model.diffusion_model.x_embedder.",
+                        "net.x_embedder.", "x_embedder.",
+                    ))
+                    and (".lora_A.weight" in k or ".lora_B.weight" in k or ".lora_down.weight" in k or ".lora_up.weight" in k)
+                )
+            )
+            for k in keys
+        ):
+            arch["AM"] = True
 
     return arch
 
