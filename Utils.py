@@ -218,10 +218,12 @@ def make_lblocks_am():
         "qwen3_06b.", "qwen3_06b_base.",
 
         # ---- diffusion-side adapters / time/pos ----
-        "model.diffusion_model.llm_adapter.", "llm_adapter.",
-        "model.diffusion_model.t_embedder.", "t_embedder.",
-        "model.diffusion_model.t_embedding_norm.", "t_embedding_norm.",
-        "model.diffusion_model.pos_embedder.", "pos_embedder.",
+        "model.diffusion_model.llm_adapter.", "diffusion_model.llm_adapter.", "llm_adapter.",
+        "model_diffusion_model_llm_adapter_", "diffusion_model_llm_adapter_", "net_llm_adapter_",
+        "model.diffusion_model.t_embedder.", "diffusion_model.t_embedder.", "t_embedder.",
+        "model_diffusion_model_t_embedder_", "diffusion_model_t_embedder_", "net_t_embedder_",
+        "model.diffusion_model.t_embedding_norm.", "diffusion_model.t_embedding_norm.", "t_embedding_norm.",
+        "model.diffusion_model.pos_embedder.", "diffusion_model.pos_embedder.", "pos_embedder.",
 
         # ---- official may come as net.* ----
         "net.llm_adapter.", "net.t_embedder.", "net.t_embedding_norm.", "net.pos_embedder.",
@@ -245,22 +247,30 @@ def make_lblocks_am():
             f"blocks.{i}.",
             f"net.blocks.{i}.",
 
-            # LoRA keys (kohya-style)
+            # LoRA keys (kohya-style + direct module-path style)
             f"lora_unet_blocks_{i}_",     # matches: lora_unet_blocks_0_self_attn_q_proj...
             f"lora_unet_blocks.{i}.",     # safety (rare)
+            f"diffusion_model.blocks.{i}.",
+            f"model.diffusion_model.blocks.{i}.",
+            f"net.blocks.{i}.",
+            f"diffusion_model_blocks_{i}_",       # convert_diffusers_name_to_compvis() direct-key form
+            f"model_diffusion_model_blocks_{i}_",
+            f"net_blocks_{i}_",
         ])
 
     # Add x_embedder into L00 bucket (input-like)
     lblocks[1].extend([
-        "model.diffusion_model.x_embedder.", "x_embedder.",
+        "model.diffusion_model.x_embedder.", "diffusion_model.x_embedder.", "x_embedder.",
         "net.x_embedder.",
+        "model_diffusion_model_x_embedder_", "diffusion_model_x_embedder_", "net_x_embedder_",
         "lora_unet_x_embedder", "lora_unet_x_embedder_",  # just in case
     ])
 
     # Add final_layer into L27 bucket (output-like)
     lblocks[28].extend([
-        "model.diffusion_model.final_layer.", "final_layer.",
+        "model.diffusion_model.final_layer.", "diffusion_model.final_layer.", "final_layer.",
         "net.final_layer.",
+        "model_diffusion_model_final_layer_", "diffusion_model_final_layer_", "net_final_layer_",
         "lora_unet_final_layer", "lora_unet_final_layer_",  # just in case
         "lora_unet_out", "lora_unet_out_",                  # some packs use out naming
     ])
@@ -458,6 +468,9 @@ def fineman(fine, arch):
             "r": float(fine[5]),
             "g": float(fine[6]),
             "b": float(fine[7]),
+            # Optional 9th value: direct saturation factor.
+            # 1.0 = off, 0.75 = 25% desaturate, 1.15 = boost.
+            "saturation": float(fine[8]) if len(fine) > 8 else 1.0,
         }
 
     r = [
@@ -733,7 +746,14 @@ def detect_arch(theta):
             if (".self_attn." in k) or (".cross_attn." in k):
                 return True
         # diffusion head / adapters
-        if ("final_layer.linear.weight" in k) or ("llm_adapter." in k) or ("t_embedding_norm" in k):
+        if (
+            "final_layer.linear.weight" in k
+            or "final_layer.adaln_modulation" in k
+            or "llm_adapter." in k
+            or "t_embedding_norm" in k
+            or (k.startswith(("diffusion_model.final_layer.", "model.diffusion_model.final_layer.", "net.final_layer.", "final_layer.")) and ".lora_" in k)
+            or (k.startswith(("diffusion_model.llm_adapter.", "model.diffusion_model.llm_adapter.", "net.llm_adapter.", "llm_adapter.")) and ".lora_" in k)
+        ):
             return True
         # AIO text encoder signature
         if k.startswith("cond_stage_model.qwen3_06b."):
@@ -1822,10 +1842,83 @@ def _is_proj_ff(key: str) -> bool:
     return ("proj_in" in key) or ("proj_out" in key) or ("ff.net" in key)
 
 def _is_unet_out(key: str) -> bool:
-    return ("model.diffusion_model.out.0." in key) or ("model.diffusion_model.out.2." in key)
+    kl = key.lower()
+    return (
+        ("model.diffusion_model.out.0." in kl) or
+        ("model.diffusion_model.out.2." in kl) or
+        # Anima / DiT-like final RGB head
+        ("model.diffusion_model.final_layer." in kl) or
+        kl.startswith("final_layer.") or
+        kl.startswith("net.final_layer.")
+    )
 
 def _is_vae_rgb(key: str) -> bool:
-    return ("first_stage_model.decoder.conv_out." in key)
+    kl = key.lower()
+    return (
+        ("first_stage_model.decoder.conv_out." in kl) or
+        ("vae.decoder.conv_out." in kl) or
+        ("model.vae.decoder.conv_out." in kl) or
+        ("model.first_stage_model.decoder.conv_out." in kl)
+    )
+
+
+def _am_block_band(blk: str) -> float:
+    """Broad tone weighting for Anima L00-L27 blocks."""
+    if not isinstance(blk, str) or not blk.startswith("L"):
+        return 0.0
+    try:
+        n = int(blk[1:])
+    except Exception:
+        return 0.0
+    if 20 <= n <= 27:
+        return 1.20
+    if 12 <= n <= 19:
+        return 1.00
+    if 8 <= n <= 11:
+        return 0.75
+    if 4 <= n <= 7:
+        return 0.55
+    return 0.35
+
+
+def _am_saturation_finetune_tensor(key: str, tens: torch.Tensor, blk: str, sat: float):
+    """
+    Gentle diffusion-side tone correction for Anima.
+
+    Real RGB saturation is handled by VAE conv_out via
+    apply_vae_saturation_inplace(). This only damp/boosts AM color/tone
+    sensitive transformer tensors so NoIn/merge fine passes have AM coverage.
+    """
+    if not isinstance(tens, torch.Tensor) or (not tens.is_floating_point()):
+        return tens
+
+    band = _am_block_band(blk)
+    if band <= 0:
+        return tens
+
+    kl = key.lower()
+    down = max(0.0, 1.0 - float(sat))
+    up = max(0.0, float(sat) - 1.0)
+    if down == 0.0 and up == 0.0:
+        return tens
+
+    coeff = 0.0
+    if ("mlp.layer1" in kl) or ("mlp.layer2" in kl) or ("adaln_modulation_mlp" in kl):
+        coeff = 0.10
+    elif (("v_proj" in kl) or ("output_proj" in kl)) and (("self_attn" in kl) or ("cross_attn" in kl)):
+        coeff = 0.07
+    elif ("q_norm" in kl) or ("k_norm" in kl) or ("t_embedding_norm" in kl):
+        coeff = 0.04
+    elif ("adaln_modulation_self_attn" in kl) or ("adaln_modulation_cross_attn" in kl):
+        coeff = 0.035
+
+    if coeff <= 0.0:
+        return tens
+
+    scale = 1.0 - (down * coeff * band) + (up * coeff * band)
+    scale = max(0.70, min(1.30, scale))
+    return (tens.float() * scale).to(dtype=tens.dtype)
+
 
 def _finetune_inplace(key, tens, fine, arch: dict):
     if fine == "" or fine is None:
@@ -1842,6 +1935,7 @@ def _finetune_inplace(key, tens, fine, arch: dict):
             "r": float(fine[5]),
             "g": float(fine[6]),
             "b": float(fine[7]),
+            "saturation": float(fine[8]) if len(fine) > 8 else 1.0,
         }
 
     if isinstance(fine, dict):
@@ -1854,6 +1948,7 @@ def _finetune_inplace(key, tens, fine, arch: dict):
             rr  = float(fine.get("r", 0.0))
             gg  = float(fine.get("g", 0.0))
             bb  = float(fine.get("b", 0.0))
+            sat = float(fine.get("saturation", 1.0))
 
             # detail / clarity band controls
             dn1_k = dn1 * 0.06
@@ -1877,10 +1972,13 @@ def _finetune_inplace(key, tens, fine, arch: dict):
             left, right = blockfromkey(key, arch)
             blk = right
 
-            # --- VAE RGB / small brightness carry ---
+            # --- VAE RGB / small brightness carry / direct saturation ---
             if _is_vae_rgb(key):
                 if _is_conv_weight(key, tens) and tens.shape[0] >= 3:
                     w = tens.float()
+                    if abs(sat - 1.0) >= 1e-6:
+                        A = _rgb_sat_matrix(sat, w.device, torch.float32)
+                        w[:3] = torch.einsum("ij,jchw->ichw", A, w[:3])
                     w[0] *= r_k
                     w[1] *= g_k
                     w[2] *= b_k
@@ -1889,6 +1987,9 @@ def _finetune_inplace(key, tens, fine, arch: dict):
 
                 if _is_bias(key, tens) and tens.shape[0] >= 3:
                     b = tens.float()
+                    if abs(sat - 1.0) >= 1e-6:
+                        A = _rgb_sat_matrix(sat, b.device, torch.float32)
+                        b[:3] = torch.einsum("ij,j->i", A, b[:3])
                     base_add = bright_add + black_lift
                     b[0] = b[0] * r_k + base_add
                     b[1] = b[1] * g_k + base_add
@@ -1896,6 +1997,12 @@ def _finetune_inplace(key, tens, fine, arch: dict):
                     return b.to(dtype=tens.dtype)
 
                 return tens
+
+            # --- Anima diffusion-side saturation/tone support ---
+            if arch.get("AM", False) and abs(sat - 1.0) >= 1e-6:
+                tuned = _am_saturation_finetune_tensor(key, tens, blk, sat)
+                if tuned is not tens:
+                    return tuned
 
             # --- UNet final out: primary global contrast / black point ---
             if _is_unet_out(key):
@@ -1986,6 +2093,7 @@ def _finetune_inplace(key, tens, fine, arch: dict):
         # ===== NEW: 8 sliders for SDXL/SD15 =====
         if len(fine) >= 8:
             dn1, dn2, dn3, ct, br, rr, gg, bb = [float(x) for x in fine[:8]]
+            sat = float(fine[8]) if len(fine) > 8 else 1.0
             
             dn1_k = dn1 * 0.12
             dn2_k = dn2 * 0.10
@@ -1994,21 +2102,35 @@ def _finetune_inplace(key, tens, fine, arch: dict):
             br_k  = br * 0.02
             r_k, g_k, b_k = (1.0 + rr * 0.05, 1.0 + gg * 0.05, 1.0 + bb * 0.05)
 
-            # --- VAE: Brightness / RGB ---
+            # --- VAE: Brightness / RGB / direct saturation ---
             if _is_vae_rgb(key):
                 if _is_conv_weight(key, tens) and tens.shape[0] >= 3:
                     w = tens.float()
+                    if abs(sat - 1.0) >= 1e-6:
+                        A = _rgb_sat_matrix(sat, w.device, torch.float32)
+                        w[:3] = torch.einsum("ij,jchw->ichw", A, w[:3])
                     w[0] *= r_k
                     w[1] *= g_k
                     w[2] *= b_k
                     return w.to(dtype=tens.dtype)
                 if _is_bias(key, tens) and tens.shape[0] >= 3:
                     b = tens.float()
+                    if abs(sat - 1.0) >= 1e-6:
+                        A = _rgb_sat_matrix(sat, b.device, torch.float32)
+                        b[:3] = torch.einsum("ij,j->i", A, b[:3])
                     b[0] = b[0] * r_k + br_k
                     b[1] = b[1] * g_k + br_k
                     b[2] = b[2] * b_k + br_k
                     return b.to(dtype=tens.dtype)
                 return tens
+
+            # --- Anima diffusion-side saturation/tone support ---
+            left, right = blockfromkey(key, arch)
+            blk = right
+            if arch.get("AM", False) and abs(sat - 1.0) >= 1e-6:
+                tuned = _am_saturation_finetune_tensor(key, tens, blk, sat)
+                if tuned is not tens:
+                    return tuned
 
             # --- UNet Contrast / Brightness ---
             if _is_unet_out(key):

@@ -1188,11 +1188,25 @@ def main():
                 return k[len(r):]
         return k
 
+    def _is_checkpoint_vae_key(k: str, vae_key: str) -> bool:
+        roots = (
+            f"{vae_key}.",
+            f"model.{vae_key}.",
+        )
+        return k == vae_key or any(k.startswith(root) for root in roots)
+
     if args.vae:
         for k in tqdm(vae_model.theta.keys(), desc=f"Baking in VAE[{vae_name}] ..."):
             tk = vae_key + "." + _strip_vae_root(k)
             model0.theta[tk] = to_half(vae_model.theta[k], args.save_half)
         del vae_model.theta
+    else:
+        vae_key = "first_stage_model" if not (arch.get("FLUX", False) or arch.get("ZI", False)) else "vae"
+        vae_keys = [k for k in list(model0.theta.keys()) if _is_checkpoint_vae_key(k, vae_key)]
+        for k in vae_keys:
+            del model0.theta[k]
+        if vae_keys:
+            print(f"[VAE] --vae not specified; removed {len(vae_keys)} embedded VAE tensors ({vae_key}).")
 
     # Apply VAE saturation to the current checkpoint as well, not only when
     # an external --vae is baked. This is the safest direct saturation control

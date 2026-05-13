@@ -2917,6 +2917,10 @@ if __name__ == "__main__":
                         help="Extra global scale multiplier applied after merge_norm.")
     parser.add_argument("--merge_unet_only", action="store_true",
                         help="Only merge UNet LoRA modules (skip text encoders).")
+    parser.add_argument("--merge_clamp_q", type=float, default=CLAMP_QUANTILE_DEFAULT,
+                        help="Quantile clamp applied to merged LoRA factors before save. Default=0.99")
+    parser.add_argument("--merge_intermediate_mult", type=int, default=4,
+                        help="Temporary rank multiplier before final compression. Default=4")
     parser.add_argument("--bake_clip_scale", type=float, default=1.0,
                     help="Global scale multiplier for text encoder LoRA modules when baking into checkpoint. Default=1.0 (no extra scaling).")
     parser.add_argument("--bake_unet_only", action="store_true",
@@ -2968,7 +2972,9 @@ if __name__ == "__main__":
             arch_set=str(getattr(args, "merge_arch", "auto")),
             merge_norm=str(getattr(args, "merge_norm","none")), 
             merge_scale=float(getattr(args, "merge_scale", 1.0)), 
-            unet_only=getattr(args, "merge_unet_only", False)
+            unet_only=getattr(args, "merge_unet_only", False),
+            clamp_quantile=float(getattr(args, "merge_clamp_q", CLAMP_QUANTILE_DEFAULT)),
+            intermediate_mult=int(getattr(args, "merge_intermediate_mult", 4)),
         )
         raise SystemExit(0)
     else:
