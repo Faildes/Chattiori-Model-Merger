@@ -73,7 +73,6 @@ class ModelInfo:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "path": self.path,
             "name": self.name,
             "format": self.format,
             "model_type": self.model_type,

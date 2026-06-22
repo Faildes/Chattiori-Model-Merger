@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import re
 import numpy as np
 import json
 import argparse
@@ -108,6 +109,128 @@ def main():
 
     args = parser.parse_args()
 
+    # Keep the original CLI text before args.alpha / args.beta are normalized by wgt(),
+    # rand_ratio(), parse_ratio(), or mode-specific code paths.
+    _raw_alpha_arg = str(args.alpha)
+    _raw_beta_arg = str(args.beta)
+
+    def _json_safe(v):
+        """Return a JSON-serializable representation for merge metadata."""
+        if v is None or isinstance(v, (str, int, float, bool)):
+            return v
+        if isinstance(v, (np.integer, np.floating, np.bool_)):
+            return v.item()
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        if isinstance(v, torch.Tensor):
+            if v.numel() <= 256:
+                return v.detach().cpu().tolist()
+            return {"tensor_shape": list(v.shape), "dtype": str(v.dtype)}
+        if isinstance(v, (list, tuple, set)):
+            return [_json_safe(x) for x in v]
+        if isinstance(v, OrderedDict):
+            return {str(k): _json_safe(val) for k, val in v.items()}
+        if isinstance(v, dict):
+            return {str(k): _json_safe(val) for k, val in v.items()}
+        return str(v)
+
+    def _meta_text(v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v if v != "" else None
+        return json.dumps(_json_safe(v), ensure_ascii=False, default=str)
+
+    def _path_basename(v: str):
+        t = str(v).rstrip("/\\")
+        name = os.path.basename(t)
+        return name or "<local_path_redacted>"
+
+    def _looks_like_local_path(v: str) -> bool:
+        if not isinstance(v, str) or not v:
+            return False
+        if v.startswith(("http://", "https://", "hf://")):
+            return False
+        return (
+            os.path.isabs(v)
+            or v.startswith("~")
+            or v.startswith("\\\\")
+            or re.match(r"^[A-Za-z]:[\\/]", v) is not None
+        )
+
+    def _sanitize_local_paths(v):
+        """Remove author-identifying local paths from metadata payloads."""
+        if isinstance(v, str):
+            return _path_basename(v) if _looks_like_local_path(v) else v
+        if isinstance(v, (list, tuple)):
+            return [_sanitize_local_paths(x) for x in v]
+        if isinstance(v, dict):
+            out = {}
+            for k, val in v.items():
+                lk = str(k).lower()
+                if isinstance(val, str) and ("path" in lk or lk in {"file", "filename", "source"}):
+                    out[k] = _path_basename(val) if _looks_like_local_path(val) else val
+                else:
+                    out[k] = _sanitize_local_paths(val)
+            return out
+        return v
+
+    def _sanitize_info_local_paths(info):
+        if info is None:
+            return info
+        for attr in ("path", "file", "filename", "source", "source_path", "model_path", "cache_path"):
+            if hasattr(info, attr):
+                try:
+                    setattr(info, attr, _sanitize_local_paths(getattr(info, attr)))
+                except Exception:
+                    pass
+        for attr in ("metadata", "extra_info", "parent_models"):
+            if hasattr(info, attr):
+                try:
+                    setattr(info, attr, _sanitize_local_paths(getattr(info, attr)))
+                except Exception:
+                    pass
+        return info
+
+    merge_param_snapshot = None
+
+    def _snapshot_merge_params(
+        stage: str,
+        *,
+        alpha=None,
+        beta=None,
+        weights_a=None,
+        weights_b=None,
+        deep_a=None,
+        deep_b=None,
+        alpha_info=None,
+        beta_info=None,
+        useblocks=None,
+        usebeta=None,
+    ):
+        nonlocal merge_param_snapshot
+        snap = {
+            "stage": stage,
+            "mode": str(args.mode),
+            "effective_mode": str(mode),
+            "alpha_raw": _raw_alpha_arg,
+            "beta_raw": _raw_beta_arg,
+            "alpha": _json_safe(alpha),
+            "beta": _json_safe(beta),
+            "alpha_info": _meta_text(alpha_info) or _meta_text(alpha) or _raw_alpha_arg,
+            "beta_info": _meta_text(beta_info) or (_meta_text(beta) if usebeta else None),
+            "alpha_weights": _json_safe(weights_a),
+            "beta_weights": _json_safe(weights_b),
+            "alpha_deep": _json_safe(deep_a),
+            "beta_deep": _json_safe(deep_b),
+            "uses_blocks": bool(useblocks) or bool(weights_a is not None) or bool(weights_b is not None),
+            "uses_beta": bool(usebeta),
+            "rand_alpha": args.rand_alpha,
+            "rand_beta": args.rand_beta,
+        }
+        merge_param_snapshot = _sanitize_local_paths(snap)
+        return merge_param_snapshot
+
     def _fine_sat_active() -> bool:
         return abs(float(getattr(args, "fine_sat", 1.0)) - 1.0) >= 1e-6
 
@@ -196,6 +319,18 @@ def main():
     if args.rand_beta is not None:
         args.beta, beta_seed,  deep_b,  beta_info  = rand_ratio(args.rand_beta)
 
+    _snapshot_merge_params(
+        "initial",
+        alpha=args.alpha,
+        beta=args.beta,
+        deep_a=deep_a,
+        deep_b=deep_b,
+        alpha_info=alpha_info,
+        beta_info=beta_info,
+        useblocks=useblocks,
+        usebeta=False,
+    )
+
     model_0_path = _model_path(args.model_path, args.model_0)
     model_0_name = args.m0_name or _model_stem(model_0_path)
     print(f"Loading {model_0_name}...")
@@ -234,6 +369,19 @@ def main():
                 src_only=only,
             )
             print(f"[SWAP] components={sorted(list(components))} only={sorted(list(only))}  moved:{moved}  created:{created}  shape_skipped:{skipped}")
+            _snapshot_merge_params(
+                "SWAP",
+                alpha=str(args.alpha),
+                beta=None,
+                weights_a=None,
+                weights_b=None,
+                deep_a=deep_a,
+                deep_b=deep_b,
+                alpha_info=str(args.alpha),
+                beta_info=None,
+                useblocks=False,
+                usebeta=False,
+            )
 
             mode = "NoIn"
             model1 = None
@@ -325,6 +473,19 @@ def main():
 
             # mode transition behavior
             if mode == "CLIPXOR":
+                _snapshot_merge_params(
+                    "CLIPXOR",
+                    alpha=None,
+                    beta=None,
+                    weights_a=None,
+                    weights_b=None,
+                    deep_a=deep_a,
+                    deep_b=deep_b,
+                    alpha_info=None,
+                    beta_info=None,
+                    useblocks=False,
+                    usebeta=False,
+                )
                 mode = "NoIn"
                 model1.theta = None
                 usebeta = False
@@ -335,6 +496,19 @@ def main():
                 usebeta = True
                 weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
                 weights_b, beta,  beta_info  = parse_ratio(args.beta,  beta_info,  deep_b)
+                _snapshot_merge_params(
+                    "XDARE",
+                    alpha=alpha,
+                    beta=beta,
+                    weights_a=weights_a,
+                    weights_b=weights_b,
+                    deep_a=deep_a,
+                    deep_b=deep_b,
+                    alpha_info=alpha_info,
+                    beta_info=beta_info,
+                    useblocks=useblocks,
+                    usebeta=True,
+                )
         else:
             weights_a, alpha, alpha_info = parse_ratio(args.alpha, alpha_info, deep_a)
             if mode in modes_need_m2:
@@ -348,6 +522,19 @@ def main():
                 weights_b, beta, beta_info = parse_ratio(args.beta, beta_info, deep_b)
             else:
                 weights_b, beta = None, None
+            _snapshot_merge_params(
+                "merge_ratios_parsed",
+                alpha=alpha,
+                beta=beta,
+                weights_a=weights_a,
+                weights_b=weights_b,
+                deep_a=deep_a,
+                deep_b=deep_b,
+                alpha_info=alpha_info,
+                beta_info=beta_info,
+                useblocks=useblocks,
+                usebeta=usebeta,
+            )
             if args.rebasin is not None:
                 if arch.get("FLUX") or arch.get("ZI") or arch.get("AM"):
                     print("[ReBasin] Unavailable architecture detected, skipping ReBasin (not supported).")
@@ -390,6 +577,19 @@ def main():
             before = len(model0.theta)
             model0.theta, kept, total = _filter_state_dict_by_components(model0.theta, comp_components, arch)
             print(f"[COMP] components={sorted(list(comp_components))}  kept:{kept} / {before}")
+            _snapshot_merge_params(
+                "COMP",
+                alpha=sorted(list(comp_components)),
+                beta=None,
+                weights_a=None,
+                weights_b=None,
+                deep_a=deep_a,
+                deep_b=deep_b,
+                alpha_info=str(args.alpha),
+                beta_info=None,
+                useblocks=False,
+                usebeta=False,
+            )
 
             mode = "NoIn"
             model1 = None
@@ -941,6 +1141,19 @@ def main():
             )
 
         model0.theta = base_sd
+        _snapshot_merge_params(
+            "cosine_merge",
+            alpha=alpha,
+            beta=beta,
+            weights_a=weights_a,
+            weights_b=weights_b,
+            deep_a=deep_a,
+            deep_b=deep_b,
+            alpha_info=alpha_info,
+            beta_info=beta_info,
+            useblocks=useblocks,
+            usebeta=(beta is not None),
+        )
 
         cosine_applied = True
         mode = "NoIn"
@@ -984,6 +1197,19 @@ def main():
             vae_key=vae_key,
             bake_vae_enabled=bake_vae_enabled,
             fine=(fine if do_fine else None),
+        )
+        _snapshot_merge_params(
+            "turbo_convert" if args.turbo else "deturbo_convert",
+            alpha=alpha,
+            beta=None,
+            weights_a=weights_a,
+            weights_b=None,
+            deep_a=deep_a,
+            deep_b=deep_b,
+            alpha_info=alpha_info,
+            beta_info=None,
+            useblocks=(weights_a is not None),
+            usebeta=False,
         )
 
         # stop normal merge path
@@ -1248,9 +1474,31 @@ def main():
         calcs.append(f"fine_sat[{args.fine_sat}]")
     if float(args.vae_sat) != 1.0:
         calcs.append(f"vae_sat[{args.vae_sat}]")
+    if float(args.cfg_sens) != 1.0:
+        calcs.append(f"cfg_sens[{args.cfg_sens}|{args.cfg_sens_targets}]")
+    if float(args.sat_boost) != 1.0:
+        calcs.append(f"sat_boost[{args.sat_boost}|{args.sat_boost_side}|{args.sat_boost_tags or 'auto'}]")
     calcl = ",".join(calcs) or None
 
     fp = "fp8" if args.save_quarter else ("fp16" if args.save_half else ("bf16" if args.save_bhalf else "fp32"))
+
+    if merge_param_snapshot is None:
+        _snapshot_merge_params(
+            "final_fallback",
+            alpha=locals().get("alpha"),
+            beta=locals().get("beta"),
+            weights_a=locals().get("weights_a"),
+            weights_b=locals().get("weights_b"),
+            deep_a=locals().get("deep_a"),
+            deep_b=locals().get("deep_b"),
+            alpha_info=locals().get("alpha_info"),
+            beta_info=locals().get("beta_info"),
+            useblocks=locals().get("useblocks"),
+            usebeta=locals().get("usebeta"),
+        )
+
+    _meta_alpha_info = merge_param_snapshot.get("alpha_info") or (alpha_info or None)
+    _meta_beta_info = merge_param_snapshot.get("beta_info") or (beta_info or None)
 
     merge_recipe = {
         "type":                 "merge-models-chattiori",
@@ -1258,14 +1506,52 @@ def main():
         "secondary_model_hash": model1.sha256 if (model1 is not None) else None,
         "tertiary_model_hash":  model2.sha256 if (model2 is not None) else None,
         "merge_method":         merge_name,
-        "block_weights":        (weights_a is not None or weights_b is not None),
-        "alpha_info":           alpha_info or None,
-        "beta_info":            beta_info  or None,
+        "block_weights":        bool(merge_param_snapshot.get("uses_blocks")),
+        "alpha_info":           _meta_alpha_info,
+        "beta_info":            _meta_beta_info,
+        "alpha_raw":            merge_param_snapshot.get("alpha_raw"),
+        "beta_raw":             merge_param_snapshot.get("beta_raw"),
+        "alpha":                merge_param_snapshot.get("alpha"),
+        "beta":                 merge_param_snapshot.get("beta"),
+        "alpha_weights":        merge_param_snapshot.get("alpha_weights"),
+        "beta_weights":         merge_param_snapshot.get("beta_weights"),
+        "alpha_deep":           merge_param_snapshot.get("alpha_deep"),
+        "beta_deep":            merge_param_snapshot.get("beta_deep"),
+        "ratio_stage":          merge_param_snapshot.get("stage"),
+        "uses_beta":            merge_param_snapshot.get("uses_beta"),
         "calculation":          calcl,
         "fp":                   fp,
         "output_name":          output_name,
         "bake_in_vae":          (vae_name if args.vae else False),
         "pruned":               args.prune,
+        "merge_options": {
+            "cosine0": bool(args.cosine0),
+            "cosine1": bool(args.cosine1),
+            "cosine2": bool(args.cosine2),
+            "use_dif_10": bool(args.use_dif_10),
+            "use_dif_20": bool(args.use_dif_20),
+            "use_dif_21": bool(args.use_dif_21),
+            "turbo": bool(args.turbo),
+            "deturbo": bool(args.deturbo),
+            "rebasin": args.rebasin,
+            "seed": args.seed,
+            "rand_alpha": args.rand_alpha,
+            "rand_beta": args.rand_beta,
+            "alpha_seed": alpha_seed,
+            "beta_seed": beta_seed,
+            "fine": args.fine,
+            "fine_sat": args.fine_sat,
+            "cfg_sens": args.cfg_sens,
+            "cfg_sens_targets": args.cfg_sens_targets,
+            "sat_boost": args.sat_boost,
+            "sat_boost_side": args.sat_boost_side,
+            "sat_boost_tags": args.sat_boost_tags,
+            "sat_profile": args.sat_profile,
+            "sat_delta_cap_pct": args.sat_delta_cap_pct,
+            "sat_boost_mix": args.sat_boost_mix,
+            "boost_clamp": args.boost_clamp,
+            "vae_sat": args.vae_sat,
+        },
     }
 
     if args.mode == "SWAP":
@@ -1281,12 +1567,7 @@ def main():
             "max_channels": 4096,
         }
         
-    if float(args.cfg_sens) != 1.0:
-        calcs.append(f"cfg_sens[{args.cfg_sens}|{args.cfg_sens_targets}]")
-    if float(args.sat_boost) != 1.0:
-        calcs.append(f"sat_boost[{args.sat_boost}|{args.sat_boost_side}|{args.sat_boost_tags or 'auto'}]")
-        
-    metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
+    metadata["sd_merge_recipe"] = json.dumps(_sanitize_local_paths(merge_recipe), ensure_ascii=False, default=str)
 
     def _coerce_json_dict(v):
         if v is None:
@@ -1320,14 +1601,15 @@ def main():
     if model2 is not None and model2.sha256 is not None:
         add_model_metadata(model2.sha256, model2.info.legacy_hash, dict(model2.metadata), model2.name)
 
-    metadata["sd_merge_models"] = json.dumps(metadata["sd_merge_models"])
+    metadata["sd_merge_models"] = json.dumps(_sanitize_local_paths(metadata["sd_merge_models"]), ensure_ascii=False, default=str)
+    metadata = _sanitize_local_paths(metadata)
 
     delete_targets = []
     if args.delete_source:
         for p, cond in [
             (os.path.join(args.model_path, args.model_0), True),
-            (os.path.join(args.model_path, args.model_1), model1.sha256 is not None),
-            (os.path.join(args.model_path, args.model_2), model2.sha256 is not None),
+            (os.path.join(args.model_path, args.model_1), (model1 is not None and model1.sha256 is not None)),
+            (os.path.join(args.model_path, args.model_2), (model2 is not None and model2.sha256 is not None)),
         ]:
             if cond and os.path.isfile(p):
                 delete_targets.append(p)
@@ -1336,9 +1618,17 @@ def main():
     merged_info.model_type = "checkpoint"
     merged_info.metadata = dict(metadata)
     merged_info.arch = dict(arch)
+    # Do not bake author-identifying local paths into unified_model_info.
+    # _save_umodel still receives output_path directly, so saving behavior is unchanged.
+    try:
+        merged_info.path = os.path.basename(output_path)
+    except Exception:
+        pass
+    _sanitize_info_local_paths(merged_info)
 
     merged = UnifiedModel.from_theta(model0.theta, info=merged_info, clone_tensors=False)
     _register_merge_parents(merged, model0, model1, model2)
+    _sanitize_info_local_paths(getattr(merged, "info", None))
 
     merge_success = False
     try:
