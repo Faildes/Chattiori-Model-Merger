@@ -1,6 +1,8 @@
 from __future__ import annotations
 import os, shutil
+import base64
 import json
+import zlib
 import re
 import numpy as np
 import random
@@ -9,7 +11,7 @@ import safetensors
 import filelock
 import hashlib
 from tqdm.auto import tqdm
-from typing import List, Tuple, NamedTuple
+from typing import Any, List, Tuple, NamedTuple
 from pathlib import Path
 import torch.nn.functional as F
 from collections import defaultdict
@@ -26,6 +28,186 @@ except Exception:
 
 FP_SET = {torch.float32, torch.float16, torch.float64, torch.bfloat16}
 
+_SAVE_PRECISION_ALIASES = {
+    "fp32": "fp32", "float32": "fp32", "full": "fp32", "single": "fp32", "32": "fp32",
+    "fp16": "fp16", "float16": "fp16", "half": "fp16", "f16": "fp16", "16": "fp16",
+    "bf16": "bf16", "bfloat16": "bf16", "bhalf": "bf16",
+    "fp8": "fp8", "float8": "fp8", "quarter": "fp8", "f8": "fp8", "8f": "fp8",
+    "int8": "int8", "i8": "int8", "s8": "int8",
+}
+_SAVE_PRECISION_CANONICAL = ("fp32", "fp16", "bf16", "fp8", "int8")
+
+def normalize_save_precision(value) -> str:
+    """Return a canonical save precision name accepted by every CLI entry point."""
+    key = str(value if value is not None else "fp32").strip().lower().replace("-", "").replace("_", "")
+    canonical = _SAVE_PRECISION_ALIASES.get(key)
+    if canonical is None:
+        aliases = "fp32/float32/full, fp16/float16/half, bf16/bfloat16/bhalf, fp8/float8/quarter, int8/i8"
+        raise ValueError(f"Unknown save precision '{value}'. Supported values and aliases: {aliases}.")
+    return canonical
+
+def configure_save_precision(args):
+    """Normalize args.save_precision and populate internal compatibility booleans."""
+    precision = normalize_save_precision(getattr(args, "save_precision", "fp32"))
+    args.save_precision = precision
+    args.save_half = precision == "fp16"
+    args.save_bhalf = precision == "bf16"
+    args.save_quarter = precision == "fp8"
+    args.save_int8 = precision == "int8"
+    return precision
+
+
+# -----------------------------------------------------------------------------
+# Chattiori int8 serialization / compute helpers
+# -----------------------------------------------------------------------------
+# Kept in Utils so every CLI/loader uses one quantization definition.  The
+# checkpoint format is symmetric per-tensor int8 with compressed per-key scales.
+
+_INT8_SCHEME_KEY = "chattiori_int8_scheme"
+_INT8_SCALES_KEY = "chattiori_int8_scales"
+_INT8_SCHEME = "symmetric_per_tensor_v1"
+_INT8_METADATA_KEYS = {_INT8_SCHEME_KEY, _INT8_SCALES_KEY}
+
+
+def _encode_int8_scales(scales: dict[str, float]) -> str:
+    payload = json.dumps(scales, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(zlib.compress(payload, level=9)).decode("ascii")
+
+
+def _metadata_candidates(metadata: Any):
+    if not isinstance(metadata, dict):
+        return
+    yield metadata
+    nested = metadata.get("metadata")
+    if isinstance(nested, dict):
+        yield nested
+    unified = metadata.get("unified_model_info")
+    if isinstance(unified, str):
+        try:
+            unified = json.loads(unified)
+        except Exception:
+            unified = None
+    if isinstance(unified, dict):
+        yield unified
+        nested_meta = unified.get("metadata")
+        if isinstance(nested_meta, dict):
+            yield nested_meta
+
+
+def _decode_int8_scales(metadata: Any) -> dict[str, float]:
+    encoded = None
+    scheme = None
+    for candidate in _metadata_candidates(metadata):
+        if encoded is None and candidate.get(_INT8_SCALES_KEY) is not None:
+            encoded = candidate.get(_INT8_SCALES_KEY)
+        if scheme is None and candidate.get(_INT8_SCHEME_KEY) is not None:
+            scheme = candidate.get(_INT8_SCHEME_KEY)
+    if not encoded:
+        return {}
+    if scheme not in (None, _INT8_SCHEME):
+        raise ValueError(f"Unsupported Chattiori int8 scheme: {scheme}")
+    try:
+        raw = zlib.decompress(base64.b64decode(str(encoded))).decode("utf-8")
+        data = json.loads(raw)
+        return {str(k): float(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception as exc:
+        raise ValueError("Invalid Chattiori int8 scale metadata") from exc
+
+
+def _required_quantization_metadata(metadata: Any) -> dict[str, str]:
+    for candidate in _metadata_candidates(metadata):
+        scales = candidate.get(_INT8_SCALES_KEY)
+        if scales:
+            return {
+                _INT8_SCHEME_KEY: str(candidate.get(_INT8_SCHEME_KEY) or _INT8_SCHEME),
+                _INT8_SCALES_KEY: str(scales),
+            }
+    return {}
+
+
+def _info_dict_without_large_quantization_metadata(info: Any) -> dict[str, Any]:
+    data = info.to_dict()
+    metadata = dict(data.get("metadata") or {})
+    for key in _INT8_METADATA_KEYS:
+        metadata.pop(key, None)
+    data["metadata"] = metadata
+    return data
+
+
+def _quantize_int8_theta(theta: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+    out: dict[str, torch.Tensor] = {}
+    scales: dict[str, float] = {}
+    for key, value in theta.items():
+        value = value.detach()
+        if not value.is_floating_point():
+            out[key] = value.to("cpu").contiguous()
+            continue
+        work = torch.nan_to_num(value.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        max_abs = float(work.abs().max().item()) if work.numel() else 0.0
+        scale = max_abs / 127.0 if max_abs > 0.0 else 1.0
+        quantized = torch.round(work / scale).clamp_(-127, 127).to(torch.int8)
+        out[key] = quantized.to("cpu").contiguous()
+        scales[key] = float(scale)
+    return out, scales
+
+
+def _quantize_int8_theta_inplace(theta: dict[str, torch.Tensor]) -> dict[str, float]:
+    scales: dict[str, float] = {}
+    for key in list(theta.keys()):
+        value = theta[key].detach()
+        if not value.is_floating_point():
+            theta[key] = value.to("cpu").contiguous()
+            continue
+        # Expand only one tensor to fp32 at a time; replacing the entry lets the
+        # previous tensor storage be reclaimed immediately.
+        work = torch.nan_to_num(value.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        max_abs = float(work.abs().max().item()) if work.numel() else 0.0
+        scale = max_abs / 127.0 if max_abs > 0.0 else 1.0
+        theta[key] = torch.round(work / scale).clamp_(-127, 127).to(torch.int8).cpu().contiguous()
+        scales[key] = float(scale)
+        del work
+    return scales
+
+
+def _normalize_int8_compute_dtype(value: Any = None) -> torch.dtype:
+    """Resolve the temporary dtype used while merging Chattiori int8 models."""
+    if isinstance(value, torch.dtype):
+        if value in {torch.float16, torch.bfloat16, torch.float32}:
+            return value
+        raise ValueError(f"Unsupported int8 compute dtype: {value}")
+
+    text = str(value or os.environ.get("CHATTIORI_INT8_COMPUTE_DTYPE", "fp16")).strip().lower()
+    aliases = {
+        "fp16": torch.float16, "float16": torch.float16, "half": torch.float16, "f16": torch.float16,
+        "bf16": torch.bfloat16, "bfloat16": torch.bfloat16, "bhalf": torch.bfloat16,
+        "fp32": torch.float32, "float32": torch.float32, "full": torch.float32, "f32": torch.float32,
+    }
+    if text not in aliases:
+        raise ValueError(f"Unsupported int8 compute precision '{text}'. Use fp16, bf16, or fp32.")
+    return aliases[text]
+
+
+def _dequantize_int8_theta(
+    theta: dict[str, torch.Tensor], metadata: Any, *, device: str = "cpu", dtype: Any = None
+) -> tuple[dict[str, torch.Tensor], bool, bool]:
+    int8_keys = [
+        k for k, v in theta.items()
+        if isinstance(v, torch.Tensor) and v.dtype in {torch.int8, torch.uint8}
+    ]
+    if not int8_keys:
+        return theta, False, False
+    scales = _decode_int8_scales(metadata)
+    used_scales = bool(scales)
+    target_dtype = _normalize_int8_compute_dtype(dtype)
+    out: dict[str, torch.Tensor] = {}
+    for key, value in theta.items():
+        if not isinstance(value, torch.Tensor) or value.dtype not in {torch.int8, torch.uint8}:
+            out[key] = value
+            continue
+        scale = float(scales.get(key, 1.0))
+        out[key] = value.to(device=device, dtype=target_dtype).mul_(scale)
+    return out, True, used_scales
+
 NUM_INPUT_BLOCKS = 12
 NUM_MID_BLOCK = 1
 NUM_OUTPUT_BLOCKS = 12
@@ -35,7 +217,50 @@ BLOCKID = ["BASE"] + [f"IN{i:02}" for i in range(12)] + ["M00"] + [f"OUT{i:02}" 
 BLOCKIDXLL = ["BASE"] + [f"IN{i:02}" for i in range(9)] + ["M00"] + [f"OUT{i:02}" for i in range(9)] + ["VAE"]
 BLOCKIDFLUX = ["CLIP", "T5", "IN"] + ["D{:002}".format(x) for x in range(19)] + ["S{:002}".format(x) for x in range(38)] + ["OUT"] # Len: 61
 BLOCKIDZI = ["BASE","CONT","NOISE"] + [f"L{i:02}" for i in range(30)] + ["VAE"]
-BLOCKIDAM = ["BASE"] + [f"L{i:02}" for i in range(28)] + ["VAE"] # Anima Model has 28 blocks
+
+# Anima family ---------------------------------------------------------------
+# Planner/Base Model remains one unified "Anima" family.  Anima-base has 28
+# DiT blocks while Anima-2.9B expands the same topology to 40 blocks.  The
+# 40-block list is the canonical/superset list exposed to Planner; merge.py
+# chooses BLOCKIDAM28 when the output/base checkpoint is a native 28-block
+# Anima model.
+ANIMA_BASE_BLOCK_COUNT = 28
+ANIMA29_BLOCK_COUNT = 40
+ANIMA_KEY_PREFIXES = ("net.", "model.diffusion_model.")
+ANIMA29_INSERTION_POSITIONS = (2, 5, 8, 11, 14, 17, 21, 24, 27, 30, 33, 36)
+ANIMA29_INSERTED_TO_SOURCE = {
+    2: 1, 5: 3, 8: 5, 11: 7, 14: 9, 17: 11,
+    21: 14, 24: 16, 27: 18, 30: 20, 33: 22, 36: 24,
+}
+ANIMA29_NATIVE_POSITIONS = tuple(i for i in range(ANIMA29_BLOCK_COUNT) if i not in ANIMA29_INSERTION_POSITIONS)
+ANIMA28_TO_40 = {old: new for old, new in enumerate(ANIMA29_NATIVE_POSITIONS)}
+ANIMA40_TO_28 = {new: old for old, new in ANIMA28_TO_40.items()}
+
+BLOCKIDAM28 = ["BASE"] + [f"L{i:02}" for i in range(ANIMA_BASE_BLOCK_COUNT)] + ["VAE"]
+BLOCKIDAM29 = ["BASE"] + [f"L{i:02}" for i in range(ANIMA29_BLOCK_COUNT)] + ["VAE"]
+BLOCKIDAM = BLOCKIDAM29  # canonical Planner-facing Anima block set
+
+# Detection signatures, model_detection.py-style.  Prefixes are intentionally
+# omitted here; detect_arch probes both net. and model.diffusion_model. roots.
+MODEL_DETECTION_KEYS = {
+    "Anima": (
+        "llm_adapter.blocks.0.cross_attn.q_proj.weight",
+        "x_embedder.proj.1.weight",
+    ),
+    "Anima-2.9B": (
+        "llm_adapter.blocks.0.cross_attn.q_proj.weight",
+        "blocks.39.self_attn.q_proj.weight",
+    ),
+    "Krea2": ("txtfusion.projector.weight", "first.weight"),
+    "Flux": ("double_blocks.0.img_attn.norm.key_norm.weight", "img_in.weight"),
+    "ZImage": ("cap_embedder.1.weight", "noise_refiner.0.attention.k_norm.weight"),
+    "SD1.5": ("input_blocks.0.0.weight", "out.2.weight"),
+    "SDXL": ("input_blocks.0.0.weight", "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight"),
+}
+
+# Krea 2 SingleStreamDiT: shared conditioning + 28 transformer blocks.
+# Official Raw/Turbo transformer checkpoints do not embed the Qwen3-VL encoder or VAE.
+BLOCKIDK2 = ["BASE"] + [f"L{i:02}" for i in range(28)]
 
 _re_inp = re.compile(r'\.input_blocks\.(\d+)\.')
 _re_mid = re.compile(r'\.middle_block\.(\d+)\.')
@@ -180,6 +405,13 @@ def make_lblocks_zi():
             f"model.diffusion_model.layers.{i}.",   # model keys
             f"diffusion_model_layers_{i}_",         # if you ever convert to underscore form
         ])
+        if i == 29:
+            lblocks[-1].extend([
+                "all_final_layer.", "diffusion_model.all_final_layer.",
+                "model.diffusion_model.all_final_layer.",
+                "final_layer.", "diffusion_model.final_layer.",
+                "model.diffusion_model.final_layer.",
+            ])
 
     # VAE
     lblocks.append([
@@ -189,10 +421,14 @@ def make_lblocks_zi():
 
     return lblocks
 
-def make_lblocks_am():
+def make_lblocks_am(block_count: int = ANIMA29_BLOCK_COUNT):
     """
-    Order aligns with BLOCKIDAM:
-      BASE, L00..L27, VAE
+    Order aligns with canonical BLOCKIDAM:
+      BASE, L00..L39, VAE
+
+    L00..L27 cover Anima-base; L28..L39 are additionally available for
+    Anima-2.9B.  Normal Anima/2.9B cross-merges are remapped to the output
+    topology before block weighting, so the same family remains compatible.
 
     Supports checkpoint keys:
       - official:   net.* (then normalized)
@@ -238,9 +474,10 @@ def make_lblocks_am():
     ])
 
     # -------------------------
-    # L00..L27 (diffusion blocks)
+    # L00..L39 (diffusion blocks; L28..L39 are Anima-2.9B-only natively)
     # -------------------------
-    for i in range(28):
+    block_count = int(block_count)
+    for i in range(block_count):
         lblocks.append([
             # checkpoint keys
             f"model.diffusion_model.blocks.{i}.",
@@ -266,8 +503,9 @@ def make_lblocks_am():
         "lora_unet_x_embedder", "lora_unet_x_embedder_",  # just in case
     ])
 
-    # Add final_layer into L27 bucket (output-like)
-    lblocks[28].extend([
+    # Add final_layer into L39 bucket (output-like canonical topology).
+    # merge.py uses L27 instead when the output/base model is 28-block Anima.
+    lblocks[block_count].extend([
         "model.diffusion_model.final_layer.", "diffusion_model.final_layer.", "final_layer.",
         "net.final_layer.",
         "model_diffusion_model_final_layer_", "diffusion_model_final_layer_", "net_final_layer_",
@@ -289,11 +527,195 @@ def make_lblocks_am():
     return lblocks
 
 
+def make_lblocks_k2():
+    """Order aligns with BLOCKIDK2: BASE, L00..L27."""
+    lblocks = [[
+        "tmlp.", "tproj.", "txtmlp.", "txtfusion.",
+        "model.diffusion_model.tmlp.", "model.diffusion_model.tproj.",
+        "model.diffusion_model.txtmlp.", "model.diffusion_model.txtfusion.",
+        "lora_transformer_tmlp_", "lora_transformer_tproj_",
+        "lora_transformer_txtmlp_", "lora_transformer_txtfusion_",
+    ]]
+    for i in range(28):
+        lblocks.append([
+            f"blocks.{i}.", f"model.diffusion_model.blocks.{i}.",
+            f"diffusion_model.blocks.{i}.", f"transformer.blocks.{i}.",
+            f"lora_transformer_blocks_{i}_", f"lora_unet_blocks_{i}_",
+            f"blocks_{i}_",
+        ])
+    lblocks[1].extend(["first.", "model.diffusion_model.first.", "diffusion_model.first.", "transformer.first.", "lora_transformer_first_"])
+    lblocks[28].extend(["last.", "model.diffusion_model.last.", "diffusion_model.last.", "transformer.last.", "lora_transformer_last_"])
+    return lblocks
+
+# ---------------------------------------------------------------------
+# Anima / Anima-2.9B compatibility helpers
+# ---------------------------------------------------------------------
+_ANIMA_MAIN_BLOCK_RE = re.compile(
+    r"^(?P<prefix>(?:model\.diffusion_model\.|diffusion_model\.|net\.)?)blocks\.(?P<index>\d+)\.(?P<suffix>.+)$"
+)
+_ANIMA29_ZERO_SUFFIXES = {
+    "adaln_modulation_self_attn.2.weight",
+    "adaln_modulation_cross_attn.2.weight",
+    "adaln_modulation_mlp.2.weight",
+    "self_attn.output_proj.weight",
+    "cross_attn.output_proj.weight",
+    "mlp.layer2.weight",
+}
+
+
+def detect_anima_block_count(theta_or_keys) -> int:
+    """Return the native Anima main-block count visible in a state dict/key set.
+
+    LLM-adapter blocks are intentionally excluded.  Both supported diffusion
+    prefixes (``net.`` and ``model.diffusion_model.``) plus the historical
+    unwrapped forms are accepted.
+    """
+    keys = theta_or_keys.keys() if hasattr(theta_or_keys, "keys") else theta_or_keys
+    idxs = set()
+    for key in keys:
+        m = _ANIMA_MAIN_BLOCK_RE.match(str(key))
+        if m:
+            idxs.add(int(m.group("index")))
+    if not idxs:
+        return 0
+    # Main blocks are contiguous in both Anima variants.  max+1 also works for
+    # partial LoRA packs that include the final/highest block.
+    return max(idxs) + 1
+
+
+def anima_blockids_for_arch(arch: dict) -> list[str]:
+    """Return the output-topology block list while keeping Base Model=Anima."""
+    return BLOCKIDAM29 if bool(arch.get("AM29", False)) else BLOCKIDAM28
+
+
+def anima_lblocks_for_arch(arch: dict):
+    """Return checkpoint/LoRA key buckets matching the native Anima depth."""
+    return LBLOCKS_AM29 if bool(arch.get("AM29", False)) else LBLOCKS_AM28
+
+
+def _anima_rekey_block(key: str, new_index: int) -> str:
+    m = _ANIMA_MAIN_BLOCK_RE.match(key)
+    if not m:
+        return key
+    return f"{m.group('prefix')}blocks.{int(new_index)}.{m.group('suffix')}"
+
+
+def remap_anima_theta(theta: dict, target_block_count: int) -> tuple[dict, dict]:
+    """Map Anima-base <-> Anima-2.9B without changing the family identity.
+
+    28 -> 40 follows the published expansion manifest: original blocks keep
+    their order in the non-inserted slots; each inserted block aliases the
+    specified neighbouring source block except the six residual-output tensors
+    that are materialized as zeros.  Sharing the unchanged tensor objects keeps
+    the compatibility conversion memory-light.
+
+    40 -> 28 drops the inserted slots and restores the original 28-block order.
+    This direction is necessarily lossy because a 28-block output cannot retain
+    the twelve additional trained blocks.
+    """
+    target_block_count = int(target_block_count)
+    source_block_count = detect_anima_block_count(theta)
+    if source_block_count == target_block_count or source_block_count not in {ANIMA_BASE_BLOCK_COUNT, ANIMA29_BLOCK_COUNT}:
+        return theta, {
+            "source_blocks": source_block_count,
+            "target_blocks": target_block_count,
+            "changed": False,
+        }
+    if target_block_count not in {ANIMA_BASE_BLOCK_COUNT, ANIMA29_BLOCK_COUNT}:
+        return theta, {
+            "source_blocks": source_block_count,
+            "target_blocks": target_block_count,
+            "changed": False,
+        }
+
+    non_blocks = {}
+    blocks: dict[int, list[tuple[str, str, Any]]] = {}
+    for key, value in theta.items():
+        m = _ANIMA_MAIN_BLOCK_RE.match(key)
+        if not m:
+            non_blocks[key] = value
+            continue
+        idx = int(m.group("index"))
+        blocks.setdefault(idx, []).append((key, m.group("suffix"), value))
+
+    out = dict(non_blocks)
+    zeroed = 0
+    if source_block_count == ANIMA_BASE_BLOCK_COUNT and target_block_count == ANIMA29_BLOCK_COUNT:
+        # Existing 28 blocks -> their preserved positions in the 40-block model.
+        for old_idx, new_idx in ANIMA28_TO_40.items():
+            for key, _suffix, value in blocks.get(old_idx, ()):
+                out[_anima_rekey_block(key, new_idx)] = value
+
+        # Inserted blocks are deep-copy equivalents at initialization.  For
+        # merge-time reading we can alias unchanged tensors, only allocating the
+        # exact residual-output tensors that the manifest zeroed.
+        for new_idx, old_src_idx in ANIMA29_INSERTED_TO_SOURCE.items():
+            for key, suffix, value in blocks.get(old_src_idx, ()):
+                new_key = _anima_rekey_block(key, new_idx)
+                if suffix in _ANIMA29_ZERO_SUFFIXES and isinstance(value, torch.Tensor):
+                    out[new_key] = torch.zeros_like(value)
+                    zeroed += 1
+                else:
+                    out[new_key] = value
+        direction = "28->40"
+    else:
+        # Recover the original 28-block spine by discarding inserted slots.
+        for new_idx, old_idx in ANIMA40_TO_28.items():
+            for key, _suffix, value in blocks.get(new_idx, ()):
+                out[_anima_rekey_block(key, old_idx)] = value
+        direction = "40->28"
+
+    return out, {
+        "source_blocks": source_block_count,
+        "target_blocks": target_block_count,
+        "changed": True,
+        "direction": direction,
+        "zeroed_tensors": zeroed,
+    }
+
+
+def remap_anima_weights(weights, target_block_count: int):
+    """Map legacy/canonical Anima block weights by manifest positions, not interpolation."""
+    if weights is None:
+        return None
+    w = list(weights)
+    target_block_count = int(target_block_count)
+    target_len = target_block_count + 1  # main blocks + VAE (BASE is scalar alpha)
+    if len(w) == target_len:
+        return w
+
+    # Legacy Anima: L00..L27 + VAE -> canonical 2.9B L00..L39 + VAE.
+    if len(w) == ANIMA_BASE_BLOCK_COUNT + 1 and target_block_count == ANIMA29_BLOCK_COUNT:
+        old_layers, vae = w[:-1], w[-1]
+        new_layers = [0.0] * ANIMA29_BLOCK_COUNT
+        for old_idx, new_idx in ANIMA28_TO_40.items():
+            new_layers[new_idx] = old_layers[old_idx]
+        for new_idx, old_src_idx in ANIMA29_INSERTED_TO_SOURCE.items():
+            new_layers[new_idx] = old_layers[old_src_idx]
+        return new_layers + [vae]
+
+    # Canonical/superset Anima: select the original spine for a 28-block output.
+    if len(w) == ANIMA29_BLOCK_COUNT + 1 and target_block_count == ANIMA_BASE_BLOCK_COUNT:
+        layers40, vae = w[:-1], w[-1]
+        layers28 = [layers40[ANIMA28_TO_40[i]] for i in range(ANIMA_BASE_BLOCK_COUNT)]
+        return layers28 + [vae]
+
+    # Preserve previous permissive behaviour for unusual presets.
+    if not w:
+        return [0.0] * target_len
+    x0 = np.arange(len(w))
+    x1 = np.linspace(0, len(w) - 1, target_len)
+    return np.interp(x1, x0, np.asarray(w, dtype=np.float64)).tolist()
+
+
 # Convenient ready-to-use constants
 LBLOCKS_SDXL = make_lblocks_sdxl()
 LBLOCKS_FLUX = make_lblocks_flux()
 LBLOCKS_ZI   = make_lblocks_zi()
-LBLOCKS_AM = make_lblocks_am()
+LBLOCKS_AM28 = make_lblocks_am(ANIMA_BASE_BLOCK_COUNT)
+LBLOCKS_AM29 = make_lblocks_am(ANIMA29_BLOCK_COUNT)
+LBLOCKS_AM = LBLOCKS_AM29
+LBLOCKS_K2 = make_lblocks_k2()
 
 LBLOCKS26 = [
     "encoder",
@@ -736,6 +1158,24 @@ def detect_arch(theta):
     keys = list(theta.keys())
 
     # -------------------------
+    # Krea 2 detection
+    # Official SingleStreamDiT checkpoints expose first.*, blocks.0..27.*,
+    # txtfusion.projector.* and last.*.  Prefixes used by wrapper checkpoints
+    # (model.diffusion_model./diffusion_model./transformer.) are accepted too.
+    # -------------------------
+    def _strip_krea2_prefix(k: str) -> str:
+        for prefix in ("model.diffusion_model.", "diffusion_model.", "transformer."):
+            if k.startswith(prefix):
+                return k[len(prefix):]
+        return k
+
+    krea2_roots = [_strip_krea2_prefix(k) for k in keys]
+    has_krea2_projector = any(k == "txtfusion.projector.weight" for k in krea2_roots)
+    has_krea2_first = any(k == "first.weight" for k in krea2_roots)
+    has_krea2_attn = any(re.match(r"^blocks\.\d+\.attn\.w[qkvo]\.weight$", k) for k in krea2_roots)
+    isk2 = bool(has_krea2_projector and (has_krea2_first or has_krea2_attn))
+
+    # -------------------------
     # Anima (AM) detection
     # -------------------------
     def _is_am_key(k: str) -> bool:
@@ -760,12 +1200,27 @@ def detect_arch(theta):
             return True
         return False
 
-    isam = any(_is_am_key(k) for k in keys)
+    # ComfyUI model_detection.py uses the LLM-adapter q_proj as the Anima
+    # family signature and derives depth by counting blocks.  Mirror that
+    # behaviour while accepting both requested key roots.
+    # Primary supported roots.  Historical unwrapped/diffusion_model roots stay
+    # as read-compatibility fallbacks, but new detection is defined by these two.
+    _am_prefixes = ANIMA_KEY_PREFIXES + ("diffusion_model.", "")
+    def _am_has(suffix: str) -> bool:
+        return any((prefix + suffix) in theta for prefix in _am_prefixes)
+
+    has_am_signature = (
+        _am_has("llm_adapter.blocks.0.cross_attn.q_proj.weight")
+        and _am_has("x_embedder.proj.1.weight")
+    )
+    isam = (not isk2) and (has_am_signature or any(_is_am_key(k) for k in keys))
+    am_block_count = detect_anima_block_count(keys) if isam else 0
+    isam29 = bool(isam and am_block_count >= ANIMA29_BLOCK_COUNT)
 
     # -------------------------
     # Z-Image (ZI) detection (avoid x_embedder/t_embedder false positives)
     # -------------------------
-    iszi = (not isam) and (
+    iszi = (not isk2) and (not isam) and (
         ("model.diffusion_model.cap_embedder.0.weight" in theta) or
         ("cap_embedder.0.weight" in theta) or
         any(k.startswith(("model.diffusion_model.layers.", "diffusion_model.layers.", "layers.")) for k in keys) or
@@ -776,13 +1231,15 @@ def detect_arch(theta):
     isxl = ("conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight" in theta)
 
     # Flux detection (keep both keys for compatibility)
-    isflux = any(("double_blocks" in k) or ("double_block" in k) or ("single_blocks" in k) or ("single_block" in k) for k in keys)
+    isflux = (not isk2) and any(("double_blocks" in k) or ("double_block" in k) or ("single_blocks" in k) or ("single_block" in k) for k in keys)
 
     arch = {
         "XL":   bool(isxl),
         "FLUX": bool(isflux),
         "ZI":   bool(iszi),
         "AM":   bool(isam),
+        "AM29": bool(isam29),
+        "K2":   bool(isk2),
     }
 
     # -------------------------
@@ -796,7 +1253,7 @@ def detect_arch(theta):
             if k.startswith("diffusion_model."):
                 return "model." + k
 
-            if k.startswith(("layers.", "context_refiner.", "noise_refiner.", "final_layer.", "cap_embedder.")):
+            if k.startswith(("layers.", "context_refiner.", "noise_refiner.", "final_layer.", "all_final_layer.", "cap_embedder.")):
                 return "model.diffusion_model." + k
 
             return k
@@ -924,13 +1381,13 @@ def _digits_concat(s: str) -> str:
     return "".join(ch for ch in s if ch.isdigit())
 
 @lru_cache(maxsize=250_000)
-def _blockfromkey_cached_flags(key: str, xl: bool, flux: bool, zi: bool, am: bool) -> Tuple[str, str]:
-    arch = {"XL": bool(xl), "FLUX": bool(flux), "ZI": bool(zi), "AM": bool(am)}
+def _blockfromkey_cached_flags(key: str, xl: bool, flux: bool, zi: bool, am: bool, am29: bool, k2: bool) -> Tuple[str, str]:
+    arch = {"XL": bool(xl), "FLUX": bool(flux), "ZI": bool(zi), "AM": bool(am), "AM29": bool(am29), "K2": bool(k2)}
 
     # -------------------------
-    # SD1.5 / SD2.x (non-XL/non-Flux/non-ZI/non-AM)
+    # SD1.5 / SD2.x (non-XL/non-Flux/non-ZI/non-AM/non-K2)
     # -------------------------
-    if not (arch["XL"] or arch["FLUX"] or arch["ZI"] or arch["AM"]):
+    if not (arch["XL"] or arch["FLUX"] or arch["ZI"] or arch["AM"] or arch["K2"]):
         if "time_embed" in key:
             idx = -2
         elif ".out." in key:
@@ -1041,6 +1498,36 @@ def _blockfromkey_cached_flags(key: str, xl: bool, flux: bool, zi: bool, am: boo
         return "Not Merge", "Not Merge"
 
     # -------------------------
+    # Krea 2 SingleStreamDiT
+    # -------------------------
+    if arch.get("K2", False):
+        # Block-local weights dominate the model.  Wrapper prefixes are
+        # intentionally ignored because _parse_int_after works anywhere.
+        li = _parse_int_after(key, "blocks.")
+        if li is not None and 0 <= li < 28:
+            tag = f"L{li:02d}"
+            return tag, tag
+
+        kl = key.lower()
+        # Input/output projections are coupled to the edge blocks.
+        stripped = key
+        for prefix in ("model.diffusion_model.", "diffusion_model.", "transformer."):
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix):]
+                break
+        if stripped.startswith("first."):
+            return "L00", "L00"
+        if stripped.startswith("last."):
+            return "L27", "L27"
+        if stripped.startswith(("tmlp.", "tproj.", "txtmlp.", "txtfusion.")):
+            return "BASE", "BASE"
+        # Optional wrapper companions are not part of the official Krea2
+        # transformer block layout and therefore stay outside block merge.
+        if kl.startswith(("vae.", "first_stage_model.", "text_encoder.", "text_encoders.", "qwen3_vl.")):
+            return "Not Merge", "Not Merge"
+        return "Not Merge", "Not Merge"
+
+    # -------------------------
     # Anima (AM)
     # -------------------------
     if arch.get("AM", False):
@@ -1050,17 +1537,24 @@ def _blockfromkey_cached_flags(key: str, xl: bool, flux: bool, zi: bool, am: boo
         if "vae" in key or key.startswith("first_stage_model."):
             return "VAE", "VAE"
 
+        block_count = ANIMA29_BLOCK_COUNT if arch.get("AM29", False) else ANIMA_BASE_BLOCK_COUNT
+
+        # Conditioning-side modules must be classified before the generic
+        # ``blocks.N`` parser: llm_adapter.blocks.0..5 are adapter blocks, not
+        # the main Anima DiT L00..L05 layers.
+        if any(s in key for s in ("t_embedder", "t_embedding_norm", "pos_embedder", "llm_adapter")):
+            return "BASE", "BASE"
+
         li = _parse_int_after(key, "blocks.")
-        if li is not None and 0 <= li < 28:
+        if li is not None and 0 <= li < block_count:
             tag = f"L{li:02d}"
             return tag, tag
 
         if "x_embedder" in key:
             return "L00", "L00"
         if "final_layer" in key:
-            return "L27", "L27"
-        if any(s in key for s in ("t_embedder", "t_embedding_norm", "pos_embedder", "llm_adapter")):
-            return "BASE", "BASE"
+            tag = f"L{block_count - 1:02d}"
+            return tag, tag
 
         return "Not Merge", "Not Merge"
 
@@ -1080,7 +1574,8 @@ def _blockfromkey_cached_flags(key: str, xl: bool, flux: bool, zi: bool, am: boo
             return "L29", "L29"
 
         if "model.diffusion_model" in key:
-            if "model.diffusion_model.final_layer" in key:
+            if ("model.diffusion_model.final_layer" in key or
+                    "model.diffusion_model.all_final_layer" in key):
                 return "L29", "L29"
             if "model.diffusion_model.context_refiner" in key:
                 return "CONT", "CONT"
@@ -1102,7 +1597,9 @@ def blockfromkey(key: str, arch: dict) -> Tuple[str, str]:
     flux = bool(arch.get("FLUX", False) or arch.get("Flux", False))
     zi   = bool(arch.get("ZI", False))
     am   = bool(arch.get("AM", False))
-    return _blockfromkey_cached_flags(key, xl, flux, zi, am)
+    am29 = bool(arch.get("AM29", False))
+    k2   = bool(arch.get("K2", False) or arch.get("Krea2", False))
+    return _blockfromkey_cached_flags(key, xl, flux, zi, am, am29, k2)
 
 EXTRA_ELEM_TAGS = ("LABEL", "TIME", "OUT", "CLIP", "CLIP-L", "CLIP-G", "T5")
 
@@ -1350,6 +1847,22 @@ def _component_prefix_map(arch: dict) -> dict[str, list[str]]:
             "clip-g":      ["cap_embedder.", "model.diffusion_model.cap_embedder."],
         }
         
+    if arch.get("K2", False):
+        roots = ("first.", "blocks.", "tmlp.", "tproj.", "txtmlp.", "txtfusion.", "last.")
+        prefixes = []
+        for wrapper in ("", "model.diffusion_model.", "diffusion_model.", "transformer."):
+            prefixes.extend(wrapper + root for root in roots)
+        return {
+            "unet":        list(prefixes),
+            "transformer": list(prefixes),
+            "vae":         ["vae.", "first_stage_model.", "model.vae."],
+            "text":        ["text_encoder.", "text_encoders.", "qwen3_vl.", "conditioner."],
+            "text2":       [],
+            "clip":        ["text_encoder.", "text_encoders.", "qwen3_vl.", "conditioner."],
+            "clip-l":      [],
+            "clip-g":      [],
+        }
+
     if arch.get("AM", False):
         return {
             "unet":        ["model.diffusion_model."],
@@ -2678,9 +3191,12 @@ def _model_stem(path: str) -> str:
     return os.path.splitext(os.path.basename(path))[0]
 
 
-def _load_umodel(path: str, *, name: str | None = None, device: str = "cpu", model_type: str = "checkpoint", verify_hash: bool = True, cache_path: str | None = None) -> UnifiedModel:
+def _load_umodel(path: str, *, name: str | None = None, device: str = "cpu", model_type: str = "checkpoint", verify_hash: bool = True, cache_path: str | None = None, int8_compute_dtype=None) -> UnifiedModel:
     from model import UnifiedModel
-    return UnifiedModel.from_file(path, name=name, device=device, model_type=model_type, verify_hash=verify_hash, cache_path=cache_path)
+    return UnifiedModel.from_file(
+        path, name=name, device=device, model_type=model_type, verify_hash=verify_hash,
+        cache_path=cache_path, int8_compute_dtype=int8_compute_dtype
+    )
 
 
 def _clone_info(src: UnifiedModel | None, *, name: str | None = None, path: str | None = None) -> ModelInfo:
@@ -2727,6 +3243,7 @@ def _save_umodel(model: UnifiedModel, path: str, *, args, metadata: dict | None 
         save_half=bool(args.save_half),
         save_quarter=bool(args.save_quarter),
         save_bhalf=bool(args.save_bhalf),
+        save_int8=bool(getattr(args, "save_int8", False)),
         prune=bool(args.prune),
         args=args,
     )

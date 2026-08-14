@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -91,7 +92,7 @@ def multiply_difference(theta0, theta1, theta2, alpha, beta):
 
 
 _SIM_SCRATCH = OrderedDict()
-_SIM_MAX_SCRATCH = 64
+_SIM_MAX_SCRATCH = max(1, int(os.environ.get("CHATTIORI_SIM_SCRATCH_CACHE", "4") or 4))
 
 def _sim_buf(device, dtype, shape):
     key = (str(device), dtype, tuple(shape))
@@ -349,7 +350,6 @@ theta_funcs = {
     "GEO":  (None,           geometric,                  "Geometric"),
     "MAX":  (None,           weight_max,                 "Max"),
     "DARE": (None,           dare_merge,                 "DARE"),
-    "XDARE":(None,           dare_merge,                 "CLIP XOR DARE"),
     "ORTHO":(None,           ortho_merge,                "Orthogonalized Delta"),
     "SPRSE":(None,           sparse_topk,                "Sparse Top-k Delta"),
     "NORM": (None,           norm_dir_blend,             "Norm/Direction Split"),
@@ -357,9 +357,8 @@ theta_funcs = {
     "FREQ": (None,           freq_band_blend,            "Frequency-Band Blend"),
     "SWAP": (None,           None,                       "Swap Components"),
     "COMP": (None,           None,                       "Save Components (model0 only)"),
-    "CLIPXOR": (None,        None,                       "CLIP XOR (union-minus-intersection)"),
     "FWM":  (None,           feature_weighted_merge,     "Feature Weighted Merge"),
     "TF":  (None,            None,                       "Trim and Fill"),
 }
 modes_need_m2   = {"sAD", "AD", "TRS", "ST",  "TD", "SIM", "MD", "HUB"}
-modes_need_beta = {"TRS", "ST", "TS",  "SIM", "MD", "DARE", "XDARE", "CHAN", "FREQ", "SPRSE"}
+modes_need_beta = {"TRS", "ST", "TS",  "SIM", "MD", "DARE", "CHAN", "FREQ", "SPRSE"}

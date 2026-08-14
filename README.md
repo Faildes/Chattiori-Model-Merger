@@ -11,7 +11,7 @@ Supports **`.ckpt`** and **`.safetensors`**. Runs on **CPU by default** (GPU opt
 - ✅ **Cosine structure modes** (`--cosine0/1/2`) to keep one model’s **structure** while blending **details** from others  
 - ✅ Block-weighted / Elemental ratios, plus random ratio samplers  
 - ✅ Extra modes: orthogonal delta, sparse top-k, channel-wise cosine gate, frequency-band mix, etc.  
-- ✅ VAE bake-in, pruning, EMA keep, fp16/fp8 saving, rich metadata
+- ✅ VAE bake-in, pruning, EMA keep, fp16/fp8/int8 saving, rich metadata
 
 ---
 
@@ -20,7 +20,7 @@ Supports **`.ckpt`** and **`.safetensors`**. Runs on **CPU by default** (GPU opt
 - **Architectures:** SD 1.x / 2.x / XL / Flux.1 / Z-Image / Anima (via `detect_arch`)
 - **Checkpoints:** `.ckpt` (PyTorch) and `.safetensors`
 - **VAE:** Optional bake-in with `--vae`
-- **DTypes:** fp32 (default), **fp16** (`--save_half`), **fp8** (`--save_quarter`, experimental)
+- **DTypes:** `--save_precision <value>` with canonical values **fp32** (default), **fp16**, **bf16**, **fp8** (experimental), and **int8** (per-tensor symmetric quantization). Aliases such as `half`, `float16`, `bhalf`, `float8`, `full`, and `i8` are accepted.
 
 ---
 
@@ -51,9 +51,24 @@ Pick one `mode` (first positional arg). Some require a third model or `beta`.
 | `CHAN` | Channel-wise Cosine Gate     |   ✓    |      ✗       | Gate per output channel (Conv/Linear) |
 | `FREQ` | Frequency-Band Blend         |   ✓    |      ✗       | Low/high-freq mix for Conv kernels |
 | `SWAP` | Swap Component         |   ✗    |      ✗       | Swap the component like CLIP |
-| `CLIPXOR` | CLIP XOR Blend         |   ✗    |      ✗       | Extending CLIPs using XOR Blend |
-| `XDARE` | XOR CLIP DARE         |   ✗    |      ✓       | DARE Merge + CLIPXOR |
 | `FWM` | Feature Weighted Merge         |   ✗    |      ✗       | True merges between different base model, same architecture |
+
+### CLIPXOR as an option
+
+CLIPXOR is no longer a standalone merge mode. Add `--clipxor` to any normal mode to run the CLIPXOR text-encoder pass before that merge. The old `CLIPXOR` and `XDARE` mode names are accepted as deprecated compatibility aliases and are normalized to `NoIn --clipxor` and `DARE --clipxor`.
+
+```bash
+python merge.py WS models A.safetensors B.safetensors --alpha 0.45 --clipxor --output ws_clipxor --save_safetensors
+python merge.py DARE models A.safetensors B.safetensors --alpha 0.5 --beta 0.2 --clipxor --output dare_clipxor --save_safetensors
+```
+
+### Component-only output
+
+Use repeatable `--save-component` values, or a comma-separated list, to save only selected portions of the result. Supported values are `unet`, `vae`, `clip`, `clip-l`, `clip-g`, `transformer`, `text`, `text2`, and `all`.
+
+```bash
+python merge.py WS models A.safetensors B.safetensors --alpha 0.5 --save-component unet,clip --output components --save_safetensors
+```
 
 ---
 
@@ -110,7 +125,7 @@ mode model_path model_0 model_1
 - I/O & formats:
   - `--vae <path>` bake into `first_stage_model.*`
   - `--save_safetensors` (otherwise saves `.ckpt`)
-  - `--save_half` (fp16), `--save_quarter` (fp8, experimental)
+  - `--save_precision <precision>` selects `fp32`, `fp16`, `bf16`, `fp8`, or `int8`. Accepted aliases include `full`/`float32`, `half`/`float16`, `bhalf`/`bfloat16`, `quarter`/`float8`, and `i8`.
   - `--output <name>` output filename (no extension), `--force` to overwrite/autoname
   - `--delete_source` delete source checkpoints after saving
   - `--no_metadata` save without metadata
@@ -131,7 +146,7 @@ mode model_path model_0 model_1
 
 ### 1) Simple weighted sum (2 models)
 ```bash
-python merge.py WS models "A.safetensors" "B.safetensors"   --alpha 0.45 --output merged_ws --save_safetensors --save_half
+python merge.py WS models "A.safetensors" "B.safetensors"   --alpha 0.45 --output merged_ws --save_safetensors --save_precision fp16
 ```
 
 ### 2) Cosine structure: keep model1’s structure, inject model0 details
@@ -170,7 +185,7 @@ python merge.py RM models "A.safetensors" --output meta_dump
 
 - **VAE bake:** `--vae path/to/vae.safetensors` replaces `first_stage_model.*`
 - **Pruning:** `--prune` (with `--keep_ema`) to slim the checkpoint; architecture-aware
-- **DTypes:** `--save_half` (fp16) is widely supported; `--save_quarter` (fp8) is experimental
+- **DTypes:** use `--save_precision fp16`, `bf16`, `fp8`, `int8`, or `fp32`. FP8 remains experimental; INT8 stores symmetric per-tensor scales for automatic dequantization on load. Friendly aliases such as `half`, `bhalf`, `quarter`, `i8`, and `full` are normalized automatically.
 
 ---
 

@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import copy
-import hashlib
+import gc
 import json
 import os
-import shutil
-import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional, Protocol
+from typing import Any, Optional
 
 import torch
 
@@ -21,6 +18,24 @@ try:
 except Exception:  # pragma: no cover
     safetensors = None
     safe_open = None
+
+# -----------------------------------------------------------------------------
+# Shared quantization helpers
+# -----------------------------------------------------------------------------
+
+from Utils import (
+    _INT8_METADATA_KEYS,
+    _INT8_SCALES_KEY,
+    _INT8_SCHEME,
+    _INT8_SCHEME_KEY,
+    _dequantize_int8_theta,
+    _encode_int8_scales,
+    _info_dict_without_large_quantization_metadata,
+    _normalize_int8_compute_dtype,
+    _quantize_int8_theta,
+    _quantize_int8_theta_inplace,
+    _required_quantization_metadata,
+)
 
 # -----------------------------------------------------------------------------
 # Optional project-local helpers
@@ -117,7 +132,7 @@ class ModelInfo:
             else:
                 base[str(k)] = json.dumps(v, ensure_ascii=False)
 
-        base["unified_model_info"] = json.dumps(self.to_dict(), ensure_ascii=False)
+        base["unified_model_info"] = json.dumps(_info_dict_without_large_quantization_metadata(self), ensure_ascii=False)
         if self.model_type is not None:
             base.setdefault("model_type", str(self.model_type))
         if self.format is not None:
@@ -152,6 +167,7 @@ class UnifiedModel:
         model_type: Optional[str] = None,
         verify_hash: bool = True,
         cache_path: str | None = None,
+        int8_compute_dtype: Any = None,
     ) -> "UnifiedModel":
         model = cls(info=ModelInfo(path=_normalize_path(path)))
         if cache_path is not None:
@@ -162,6 +178,7 @@ class UnifiedModel:
             model_type=model_type,
             verify_hash=verify_hash,
             cache_path=cache_path,
+            int8_compute_dtype=int8_compute_dtype,
         )
 
     @classmethod
@@ -259,6 +276,29 @@ class UnifiedModel:
         return len(self.theta)
 
     @property
+    def has_tensors(self) -> bool:
+        """True while this model still owns a non-empty state dict.
+
+        Tensor payloads are released by clearing the state dict instead of
+        deleting the ``theta`` attribute.  Keeping the attribute stable avoids
+        late AttributeError crashes in common cleanup/remerge paths.
+        """
+        return isinstance(self.theta, dict) and bool(self.theta)
+
+    def release_tensors(self) -> None:
+        """Release tensor references without invalidating the UnifiedModel.
+
+        Do not ``del model.theta``.  A UnifiedModel is passed through several
+        shared merge/cleanup branches and those branches are allowed to inspect
+        ``theta`` after a payload has been consumed.  Clearing the dict releases
+        tensor storage while preserving the object's structural contract.
+        """
+        theta = getattr(self, "theta", None)
+        if isinstance(theta, dict):
+            theta.clear()
+        self.theta = {}
+
+    @property
     def num_parameters(self) -> int:
         return int(sum(int(v.numel()) for v in self.theta.values() if isinstance(v, torch.Tensor)))
 
@@ -310,6 +350,7 @@ class UnifiedModel:
         model_type: Optional[str] = None,
         verify_hash: bool = True,
         cache_path: str | None = None,
+        int8_compute_dtype: Any = None,
     ) -> "UnifiedModel":
         if not self.info.path:
             raise ValueError("ModelInfo.path is not set")
@@ -326,6 +367,23 @@ class UnifiedModel:
             raise ValueError(f"Unsupported format: {self.info.format}")
 
         self.theta = _sanitize_theta(self.theta, device=device)
+        source_int8 = any(
+            isinstance(v, torch.Tensor) and v.dtype in {torch.int8, torch.uint8}
+            for v in self.theta.values()
+        )
+        if source_int8:
+            target_dtype = _normalize_int8_compute_dtype(int8_compute_dtype)
+            self.theta, _, used_scales = _dequantize_int8_theta(
+                self.theta, self.info.metadata, device=device, dtype=target_dtype
+            )
+            self.info.extra_info["int8_compute_dtype"] = str(target_dtype).replace("torch.", "")
+            self.info.extra_info["source_quantization"] = "int8"
+            self.info.extra_info["int8_scale_metadata"] = bool(used_scales)
+            if not used_scales:
+                self.info.extra_info["int8_warning"] = (
+                    "No Chattiori scale metadata was found; raw integer values were cast without dequantization scales."
+                )
+                print(f"[int8] Scale metadata not found; raw int8 values were cast to {target_dtype} without scales.")
         if _upcast_fp8_state_dict_impl is not None and self.theta:
             self.theta = _upcast_fp8_state_dict_impl(self.theta)
             
@@ -348,6 +406,7 @@ class UnifiedModel:
         save_half: bool = False,
         save_quarter: bool = False,
         save_bhalf: bool = False,
+        save_int8: bool = False,
         prune: bool = False,
         args: Any = None,
         cache_path: str | None = None,
@@ -359,23 +418,33 @@ class UnifiedModel:
         out_format = format or _infer_format_from_path(out_path)
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
+        # The merge subprocess exits after saving, so prepare the state dict in
+        # place.  This avoids holding a complete cloned model alongside the
+        # precision-converted output at the RAM peak.
         prepared = self.prepare_for_save(
             save_half=save_half,
             save_quarter=save_quarter,
             save_bhalf=save_bhalf,
+            save_int8=save_int8,
             prune=prune,
             args=args,
+            in_place=True,
         )
-        
+
         print(f"Saving as {name or out_path.split('/')[-1]}...")
 
-        if out_format == "ckpt":
-            self._save_ckpt(out_path, prepared, no_metadata=no_metadata)
-        elif out_format == "safetensors":
-            self._save_safetensors(out_path, prepared, no_metadata=no_metadata)
-        else:
-            raise ValueError(f"Unsupported save format: {out_format}")
-        
+        try:
+            if out_format == "ckpt":
+                self._save_ckpt(out_path, prepared, no_metadata=no_metadata)
+            elif out_format == "safetensors":
+                self._save_safetensors(out_path, prepared, no_metadata=no_metadata)
+            else:
+                raise ValueError(f"Unsupported save format: {out_format}")
+        finally:
+            # Drop saver temporaries promptly.  prepared is self.theta for the
+            # in-place path, so do not clear the state dict itself here.
+            gc.collect()
+
         if cache_path is not None:
             self.info.extra_info["cache_path"] = _normalize_path(cache_path)
         else:
@@ -393,41 +462,80 @@ class UnifiedModel:
         save_half: bool = False,
         save_quarter: bool = False,
         save_bhalf: bool = False,
+        save_int8: bool = False,
         prune: bool = False,
         args: Any = None,
+        in_place: bool = False,
     ) -> dict[str, torch.Tensor]:
-        theta = _clone_theta(self.theta)
+        # Container-only copy by default.  The old implementation cloned every
+        # tensor, doubling model memory before any save conversion occurred.
+        theta = self.theta if in_place else dict(self.theta)
+
+        # Remove stale format metadata before preparing a different precision.
+        for key in _INT8_METADATA_KEYS:
+            self.info.metadata.pop(key, None)
 
         if self.is_lora:
-            theta = _cast_theta(theta, save_half=save_half, save_quarter=save_quarter, save_bhalf=save_bhalf)
-            theta = _make_theta_cpu_contiguous(theta)
-            return theta
+            if in_place:
+                theta = _cast_theta_inplace(
+                    theta, save_half=save_half, save_quarter=save_quarter,
+                    save_bhalf=save_bhalf
+                )
+                theta = _make_theta_cpu_contiguous_inplace(theta)
+            else:
+                theta = _cast_theta(
+                    theta, save_half=save_half, save_quarter=save_quarter,
+                    save_bhalf=save_bhalf, save_int8=False
+                )
+                theta = _make_theta_cpu_contiguous(theta)
+        else:
+            arch = dict(self.info.arch or {})
+            if (not arch) and self.theta:
+                arch = _infer_arch(self.theta, model_type=self.info.model_type)[0]
 
-        arch = dict(self.info.arch or {})
-        if (not arch) and self.theta:
-            arch = _infer_arch(self.theta, model_type=self.info.model_type)[0]
+            vae_prefix = _guess_vae_prefix(arch)
 
-        vae_prefix = _guess_vae_prefix(arch)
+            if _prepare_state_dict_for_save_impl is not None:
+                local_args = args or SimpleNamespace(
+                    save_half=save_half,
+                    save_quarter=save_quarter,
+                    save_bhalf=save_bhalf,
+                    save_int8=save_int8,
+                    prune=prune,
+                )
+                theta = _prepare_state_dict_for_save_impl(
+                    theta,
+                    args=local_args,
+                    arch=arch,
+                    vae_prefix=vae_prefix,
+                    prune=bool(prune),
+                    make_cpu=True,
+                    make_contiguous=True,
+                )
+            else:
+                if in_place:
+                    theta = _cast_theta_inplace(
+                        theta, save_half=save_half, save_quarter=save_quarter,
+                        save_bhalf=save_bhalf
+                    )
+                    theta = _make_theta_cpu_contiguous_inplace(theta)
+                else:
+                    theta = _cast_theta(
+                        theta, save_half=save_half, save_quarter=save_quarter,
+                        save_bhalf=save_bhalf, save_int8=False
+                    )
+                    theta = _make_theta_cpu_contiguous(theta)
 
-        if _prepare_state_dict_for_save_impl is not None:
-            local_args = args or SimpleNamespace(
-                save_half=save_half,
-                save_quarter=save_quarter,
-                save_bhalf=save_bhalf,
-                prune=prune,
-            )
-            return _prepare_state_dict_for_save_impl(
-                theta,
-                args=local_args,
-                arch=arch,
-                vae_prefix=vae_prefix,
-                prune=bool(prune),
-                make_cpu=True,
-                make_contiguous=True,
-            )
-
-        theta = _cast_theta(theta, save_half=save_half, save_quarter=save_quarter, save_bhalf=save_bhalf)
-        theta = _make_theta_cpu_contiguous(theta)
+        if save_int8:
+            if in_place:
+                scales = _quantize_int8_theta_inplace(theta)
+            else:
+                theta, scales = _quantize_int8_theta(theta)
+            self.info.metadata[_INT8_SCHEME_KEY] = _INT8_SCHEME
+            self.info.metadata[_INT8_SCALES_KEY] = _encode_int8_scales(scales)
+            self.info.quantization = "int8"
+        else:
+            self.info.quantization = _infer_quantization(theta)
         return theta
 
     def refresh_info(
@@ -543,9 +651,13 @@ class UnifiedModel:
         no_metadata: bool,
     ) -> None:
         payload: dict[str, Any] = {"state_dict": theta}
+        required_metadata = _required_quantization_metadata(self.info.metadata)
         if not no_metadata:
-            payload["metadata"] = self.info.to_dict()
+            payload["metadata"] = _info_dict_without_large_quantization_metadata(self.info)
             payload.update({k: v for k, v in self.info.metadata.items() if k != "state_dict"})
+        elif required_metadata:
+            # Scale data is part of the int8 storage format, not descriptive metadata.
+            payload.update(required_metadata)
         torch.save(payload, path, _use_new_zipfile_serialization=False)
 
     def _save_safetensors(
@@ -558,7 +670,10 @@ class UnifiedModel:
         if safetensors is None:
             raise ImportError("safetensors is not installed")
 
-        metadata = None if no_metadata else self.info.to_safetensors_metadata()
+        if no_metadata:
+            metadata = _required_quantization_metadata(self.info.metadata) or None
+        else:
+            metadata = self.info.to_safetensors_metadata()
         safetensors.torch.save_file(theta, path, metadata=metadata)
 
 
@@ -616,12 +731,47 @@ def _make_theta_cpu_contiguous(theta: dict[str, torch.Tensor]) -> dict[str, torc
     return out
 
 
+def _make_theta_cpu_contiguous_inplace(theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    for key in list(theta.keys()):
+        value = theta[key]
+        theta[key] = value.detach().to("cpu").contiguous()
+    return theta
+
+
+def _cast_theta_inplace(
+    theta: dict[str, torch.Tensor],
+    *,
+    save_half: bool = False,
+    save_quarter: bool = False,
+    save_bhalf: bool = False,
+) -> dict[str, torch.Tensor]:
+    quarter_dtype = getattr(torch, "float8_e4m3fn", None)
+    use_quarter = bool(save_quarter and quarter_dtype is not None)
+    for key in list(theta.keys()):
+        value = theta[key]
+        if not isinstance(value, torch.Tensor):
+            continue
+        if not value.is_floating_point():
+            theta[key] = value.detach()
+        elif use_quarter:
+            theta[key] = value.detach().to(dtype=quarter_dtype)
+        elif save_bhalf:
+            theta[key] = value.detach().to(dtype=torch.bfloat16)
+        elif save_half:
+            theta[key] = value.detach().to(dtype=torch.float16)
+        else:
+            theta[key] = value.detach()
+    return theta
+
+
+
 def _cast_theta(
     theta: dict[str, torch.Tensor],
     *,
     save_half: bool = False,
     save_quarter: bool = False,
     save_bhalf: bool = False,
+    save_int8: bool = False,
 ) -> dict[str, torch.Tensor]:
     out: dict[str, torch.Tensor] = {}
 
@@ -658,6 +808,8 @@ def _infer_quantization(theta: dict[str, torch.Tensor]) -> Optional[str]:
     dtypes = {str(v.dtype).replace("torch.", "") for v in theta.values() if isinstance(v, torch.Tensor)}
     if not dtypes:
         return None
+    if "int8" in dtypes or "uint8" in dtypes:
+        return "int8"
     if any(dt.startswith("float8") for dt in dtypes):
         return "fp8"
     if dtypes == {"float16"}:
@@ -717,6 +869,8 @@ def _fallback_arch(theta: dict[str, torch.Tensor], *, model_type: Optional[str])
         "FLUX": False,
         "ZI": False,
         "AM": False,
+        "AM29": False,
+        "K2": False,
     }
 
     if any("conditioner.embedders" in k or "text_encoders.clip_g" in k for k in keys):
@@ -737,12 +891,24 @@ def _fallback_arch(theta: dict[str, torch.Tensor], *, model_type: Optional[str])
     if any("cap_embedder" in k for k in keys):
         arch["ZI"] = True
 
+    # Krea 2 SingleStreamDiT detection (official Raw/Turbo and common wrappers).
+    def _k2strip(k: str) -> str:
+        for prefix in ("model.diffusion_model.", "diffusion_model.", "transformer."):
+            if k.startswith(prefix):
+                return k[len(prefix):]
+        return k
+    k2keys = [_k2strip(k) for k in keys]
+    if ("txtfusion.projector.weight" in k2keys) and (
+        "first.weight" in k2keys or any(re.match(r"^blocks\.\d+\.attn\.w[qkvo]\.weight$", k) for k in k2keys)
+    ):
+        arch["K2"] = True
+
     # Anima detection.  Keep the checkpoint-side checks structure-specific, and
     # recognize the kohya-style Anima LoRA families used by Anima trainers.
-    if any("anima" in k.lower() for k in keys):
+    if (not arch["K2"]) and any("anima" in k.lower() for k in keys):
         arch["AM"] = True
 
-    if any(
+    if (not arch["K2"]) and any(
         (
             k.startswith(("blocks.", "net.blocks.", "diffusion_model.blocks.", "model.diffusion_model.blocks."))
             and (
@@ -777,6 +943,14 @@ def _fallback_arch(theta: dict[str, torch.Tensor], *, model_type: Optional[str])
     ):
         arch["AM"] = True
 
+    if arch["AM"]:
+        anima_idxs = set()
+        for k in keys:
+            m = re.match(r"^(?:(?:model\.diffusion_model\.|diffusion_model\.|net\.)?)blocks\.(\d+)\.", k)
+            if m:
+                anima_idxs.add(int(m.group(1)))
+        arch["AM29"] = bool(anima_idxs and (max(anima_idxs) + 1 >= 40))
+
     if model_type == "lora":
         if any("conditioner.embedders" in k or "clip_g" in k for k in keys):
             arch["XL"] = True
@@ -810,6 +984,14 @@ def _fallback_arch(theta: dict[str, torch.Tensor], *, model_type: Optional[str])
         ):
             arch["AM"] = True
 
+    if arch["AM"] and not arch["AM29"]:
+        anima_idxs = set()
+        for k in keys:
+            m = re.search(r"(?:^|[._])blocks[._](\d+)[._]", k)
+            if m:
+                anima_idxs.add(int(m.group(1)))
+        arch["AM29"] = bool(anima_idxs and (max(anima_idxs) + 1 >= 40))
+
     return arch
 
 
@@ -832,7 +1014,7 @@ def _infer_arch(
 
 
 def _guess_vae_prefix(arch: dict[str, bool]) -> str:
-    if arch.get("FLUX", False) or arch.get("ZI", False):
+    if arch.get("FLUX", False) or arch.get("ZI", False) or arch.get("K2", False):
         return "vae"
     return "first_stage_model"
 

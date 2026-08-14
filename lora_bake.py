@@ -14,18 +14,22 @@ from Utils import (
     LBLOCKS_FLUX,
     LBLOCKS_ZI,
     LBLOCKS_SDXL,
-    LBLOCKS_AM,
+    LBLOCKS_K2,
     BLOCKID,
     BLOCKIDFLUX,
     BLOCKIDZI,
     BLOCKIDXLL,
     BLOCKIDAM,
+    BLOCKIDK2,
     normalize_path,
     base_path,
     merge_cache_json,
     blockfromkey,
     elementals2,
     _load_umodel,
+    configure_save_precision,
+    anima_lblocks_for_arch,
+    anima_blockids_for_arch,
 )
 
 from model import UnifiedModel, ModelInfo
@@ -1054,6 +1058,7 @@ def _save_umodel(model: UnifiedModel, output: str, *, args) -> None:
         save_half=bool(getattr(args, "save_half", False)),
         save_quarter=bool(getattr(args, "save_quarter", False)),
         save_bhalf=bool(getattr(args, "save_bhalf", False)),
+        save_int8=bool(getattr(args, "save_int8", False)),
         prune=bool(getattr(args, "prune", False)),
         args=args,
     )
@@ -1138,6 +1143,61 @@ def merge_weights_inplace(
 
     return lora
 
+def _krea2_strip_lora_suffix(key: str) -> str:
+    base = str(key)
+    for suffix in (".lora_A.weight", ".lora_B.weight", ".lora_down.weight", ".lora_up.weight", ".down.weight", ".up.weight"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    for prefix in ("model.diffusion_model.", "diffusion_model.", "transformer."):
+        if base.startswith(prefix):
+            base = base[len(prefix):]
+            break
+    for prefix in ("lora_transformer_", "lora_unet_"):
+        if base.startswith(prefix):
+            tail = base[len(prefix):]
+            m = re.match(r"blocks_(\d+)_(.+)$", tail)
+            if m:
+                idx, rest = m.groups()
+                replacements = {
+                    "attn_wq": "attn.wq", "attn_wk": "attn.wk", "attn_wv": "attn.wv",
+                    "attn_wo": "attn.wo", "prenorm_scale": "prenorm.scale",
+                }
+                for src, dst in replacements.items():
+                    if rest.startswith(src):
+                        rest = dst + rest[len(src):].replace("_", ".")
+                        break
+                else:
+                    rest = rest.replace("_", ".")
+                return f"blocks.{idx}.{rest}"
+            if tail.startswith("first_"):
+                return "first." + tail[len("first_"):].replace("_", ".")
+            if tail.startswith("last_"):
+                return "last." + tail[len("last_"):].replace("_", ".")
+            for root in ("tmlp_", "tproj_", "txtmlp_", "txtfusion_"):
+                if tail.startswith(root):
+                    return root[:-1] + "." + tail[len(root):].replace("_", ".")
+    return base
+
+def krea2_resolve_target_any(down_k: str, theta_0: dict) -> str | None:
+    if not theta_0:
+        return None
+    base = _krea2_strip_lora_suffix(down_k)
+    if base.endswith(".weight"):
+        base = base[:-7]
+    candidates = [
+        base + ".weight",
+        "model.diffusion_model." + base + ".weight",
+        "diffusion_model." + base + ".weight",
+        "transformer." + base + ".weight",
+    ]
+    for key in candidates:
+        if key in theta_0:
+            return key
+    suffix = base + ".weight"
+    hits = [k for k in theta_0.keys() if k.endswith(suffix)]
+    return hits[0] if len(hits) == 1 else None
+
 @torch.inference_mode()
 def build_apply_plan(main_keys, *, arch: dict, mlv2: bool, keymap: dict, theta_0: dict | None = None):
     plan = []
@@ -1162,6 +1222,15 @@ def build_apply_plan(main_keys, *, arch: dict, mlv2: bool, keymap: dict, theta_0
             tgt, part = zimage_resolve_target(down_k)
             if tgt is not None:
                 plan.append(("zi", down_k, up_k, alpha_k, tgt, part))
+            continue
+
+        if arch.get("K2", False):
+            if theta_0 is None:
+                continue
+            tgt = krea2_resolve_target_any(down_k, theta_0)
+            if tgt is None:
+                continue
+            plan.append(("std", down_k, up_k, alpha_k, tgt, None))
             continue
 
         if arch.get("AM", False):
@@ -1847,14 +1916,16 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
         LBLOCKS_ZI if base_model.arch.get("ZI", False) else
         (LBLOCKS_FLUX if base_model.arch.get("FLUX", False) else
         (LBLOCKS_SDXL if base_model.arch.get("XL", False) else
-        (LBLOCKS_AM if base_model.arch.get("AM", False) else LBLOCKS26)))
+        (anima_lblocks_for_arch(base_model.arch) if base_model.arch.get("AM", False) else
+        (LBLOCKS_K2 if base_model.arch.get("K2", False) else LBLOCKS26))))
     )
 
     blocknum = (
         BLOCKIDZI if base_model.arch.get("ZI", False) else
         (BLOCKIDFLUX if base_model.arch.get("FLUX", False) else
         (BLOCKIDXLL if base_model.arch.get("XL", False) else
-        (BLOCKIDAM if base_model.arch.get("AM", False) else BLOCKID)))
+        (anima_blockids_for_arch(base_model.arch) if base_model.arch.get("AM", False)
+        else (BLOCKIDK2 if base_model.arch.get("K2", False) else BLOCKID))))
     )
 
     keymap   = _build_keymap(base_model.theta)
@@ -1933,6 +2004,10 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                     target_key = te2_target
                 elif special_target is not None:
                     target_key = special_target
+                elif base_model.arch.get("K2", False):
+                    target_key = krea2_resolve_target_any(d, base_model.theta)
+                    if target_key is None or (target_key not in base_model.theta):
+                        continue
                 elif base_model.arch.get("AM", False):
                     target_key = anima_resolve_target_any(d, base_model.theta)
                     if target_key is None or (target_key not in base_model.theta):
@@ -1975,7 +2050,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                 if rho > 0.0:
                     sum_rho[target_key] += float(rho)
 
-            del lora_model_obj.theta
+            lora_model_obj.release_tensors()
 
     for lora_model, ratio_str in lora_list:
         print(f"loading: {lora_model}")
@@ -2053,6 +2128,23 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                     ratio = float(ratio) * float(bake_norm_use)
                     plan.append(("std", special_target, special_part, d, u, a, float(ratio)))
                     continue
+
+            if base_model.arch.get("K2", False):
+                target = krea2_resolve_target_any(d, base_model.theta)
+                if target is None or target not in base_model.theta:
+                    unresolved += 1
+                    if len(unresolved_examples) < 12:
+                        unresolved_examples.append(d)
+                    continue
+                ratio = _effective_ratio_for_target(
+                    target,
+                    g=g, weights=weights, deep=deep,
+                    blockids=blocknum,
+                    arch=base_model.arch,
+                )
+                ratio = float(ratio) * float(bake_norm_use)
+                plan.append(("std", target, None, d, u, a, float(ratio)))
+                continue
 
             if base_model.arch.get("AM", False):
                 target = anima_resolve_target_any(d, base_model.theta)
@@ -2192,7 +2284,7 @@ def pluslora(lora_list, model, output, model_path, device="cpu"):
                 d = down.to(device=dev, dtype=dt, non_blocking=False)
                 base_model.theta[target_key] = apply_lora_to_weight_inplace(W, u, d, sc, ratio)
             
-        del lora_model_obj.theta
+        lora_model_obj.release_tensors()
 
     out_name = os.path.splitext(os.path.basename(output))[0]
     meta_new = {
@@ -2244,13 +2336,13 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
         LBLOCKS_ZI if base_model.arch.get("ZI", False) else
         (LBLOCKS_FLUX if base_model.arch.get("FLUX", False) else
          (LBLOCKS_SDXL if base_model.arch.get("XL", False) else
-          (LBLOCKS_AM if base_model.arch.get("AM", False) else LBLOCKS26)))
+          (anima_lblocks_for_arch(base_model.arch) if base_model.arch.get("AM", False) else (LBLOCKS_K2 if base_model.arch.get("K2", False) else LBLOCKS26))))
     )
     blocknum = (
         BLOCKIDZI if base_model.arch.get("ZI", False) else
         (BLOCKIDFLUX if base_model.arch.get("FLUX", False) else
          (BLOCKIDXLL if base_model.arch.get("XL", False) else
-          (BLOCKIDAM if base_model.arch.get("AM", False) else BLOCKID)))
+          (anima_blockids_for_arch(base_model.arch) if base_model.arch.get("AM", False) else (BLOCKIDK2 if base_model.arch.get("K2", False) else BLOCKID))))
     )
 
     keymap = _build_keymap(base_model.theta)
@@ -2320,6 +2412,12 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
                 if target_key is None or target_key not in base_model.theta:
                     continue
 
+            elif base_model.arch.get("K2", False):
+                if (target_key is None) or (target_key not in base_model.theta):
+                    target_key = krea2_resolve_target_any(down_k, base_model.theta)
+                if target_key is None or target_key not in base_model.theta:
+                    continue
+
             elif base_model.arch.get("AM", False):
                 if (target_key is None) or (target_key not in base_model.theta):
                     target_key = anima_resolve_target_any(down_k, base_model.theta)
@@ -2384,7 +2482,8 @@ def darelora(mainlora, lora_list, model, output, model_path, device="cpu"):
             )
             base_model.theta[target_key] = out.to(W.dtype)
 
-        del lw, lora_model_obj.theta
+        del lw
+        lora_model_obj.release_tensors()
 
     out_name = os.path.splitext(os.path.basename(output))[0]
     meta_new = {
@@ -2410,7 +2509,14 @@ def _infer_arch_from_lora_keys(keys: list[str]) -> tuple[bool, bool, bool]:
     """
     return (isxl, isflux, iszi)  heuristic
     """
-    arch = {"XL": False, "FLUX": False, "ZI": False, "AM": False}
+    arch = {"XL": False, "FLUX": False, "ZI": False, "AM": False, "K2": False}
+
+    # Krea 2
+    for k in keys:
+        kl = k.lower()
+        if ("txtfusion" in kl) or re.search(r"(?:^|[._])blocks[._]\d+[._]attn[._]w[qkvo](?:[._]|$)", kl):
+            arch["K2"] = True
+            return arch
 
     # AM (Anima)
     for k in keys:
@@ -2675,7 +2781,7 @@ def merge_loras_only(
     print(f"clamp_quantile: {clamp_quantile}  intermediate_mult: {intermediate_mult}")
 
     # arch decision
-    arch = {"XL": False, "FLUX": False, "ZI": False, "AM": False}
+    arch = {"XL": False, "FLUX": False, "ZI": False, "AM": False, "K2": False}
     decided = False
     blocknum = None
 
@@ -2715,15 +2821,16 @@ def merge_loras_only(
                 arch["FLUX"] = (arch_set == "flux")
                 arch["ZI"] = (arch_set == "zi")
                 arch["AM"] = (arch_set == "am")
+                arch["K2"] = (arch_set in {"k2", "krea2"})
 
             blocknum = (
                 BLOCKIDZI if arch["ZI"] else
                 (BLOCKIDFLUX if arch["FLUX"] else
                 (BLOCKIDXLL if arch["XL"] else
-                (BLOCKIDAM if arch["AM"] else BLOCKID)))
+                (BLOCKIDAM if arch["AM"] else (BLOCKIDK2 if arch["K2"] else BLOCKID))))
             )
             decided = True
-            print(f"detected arch: isxl={arch['XL']} isflux={arch['FLUX']} iszi={arch['ZI']} isam={arch['AM']} (blocklen={len(blocknum)})")
+            print(f"detected arch: isxl={arch['XL']} isflux={arch['FLUX']} iszi={arch['ZI']} isam={arch['AM']} isk2={arch.get('K2', False)} (blocklen={len(blocknum)})")
 
         g, weights, deep = parse_ratio_spec(ratio_str, len(blocknum))
 
@@ -2763,6 +2870,9 @@ def merge_loras_only(
             if arch["ZI"]:
                 tgt, _part = zimage_resolve_target(d)
                 target_key = tgt if tgt is not None else d
+            elif arch["K2"]:
+                base = _krea2_strip_lora_suffix(d)
+                target_key = base
             elif arch["AM"]:
                 target_key = _am_target_key_from_lora_down(d) or d
             else:
@@ -2877,7 +2987,7 @@ def merge_loras_only(
             "merge_rank_target": int(merge_rank),
             "intermediate_mult": int(intermediate_mult),
             "clamp_quantile": float(clamp_quantile),
-            "arch": ("zi" if arch["ZI"] else ("flux" if arch["FLUX"] else ("sdxl" if arch["XL"] else ("am" if arch["AM"] else "sd")))),
+            "arch": ("zi" if arch["ZI"] else ("flux" if arch["FLUX"] else ("sdxl" if arch["XL"] else ("am" if arch["AM"] else ("krea2" if arch["K2"] else "sd"))))),
             "merge_norm": str(merge_norm),
             "merge_scale": float(merge_scale),
             "sources": merged_sources,
@@ -2897,10 +3007,14 @@ if __name__ == "__main__":
     parser.add_argument("model_path", type=str, help="Path to models")
     parser.add_argument("checkpoint", type=str, nargs="?", help="Name of the checkpoint", default=None)
     parser.add_argument("loras", type=str, nargs="?", help="Path and alpha of LoRAs eg.)\"Path:alpha,Path:alpha, ...\"", default=None)
-    parser.add_argument("--save_half", action="store_true", help="Save as float16", required=False)
-    parser.add_argument("--save_bhalf", action="store_true", help="Save as bfloat16", required=False)
+    parser.add_argument(
+        "--save_precision", "--save-precision",
+        dest="save_precision", default="fp32", metavar="PRECISION",
+        help=("Output precision. Canonical values: fp32, fp16, bf16, fp8, int8. "
+              "Aliases such as full/float32, half/float16, bhalf/bfloat16, "
+              "quarter/float8, and i8 are accepted."),
+    )
     parser.add_argument("--prune", action="store_true", help="Prune Model", required=False)
-    parser.add_argument("--save_quarter", action="store_true", help="Save as float8", required=False)
     parser.add_argument("--keep_ema", action="store_true", help="Keep ema", required=False)
     parser.add_argument("--dare", action="store_true", help="Use DARE Merge")
     parser.add_argument("--merge_loras", action="store_true",
@@ -2908,7 +3022,7 @@ if __name__ == "__main__":
     parser.add_argument("--merge_rank", type=int, default=64,
                         help="Rank cap for merged LoRA. 0 means unlimited (exact concat; can get huge). Default=64")
     parser.add_argument("--merge_arch", type=str, default="auto",
-                        choices=["auto", "sd", "sdxl", "flux", "zi", "am"],
+                        choices=["auto", "sd", "sdxl", "flux", "zi", "am", "k2", "krea2"],
                         help="Architecture for ratio/block mapping in merge mode. Default=auto")
     parser.add_argument("--merge_norm", type=str, default="none",
                     choices=["none","sqrt","mean"],
@@ -2952,6 +3066,10 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
     parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
     args = parser.parse_args()
+    try:
+        configure_save_precision(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     args.model_path = normalize_path(args.model_path)
 
     ll  = get_loralist(args.loras, model_path=args.model_path)
